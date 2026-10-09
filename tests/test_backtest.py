@@ -46,3 +46,47 @@ def test_vectorized_backtester_metrics():
     assert not np.isnan(result.sortino_ratio)
     assert not np.isnan(result.profit_factor)
     assert 0.0 <= result.win_rate_pct <= 100.0
+
+
+def test_maker_vs_taker_execution_fee_savings():
+    np.random.seed(42)
+    n_bars = 200
+    dates = pd.date_range("2024-01-01", periods=n_bars, freq="1h")
+    symbols = ["BTCUSDT", "ETHUSDT"]
+
+    returns_df = pd.DataFrame(0.0001, index=dates, columns=symbols)
+    # Frequent rebalance weights
+    w_btc = np.sin(np.linspace(0, 10, n_bars)) * 0.4
+    weights_df = pd.DataFrame({"BTCUSDT": w_btc, "ETHUSDT": -w_btc}, index=dates)
+
+    taker_engine = VectorizedBacktester(execution_mode="taker")
+    maker_engine = VectorizedBacktester(execution_mode="maker")
+
+    res_taker = taker_engine.run(returns_df, weights_df)
+    res_maker = maker_engine.run(returns_df, weights_df)
+
+    # Maker execution pays 0.02% vs 0.05% taker -> higher final equity and lower fees
+    assert res_maker.total_fees_pct < res_taker.total_fees_pct
+    assert res_maker.total_return_pct > res_taker.total_return_pct
+
+
+def test_turnover_deadband_reduces_trades():
+    np.random.seed(42)
+    n_bars = 200
+    dates = pd.date_range("2024-01-01", periods=n_bars, freq="1h")
+    symbols = ["BTCUSDT"]
+
+    returns_df = pd.DataFrame(0.0001, index=dates, columns=symbols)
+    # Noisy weights wiggling by 1%
+    w = 0.5 + np.random.normal(0, 0.015, n_bars)
+    weights_df = pd.DataFrame({"BTCUSDT": w}, index=dates)
+
+    no_deadband = VectorizedBacktester(turnover_deadband=0.0)
+    with_deadband = VectorizedBacktester(turnover_deadband=0.03)  # 3% buffer
+
+    res_no_db = no_deadband.run(returns_df, weights_df)
+    res_with_db = with_deadband.run(returns_df, weights_df)
+
+    # Deadband eliminates micro-trades and cuts turnover significantly
+    assert res_with_db.total_trades < res_no_db.total_trades
+    assert res_with_db.total_turnover < res_no_db.total_turnover

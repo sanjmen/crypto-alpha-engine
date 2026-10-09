@@ -165,6 +165,8 @@ def run_simulation(
     funding_dict: Dict[str, pd.DataFrame],
     initial_capital: float = 100_000.0,
     rebalance_freq_bars: int = 8,
+    execution_mode: str = "maker",
+    turnover_deadband: float = 0.04,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> BacktestResult:
@@ -220,7 +222,7 @@ def run_simulation(
 
     lookback = 72
     print(f"⚙️  Simulating {strategy_name.upper()} across {len(common_idx)} bars ({common_idx[0].strftime('%Y-%m-%d')} to {common_idx[-1].strftime('%Y-%m-%d')})...")
-    print(f"⏱️  Rebalance Frequency: Every {rebalance_freq_bars} bars (Friction & Turnover Control)")
+    print(f"⏱️  Rebalance Frequency: Every {rebalance_freq_bars} bars | Execution: {execution_mode.upper()} | Deadband: {turnover_deadband*100:.1f}%")
 
     current_weights = {sym: 0.0 for sym in valid_symbols}
 
@@ -263,12 +265,14 @@ def run_simulation(
     weight_records = {ts: w for ts, w in weights_history}
     weights_df = pd.DataFrame.from_dict(weight_records, orient="index").reindex(common_idx).fillna(0.0)
 
-    # Run backtester
+    # Run backtester with Execution Alpha
     backtester = VectorizedBacktester(
         initial_capital=initial_capital,
         taker_fee=0.0004,
         maker_fee=0.0002,
         slippage_bps=1.0,
+        execution_mode=execution_mode,
+        turnover_deadband=turnover_deadband,
     )
     return backtester.run(returns_df=returns_df, weights_df=weights_df, funding_rates_df=funding_df)
 
@@ -319,7 +323,7 @@ def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, preset
         title_text=(
             f"<b>Crypto Alpha Engine: {strategy_name.upper()} Tearsheet</b> | "
             f"Sharpe: {result.sharpe_ratio:.2f} | "
-            f"CAGR: {result.cagr_pct:.2f}% | "
+            f"Net Return: {result.total_return_pct:+.2f}% | "
             f"Max DD: {result.max_drawdown_pct:.2f}%"
         ),
         height=800,
@@ -332,12 +336,18 @@ def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, preset
     print(f"📊 Interactive Plotly tear sheet exported to: {output_path}")
 
 
-def print_performance_table(result: BacktestResult, strategy_name: str, preset: str) -> None:
-    """Prints institutional summary table."""
+def print_performance_table(result: BacktestResult, strategy_name: str, preset: str, execution_mode: str, deadband: float) -> None:
+    """Prints institutional summary table with fee breakdown."""
     print("\n" + "=" * 70)
     print(f"  INSTITUTIONAL PERFORMANCE REPORT: {strategy_name.upper()} ({preset.upper()})")
+    print(f"  Execution: {execution_mode.upper()} | Turnover Deadband Buffer: {deadband*100:.1f}%")
     print("=" * 70)
-    print(f"  Total Return:        {result.total_return_pct:+8.2f}%")
+    print(f"  Gross Alpha Return:  {result.gross_return_pct:+8.2f}%")
+    print(f"  Total Turnover:      {result.total_turnover:8.2f}x portfolio")
+    print(f"  Total Fees/Slippage: {result.total_fees_pct:8.2f}%")
+    print(f"  Funding Cashflow PnL:{result.total_funding_pnl_pct:+8.2f}%")
+    print("-" * 70)
+    print(f"  NET TOTAL RETURN:    {result.total_return_pct:+8.2f}%")
     print(f"  CAGR (Annualized):   {result.cagr_pct:+8.2f}%")
     print(f"  Annualized Vol:      {result.annualized_vol_pct:8.2f}%")
     print(f"  Sharpe Ratio:        {result.sharpe_ratio:8.2f}")
@@ -356,6 +366,8 @@ def main():
     parser.add_argument("--preset", choices=["top5", "top10", "top20"], default="top10", help="Asset universe preset.")
     parser.add_argument("--source", choices=["drive", "synthetic"], default="drive", help="Data source.")
     parser.add_argument("--rebalance-freq", type=int, default=8, help="Rebalancing frequency in bars (e.g. 8 for 8-hour settlements).")
+    parser.add_argument("--execution-mode", choices=["taker", "maker", "hybrid"], default="maker", help="Execution mode (maker=0.02%% limit, taker=0.04%% market+slip, hybrid).")
+    parser.add_argument("--turnover-deadband", type=float, default=0.04, help="Turnover deadband threshold (e.g. 0.04 ignores weight changes < 4%%).")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial portfolio capital.")
     parser.add_argument("--start", type=str, default=None, help="Backtest start date (YYYY-MM-DD).")
     parser.add_argument("--end", type=str, default=None, help="Backtest end date (YYYY-MM-DD).")
@@ -363,7 +375,7 @@ def main():
     args = parser.parse_args()
 
     symbols = PRESETS[args.preset]
-    report_file = Path(args.report) if args.report else Path(f"reports/tearsheet_{args.strategy}_{args.preset}.html")
+    report_file = Path(args.report) if args.report else Path(f"reports/tearsheet_{args.strategy}_{args.preset}_{args.execution_mode}.html")
 
     print("=" * 70)
     print("  CRYPTO ALPHA ENGINE: INSTITUTIONAL BACKTEST RUNNER")
@@ -371,6 +383,8 @@ def main():
     print(f"  Strategy:         {args.strategy.upper()}")
     print(f"  Universe:         {args.preset.upper()} ({len(symbols)} symbols: {', '.join(symbols[:5])}...)")
     print(f"  Source:           {args.source.upper()}")
+    print(f"  Execution Mode:   {args.execution_mode.upper()} ({'0.02% passive' if args.execution_mode == 'maker' else '0.04% + 1bp taker'})")
+    print(f"  Turnover Deadband:{args.turnover_deadband*100:.1f}%")
     print(f"  Initial Capital:  ${args.capital:,.2f}")
     print(f"  Rebalance Freq:   Every {args.rebalance_freq} bars")
     print("-" * 70)
@@ -389,11 +403,13 @@ def main():
         funding_dict=funding_dict,
         initial_capital=args.capital,
         rebalance_freq_bars=args.rebalance_freq,
+        execution_mode=args.execution_mode,
+        turnover_deadband=args.turnover_deadband,
         start_date=args.start,
         end_date=args.end,
     )
 
-    print_performance_table(result, args.strategy, args.preset)
+    print_performance_table(result, args.strategy, args.preset, args.execution_mode, args.turnover_deadband)
     generate_plotly_tearsheet(result, args.strategy, args.preset, report_file)
 
 
