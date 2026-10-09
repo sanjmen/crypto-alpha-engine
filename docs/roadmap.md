@@ -5,32 +5,37 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 ---
 
 ## Milestone 1: Ingestion & Market Data Pipeline (M1)
-**Objective**: Build a high-throughput, free crypto market data pipeline utilizing CCXT, Binance, and Bybit public endpoints, persisting to partitioned Parquet files with DuckDB querying.
+**Objective**: Build a high-throughput, free crypto market data pipeline bridging bulk S3 streaming from Binance Vision (multi-year history) with CCXT (rolling recent sync), persisting to partitioned Parquet files with DuckDB querying.
 
 * **Issue #1**: Define Core Domain Entities & Data Ports
-  * `Bar`, `Tick`, `OrderBook`, `FundingRate`, `SymbolInfo` domain entities.
-  * `IDataProvider`, `IBarStorage`, `IFundingStorage` port abstractions.
-* **Issue #2**: CCXT Free Data Adapter
+  * `Bar`, `Tick`, `OrderBook`, `FundingRate`, `DerivativesMetrics`, `SymbolInfo` domain entities.
+  * `IDataProvider`, `IBarStorage`, `IFundingStorage`, `IMetricsStorage` port abstractions.
+* **Issue #2**: Binance Vision Bulk S3 Downloader (Historical Backfill)
+  * Direct streaming download and on-the-fly decompression of monthly/daily ZIPs from `data.binance.vision`.
+  * Support for `klines` (1m, 15m, 1h), `fundingRate` (8h), and `metrics` (5m OI + Long/Short ratios).
+* **Issue #3**: CCXT Rolling Sync Adapter (Near Real-Time)
+  * Incremental synchronization of recent hours/days not yet rolled into monthly archives.
   * Integration with Binance USDT-M Futures & Bybit Linear Futures.
-  * OHLCV 1m, 5m, 15m, 1h download with automatic rate limit handling and pagination.
-* **Issue #3**: Parquet Storage & DuckDB Cache Engine
-  * Fast storage partitioned by `symbol/timeframe`.
-  * Incremental append and deduplication via DuckDB.
-* **Issue #4**: CLI Data Download & Cache Telemetry Tool
-  * `scripts/download_market_data.py` supporting Top 30 altcoin universe presets.
+* **Issue #4**: Parquet Storage & DuckDB Cache Engine
+  * Fast partitioned storage (`data/cache/bars/`, `data/cache/metrics/`, `data/cache/funding/`).
+  * Sub-millisecond analytical queries and timestamp deduplication via DuckDB.
+* **Issue #5**: CLI Data Management & Audit Tool
+  * `scripts/download_market_data.py` supporting presets (`top10`, `top30`) across Binance Vision and CCXT.
 
 ---
 
 ## Milestone 2: Feature Engineering & Alpha Porting (M2)
-**Objective**: Port and refactor mathematical estimators from `crunch-synth` and `datacrunch-2` into modular, decoupled feature extractors.
+**Objective**: Port mathematical estimators from `crunch-synth` and `datacrunch-2`, enriched with crypto derivatives metrics (Open Interest, Long/Short ratios) and L2 book depth.
 
-* **Issue #5**: Intraday Volatility Estimators
+* **Issue #6**: Intraday Volatility Estimators
   * Parkinson, Garman-Klass, Rogers-Satchell, Online GARCH(1,1), Online EWMA.
-* **Issue #6**: Market Microstructure Estimators
-  * Corwin-Schultz bid-ask spread, Amihud illiquidity ratio, Roll effective spread.
-* **Issue #7**: Fractal Hurst Exponent Analysis
-  * Rescaled Range (R/S) and Detrended Fluctuation Analysis (DFA) calibrator.
-* **Issue #8**: Cross-Sectional Normalization & Beta Neutralization
+* **Issue #7**: Market Microstructure & L2 Book Depth Estimators
+  * Corwin-Schultz bid-ask spread, Amihud illiquidity, Roll spread, and L2 order book depth imbalance (from `bookDepth`).
+* **Issue #8**: Fractal Hurst Exponent Analysis
+  * Rescaled Range (R/S) and Detrended Fluctuation Analysis (DFA) calibrator for anomalous diffusion.
+* **Issue #9**: Derivatives & Sentiment Feature Extractors
+  * Open Interest velocity & acceleration ($\Delta \text{OI}$), Top-Trader vs Retail Long/Short divergence, Taker Buy/Sell volume imbalance.
+* **Issue #10**: Cross-Sectional Normalization & Beta Neutralization
   * Gaussian rank transformation, cross-sectional z-score, orthogonal market beta projection.
 
 ---
@@ -69,7 +74,7 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 * **Issue #17**: Event-Driven & Vectorized Backtest Simulator
   * Strict time-step simulation preventing data leakage.
 * **Issue #18**: Cost & Execution Impact Models
-  * Binance Futures tier fee schedules (0.02% maker, 0.05% taker) + quadratic market impact.
+  * Binance Futures tier fee schedules (0.02% maker, 0.05% taker) + L2 order book depth execution simulator (using `bookDepth`).
 * **Issue #19**: Performance Analytics & Plotly Tear Sheets
   * Cumulative PnL, Annualized Return, Sharpe Ratio, Sortino Ratio, Max Drawdown, Calmar Ratio.
 
