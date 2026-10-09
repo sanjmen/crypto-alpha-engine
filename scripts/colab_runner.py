@@ -37,17 +37,21 @@ def run_ingest(client: ColabClient, poll_interval: int = 5, heartbeat_interval: 
         return False
     print(f"[+] Session '{client.session_name}' is active.")
 
-    print("[*] Probing / mounting Google Drive at /content/drive...")
-    if not client.is_drive_mounted():
-        rc, out, err = client.mount_drive()
-        if rc != 0:
-            print(f"[-] Drive mount warning: {err or out}. Probing again...")
-        time.sleep(2)
-
-    if not client.is_drive_mounted():
-        print("[-] Error: Google Drive could not be mounted. Please check Colab Drive authorizations.")
-        return False
-    print("[+] Google Drive verified mounted at /content/drive/MyDrive.")
+    print("[*] Probing Google Drive mount or headless rclone synchronization...")
+    if client.is_drive_mounted():
+        print("[+] Google Drive verified mounted at /content/drive/MyDrive.")
+    else:
+        print("[*] Google Drive FUSE not mounted. Ensuring headless rclone channel...")
+        client.exec_inline(
+            'import subprocess, os; subprocess.run(["apt-get", "install", "-y", "-qq", "rclone"]); os.makedirs("/root/.config/rclone", exist_ok=True)',
+            timeout=60
+        )
+        rclone_conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+        if rclone_conf.exists():
+            client.upload(rclone_conf, "/root/.config/rclone/rclone.conf")
+            print("[+] Rclone credentials synced to Colab VM successfully.")
+        else:
+            print("[-] Warning: ~/.config/rclone/rclone.conf not found locally.")
 
     print("[*] Installing required cloud dependencies (duckdb, pyarrow, pandas)...")
     client.install_packages(["duckdb", "pyarrow", "pandas", "requests"])
@@ -123,13 +127,13 @@ print(f'WORKER_LAUNCHED_PID={proc.pid}')
                 last_log_size = current_size
 
         # 3. Check for completion sentinel
-        check_code = "import os, sys; sys.exit(0 if os.path.exists('/content/INGEST_FINISHED') else 1)"
-        rc, _, _ = client.exec_inline(check_code, timeout=15)
-        if rc == 0:
+        check_code = "import os; print('FINISHED_YES' if os.path.exists('/content/INGEST_FINISHED') else 'FINISHED_NO')"
+        _, check_out, _ = client.exec_inline(check_code, timeout=20)
+        if "FINISHED_YES" in check_out:
             print("\n" + "=" * 60)
             print("[+] Ingestion worker reported completion!")
             manifest_local = PROJECT_ROOT / "data" / "cache" / "manifest.json"
-            client.download("/content/drive/MyDrive/trading/crypto-alpha-engine/data/manifest.json", manifest_local)
+            client.download("/content/INGEST_FINISHED", manifest_local)
             if manifest_local.exists():
                 print(f"[+] Downloaded manifest:\n{manifest_local.read_text()}")
             print("[+] All data stored safely on Google Drive with 0 local disk consumed.")

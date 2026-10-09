@@ -72,12 +72,11 @@ class ColabClient:
 
     def is_drive_mounted(self, drive_path: str = "/content/drive/MyDrive") -> bool:
         """Checks if Google Drive is currently mounted inside the session."""
-        code = f"""import sys
-from pathlib import Path
-sys.exit(0 if Path('{drive_path}').exists() else 1)
+        code = f"""import os
+print("MOUNTED_TRUE" if os.path.exists('{drive_path}') else "MOUNTED_FALSE")
 """
-        rc, _, _ = self.exec_inline(code, timeout=30)
-        return rc == 0
+        _, out, _ = self.exec_inline(code, timeout=30)
+        return "MOUNTED_TRUE" in out
 
     def install_packages(self, packages: List[str]) -> bool:
         """Installs Python packages on the Colab VM using colab install."""

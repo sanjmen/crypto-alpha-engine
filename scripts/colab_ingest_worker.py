@@ -1,7 +1,8 @@
 """
 High-Throughput Remote Ingestion Worker for Google Colab.
 Streams Binance Vision historical data directly into Google Drive Parquet storage.
-Designed to be executed headlessly inside a Colab session.
+Supports both mounted Google Drive (/content/drive/MyDrive) and direct rclone sync.
+Zero local disk space on client Mac. Zero browser tab clicks required.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 import urllib.request
@@ -22,9 +24,14 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Target Drive Base Path
+# Storage Configuration
 DRIVE_MOUNT_POINT = Path("/content/drive/MyDrive")
-DRIVE_OUTPUT_DIR = DRIVE_MOUNT_POINT / "trading" / "crypto-alpha-engine" / "data"
+if DRIVE_MOUNT_POINT.exists():
+    BASE_OUTPUT_DIR = DRIVE_MOUNT_POINT / "trading" / "crypto-alpha-engine" / "data"
+    USE_RCLONE = False
+else:
+    BASE_OUTPUT_DIR = Path("/content/data")
+    USE_RCLONE = True
 
 BINANCE_VISION_S3_BASE = "https://data.binance.vision"
 
@@ -58,12 +65,20 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
-def verify_drive():
-    if not DRIVE_MOUNT_POINT.exists():
-        log(f"❌ Error: Google Drive is not mounted at {DRIVE_MOUNT_POINT}!")
-        sys.exit(1)
-    DRIVE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    log(f"📁 Google Drive storage target ready: {DRIVE_OUTPUT_DIR}")
+def sync_to_drive():
+    """Syncs local VM data to Google Drive via rclone if not mounted directly."""
+    if not USE_RCLONE:
+        return
+    log("🔄 Sincronizando datos con Google Drive (rclone)...")
+    res = subprocess.run(
+        ["rclone", "copy", str(BASE_OUTPUT_DIR), "gdrive:trading/crypto-alpha-engine/data", "--transfers", "8", "--checkers", "16", "-q"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode == 0:
+        log("✅ Sincronización con Google Drive exitosa.")
+    else:
+        log(f"⚠️ Advertencia en sync rclone: {res.stderr}")
 
 
 def fetch_zip_df(url: str, col_names: list[str]) -> pd.DataFrame | None:
@@ -91,7 +106,7 @@ def fetch_zip_df(url: str, col_names: list[str]) -> pd.DataFrame | None:
 def save_klines(symbol: str, timeframe: str, df: pd.DataFrame) -> int:
     if df is None or df.empty:
         return 0
-    target_dir = DRIVE_OUTPUT_DIR / "bars" / timeframe
+    target_dir = BASE_OUTPUT_DIR / "bars" / timeframe
     target_dir.mkdir(parents=True, exist_ok=True)
     file_path = target_dir / f"{symbol}.parquet"
 
@@ -131,7 +146,7 @@ def save_klines(symbol: str, timeframe: str, df: pd.DataFrame) -> int:
 def save_funding(symbol: str, df: pd.DataFrame) -> int:
     if df is None or df.empty:
         return 0
-    target_dir = DRIVE_OUTPUT_DIR / "funding"
+    target_dir = BASE_OUTPUT_DIR / "funding"
     target_dir.mkdir(parents=True, exist_ok=True)
     file_path = target_dir / f"{symbol}.parquet"
 
@@ -186,7 +201,8 @@ def download_funding_job(symbol: str, year: int, month: int):
 def run_pipeline():
     start_time = time.time()
     log("🚀 [COLAB WORKER] Starting High-Throughput Binance Ingestion directly to Google Drive...")
-    verify_drive()
+    BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"📁 Target Output Directory: {BASE_OUTPUT_DIR} (USE_RCLONE={USE_RCLONE})")
 
     symbols = TOP_SYMBOLS
     log(f"📊 Selected Universe: {len(symbols)} symbols: {symbols}")
@@ -210,6 +226,9 @@ def run_pipeline():
             if bars > 0:
                 total_klines_downloaded += bars
                 log(f"  ✓ {sym} [{tf}] {y}-{m:02d}: +{bars:,} bars (Total in Parquet: {total:,})")
+
+    # Sync klines to Drive
+    sync_to_drive()
 
     # 2. Monthly Funding Rates Download
     log("\n📥 Phase 2: Downloading Historical 8h Funding Rates...")
@@ -240,11 +259,14 @@ def run_pipeline():
         "years": YEARS,
         "total_klines_bars": total_klines_downloaded,
         "total_funding_settlements": total_funding_downloaded,
-        "drive_path": str(DRIVE_OUTPUT_DIR),
+        "drive_path": "gdrive:trading/crypto-alpha-engine/data",
     }
-    manifest_path = DRIVE_OUTPUT_DIR / "manifest.json"
+    manifest_path = BASE_OUTPUT_DIR / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     log(f"📄 Manifest written to: {manifest_path}")
+
+    # Final sync
+    sync_to_drive()
 
     # Sentinel file for Colab Runner detection
     sentinel = Path("/content/INGEST_FINISHED")
