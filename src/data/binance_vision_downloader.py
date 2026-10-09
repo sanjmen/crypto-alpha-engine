@@ -142,7 +142,9 @@ class BinanceVisionDownloader:
         target_dir.mkdir(parents=True, exist_ok=True)
         file_path = target_dir / f"{clean_sym}.parquet"
 
-        # Standardize columns
+        trade_count = pd.to_numeric(df["trade_count"], errors="coerce").fillna(0).astype(np.int64) if "trade_count" in df.columns else np.zeros(len(df), dtype=np.int64)
+        taker_vol = pd.to_numeric(df["taker_buy_base_vol"], errors="coerce").fillna(0.0).astype(np.float64) if "taker_buy_base_vol" in df.columns else np.zeros(len(df), dtype=np.float64)
+
         df_clean = pd.DataFrame({
             "timestamp": (pd.to_numeric(df["open_time"]) // 1000).astype(np.int64),
             "symbol": symbol,
@@ -151,8 +153,8 @@ class BinanceVisionDownloader:
             "low": pd.to_numeric(df["low"], errors="coerce").astype(np.float64),
             "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float64),
             "volume": pd.to_numeric(df["volume"], errors="coerce").astype(np.float64),
-            "trade_count": pd.to_numeric(df.get("trade_count", 0), errors="coerce").fillna(0).astype(np.int64),
-            "taker_buy_vol": pd.to_numeric(df.get("taker_buy_base_vol", 0), errors="coerce").fillna(0).astype(np.float64),
+            "trade_count": trade_count,
+            "taker_buy_vol": taker_vol,
         })
 
         if file_path.exists():
