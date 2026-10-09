@@ -66,3 +66,18 @@ class IRiskManager(Protocol):
     ) -> Dict[str, float]:
         """Compute target dollar or fractional weights per asset."""
         ...
+
+
+@runtime_checkable
+class IStrategy(Protocol):
+    """
+    Interface for quantitative trading strategies.
+    """
+
+    @abstractmethod
+    def generate_signals(
+        self,
+        market_data: Dict[str, pd.DataFrame]
+    ) -> List[Signal]:
+        """Generate target alpha signals across assets."""
+        ...
