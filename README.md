@@ -26,6 +26,7 @@ Built on **Clean Architecture (Hexagonal / Ports & Adapters)**:
 
 Detailed architectural specifications: [`docs/system_architecture.md`](docs/system_architecture.md).  
 Mathematical formulations: [`docs/mathematical_formulation.md`](docs/mathematical_formulation.md).  
+Empirical data census & sources report: [`docs/deep_data_census_report.md`](docs/deep_data_census_report.md).  
 Development roadmap: [`docs/roadmap.md`](docs/roadmap.md).
 
 ---
