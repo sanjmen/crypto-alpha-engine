@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Institutional Backtest Runner CLI.
-Executes multi-asset simulations for Momentum, Stat-Arb, Funding Carry, or Meta-Strategy Allocator.
-Reads data directly from Google Drive (or local cache) and produces performance metrics & Plotly tear sheets.
+Institutional Multi-Asset Backtest Runner CLI.
+Simulates Momentum, Stat-Arb, Funding Carry, and Meta-Strategy Allocator
+over the historical dataset stored on Google Drive (2023–2026).
+Enforces realistic taker/maker fees, exchange slippage, and 8h funding cashflows.
 
 Usage:
-    python scripts/run_backtest.py --strategy meta --preset top5 --source synthetic
-    python scripts/run_backtest.py --strategy meta --preset top5 --source drive
+    python scripts/run_backtest.py --strategy meta --preset top10 --source drive --rebalance-freq 8
+    python scripts/run_backtest.py --strategy carry --preset top10 --source drive --rebalance-freq 8
 """
 
 import argparse
 from datetime import datetime, timezone
-import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.backtest.engine import BacktestResult, VectorizedBacktester
 from src.domain.entities import Portfolio
-from src.domain.enums import MarketRegime
 from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
 from src.strategies.funding_carry_arbitrage import FundingCarryArbitrageStrategy
 from src.strategies.meta_allocator import MetaStrategyAllocator
@@ -39,6 +37,10 @@ from src.strategies.stat_arb_mean_reversion import StatArbMeanReversionStrategy
 PRESETS = {
     "top5": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"],
     "top10": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT"],
+    "top20": [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
+        "SUIUSDT", "APTUSDT", "DOTUSDT", "ATOMUSDT", "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "KAVAUSDT", "ICPUSDT", "ARBUSDT"
+    ],
 }
 
 
@@ -47,8 +49,9 @@ def load_drive_market_data(
     timeframe: str = "1h",
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
-    Downloads requested symbol Parquet files from Google Drive to /tmp in a single batch.
-    Ensures 0 MB of persistent local disk space is consumed.
+    Downloads requested symbol Parquet files from Google Drive to /tmp in parallel.
+    Uses local cache in /tmp to avoid re-downloading existing files.
+    Ensures 0 MB of persistent local disk space is consumed in the repo.
     """
     temp_dir = Path("/tmp/crypto_alpha_backtest_cache")
     bars_dir = temp_dir / "bars" / timeframe
@@ -56,34 +59,38 @@ def load_drive_market_data(
     bars_dir.mkdir(parents=True, exist_ok=True)
     funding_dir.mkdir(parents=True, exist_ok=True)
 
-    include_pattern = "{" + ",".join([f"{s}.parquet" for s in symbols]) + "}"
-    print(f"📥 Streaming {len(symbols)} assets from Google Drive (rclone parallel batch)...")
+    missing_bars = [s for s in symbols if not (bars_dir / f"{s}.parquet").exists()]
+    missing_funding = [s for s in symbols if not (funding_dir / f"{s}.parquet").exists()]
 
-    # 1. Batch sync klines bars
-    subprocess.run(
-        [
-            "rclone", "copy",
-            f"gdrive:trading/crypto-alpha-engine/data/bars/{timeframe}/",
-            str(bars_dir),
-            "--include", include_pattern,
-            "--transfers", "8",
-            "--checkers", "8",
-        ],
-        check=False,
-    )
+    if missing_bars:
+        print(f"📥 Downloading {len(missing_bars)} missing bar files from Google Drive via rclone...")
+        pattern = "{" + ",".join([f"{s}.parquet" for s in missing_bars]) + "}"
+        subprocess.run(
+            [
+                "rclone", "copy",
+                f"gdrive:trading/crypto-alpha-engine/data/bars/{timeframe}/",
+                str(bars_dir),
+                "--include", pattern,
+                "--transfers", "16",
+                "--checkers", "16",
+            ],
+            check=False,
+        )
 
-    # 2. Batch sync funding
-    subprocess.run(
-        [
-            "rclone", "copy",
-            "gdrive:trading/crypto-alpha-engine/data/funding/",
-            str(funding_dir),
-            "--include", include_pattern,
-            "--transfers", "8",
-            "--checkers", "8",
-        ],
-        check=False,
-    )
+    if missing_funding:
+        print(f"📥 Downloading {len(missing_funding)} missing funding files from Google Drive via rclone...")
+        pattern = "{" + ",".join([f"{s}.parquet" for s in missing_funding]) + "}"
+        subprocess.run(
+            [
+                "rclone", "copy",
+                "gdrive:trading/crypto-alpha-engine/data/funding/",
+                str(funding_dir),
+                "--include", pattern,
+                "--transfers", "16",
+                "--checkers", "16",
+            ],
+            check=False,
+        )
 
     bars_dict: Dict[str, pd.DataFrame] = {}
     funding_dict: Dict[str, pd.DataFrame] = {}
@@ -93,16 +100,21 @@ def load_drive_market_data(
         if bar_path.exists():
             df = pd.read_parquet(bar_path)
             if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+                # Versatile timestamp parser for float, int, or datetime
+                if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
                 df.set_index("timestamp", inplace=True)
+            df.sort_index(inplace=True)
             bars_dict[sym] = df
 
         funding_path = funding_dir / f"{sym}.parquet"
         if funding_path.exists():
             f_df = pd.read_parquet(funding_path)
             if "timestamp" in f_df.columns:
-                f_df["timestamp"] = pd.to_datetime(f_df["timestamp"], unit="s", utc=True)
+                if not pd.api.types.is_datetime64_any_dtype(f_df["timestamp"]):
+                    f_df["timestamp"] = pd.to_datetime(f_df["timestamp"], unit="s", utc=True)
                 f_df.set_index("timestamp", inplace=True)
+            f_df.sort_index(inplace=True)
             funding_dict[sym] = f_df
 
     return bars_dict, funding_dict
@@ -112,7 +124,7 @@ def generate_synthetic_universe(
     symbols: List[str],
     n_bars: int = 2000,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-    """Generates synthetic multi-asset price and funding data for offline backtesting."""
+    """Generates synthetic multi-asset price and funding data for testing."""
     np.random.seed(42)
     timestamps = pd.date_range("2024-01-01", periods=n_bars, freq="1h", tz="UTC")
 
@@ -123,8 +135,8 @@ def generate_synthetic_universe(
 
     for sym in symbols:
         p0 = base_prices.get(sym, 50.0)
-        daily_drift = np.random.uniform(-0.0002, 0.0005)
-        vol = np.random.uniform(0.01, 0.03)
+        daily_drift = np.random.uniform(-0.0001, 0.0004)
+        vol = np.random.uniform(0.015, 0.035)
         returns = np.random.normal(daily_drift, vol, n_bars)
         price_series = p0 * np.exp(np.cumsum(returns))
 
@@ -152,25 +164,46 @@ def run_simulation(
     bars_dict: Dict[str, pd.DataFrame],
     funding_dict: Dict[str, pd.DataFrame],
     initial_capital: float = 100_000.0,
-    rebalance_freq_bars: int = 1,
+    rebalance_freq_bars: int = 8,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> BacktestResult:
     """
-    Simulates portfolio strategy signals and returns.
+    Executes historical portfolio simulation with frequency gating and window slicing.
     """
-    symbols = list(bars_dict.keys())
-    common_idx = bars_dict[symbols[0]].index
-    for sym in symbols[1:]:
+    valid_symbols = [s for s in bars_dict if not bars_dict[s].empty]
+    if not valid_symbols:
+        raise ValueError("No valid price data available for backtest.")
+
+    # Find common date index
+    common_idx = bars_dict[valid_symbols[0]].index
+    for sym in valid_symbols[1:]:
         common_idx = common_idx.intersection(bars_dict[sym].index)
 
+    if start_date:
+        common_idx = common_idx[common_idx >= pd.Timestamp(start_date, tz="UTC")]
+    if end_date:
+        common_idx = common_idx[common_idx <= pd.Timestamp(end_date, tz="UTC")]
+
+    if len(common_idx) < 100:
+        raise ValueError(f"Insufficient aligned bars ({len(common_idx)}) to evaluate backtest.")
+
     # Price matrix & returns
-    close_df = pd.DataFrame({sym: bars_dict[sym].loc[common_idx, "close"] for sym in symbols})
+    close_df = pd.DataFrame({sym: bars_dict[sym].loc[common_idx, "close"] for sym in valid_symbols})
     returns_df = close_df.pct_change().fillna(0.0)
 
-    # Funding settlements matrix
-    funding_df = pd.DataFrame({
-        sym: funding_dict[sym].loc[common_idx.intersection(funding_dict[sym].index), "funding_rate"]
-        for sym in symbols if sym in funding_dict
-    }).reindex(index=common_idx).fillna(0.0)
+    # Funding settlements matrix (forward-fill 8h settlements across 1h bars)
+    funding_dfs = {}
+    for sym in valid_symbols:
+        if sym in funding_dict and not funding_dict[sym].empty:
+            f_series = funding_dict[sym]["funding_rate"]
+            f_aligned = f_series.reindex(common_idx, method="ffill").fillna(0.0)
+            # Funding is only paid/received on the 8h settlement bar (00:00, 08:00, 16:00)
+            is_settlement = common_idx.hour.isin([0, 8, 16])
+            funding_dfs[sym] = f_aligned * is_settlement
+        else:
+            funding_dfs[sym] = pd.Series(0.0, index=common_idx)
+    funding_df = pd.DataFrame(funding_dfs)
 
     # Initialize strategy
     if strategy_name == "momentum":
@@ -185,39 +218,46 @@ def run_simulation(
     weights_history = []
     portfolio = Portfolio(cash=initial_capital, initial_cash=initial_capital)
 
-    lookback = 48
-    print(f"⚙️  Executing {strategy_name.upper()} simulation across {len(common_idx)} bars...")
+    lookback = 72
+    print(f"⚙️  Simulating {strategy_name.upper()} across {len(common_idx)} bars ({common_idx[0].strftime('%Y-%m-%d')} to {common_idx[-1].strftime('%Y-%m-%d')})...")
+    print(f"⏱️  Rebalance Frequency: Every {rebalance_freq_bars} bars (Friction & Turnover Control)")
+
+    current_weights = {sym: 0.0 for sym in valid_symbols}
 
     for i in range(lookback, len(common_idx)):
-        # Sub-window of data
-        sub_idx = common_idx[:i + 1]
-        sub_market = {sym: bars_dict[sym].loc[sub_idx] for sym in symbols}
-        sub_funding = {sym: funding_dict[sym].loc[funding_dict[sym].index <= sub_idx[-1]] for sym in symbols if sym in funding_dict}
+        ts = common_idx[i]
 
-        # Volatilities
-        volatilities = {sym: float(returns_df[sym].iloc[max(0, i - 24):i].std()) or 0.02 for sym in symbols}
+        # Rebalance only at specified bar cadence
+        if (i - lookback) % rebalance_freq_bars == 0:
+            window_start = max(0, i - 120)
+            sub_idx = common_idx[window_start:i + 1]
+            sub_market = {sym: bars_dict[sym].loc[sub_idx] for sym in valid_symbols}
+            sub_funding = {sym: funding_dict[sym].loc[funding_dict[sym].index <= ts] for sym in valid_symbols if sym in funding_dict}
 
-        if strategy_name == "meta":
-            target_dollars, _, _ = strat.generate_portfolio_allocations(
-                market_data=sub_market,
-                portfolio=portfolio,
-                volatilities=volatilities,
-                funding_data=sub_funding,
-            )
-            total_eq = portfolio.total_equity
-            target_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in symbols}
-        elif strategy_name == "carry":
-            signals = strat.generate_signals(sub_market, funding_data=sub_funding)
-            target_dollars = strat.allocate_weights(signals, portfolio, volatilities)
-            total_eq = portfolio.total_equity
-            target_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in symbols}
-        else:
-            signals = strat.generate_signals(sub_market)
-            target_dollars = strat.allocate_weights(signals, portfolio, volatilities)
-            total_eq = portfolio.total_equity
-            target_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in symbols}
+            # Intraday rolling volatility
+            volatilities = {sym: float(returns_df[sym].iloc[max(0, i - 24):i].std()) or 0.02 for sym in valid_symbols}
 
-        weights_history.append((common_idx[i], target_weights))
+            if strategy_name == "meta":
+                target_dollars, _, _ = strat.generate_portfolio_allocations(
+                    market_data=sub_market,
+                    portfolio=portfolio,
+                    volatilities=volatilities,
+                    funding_data=sub_funding,
+                )
+                total_eq = portfolio.total_equity
+                current_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in valid_symbols}
+            elif strategy_name == "carry":
+                signals = strat.generate_signals(sub_market, funding_data=sub_funding)
+                target_dollars = strat.allocate_weights(signals, portfolio, volatilities)
+                total_eq = portfolio.total_equity
+                current_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in valid_symbols}
+            else:
+                signals = strat.generate_signals(sub_market)
+                target_dollars = strat.allocate_weights(signals, portfolio, volatilities)
+                total_eq = portfolio.total_equity
+                current_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in valid_symbols}
+
+        weights_history.append((ts, current_weights))
 
     # Build weights DataFrame
     weight_records = {ts: w for ts, w in weights_history}
@@ -233,15 +273,15 @@ def run_simulation(
     return backtester.run(returns_df=returns_df, weights_df=weights_df, funding_rates_df=funding_df)
 
 
-def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, output_path: Path) -> None:
+def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, preset: str, output_path: Path) -> None:
     """Generates an institutional interactive HTML report with Plotly."""
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
+        vertical_spacing=0.06,
         row_heights=[0.7, 0.3],
         subplot_titles=[
-            f"Institutional Equity Curve ({strategy_name.upper()})",
+            f"Institutional Cumulative Equity Curve — {strategy_name.upper()} ({preset.upper()})",
             "Underwater Drawdown Profile (%)",
         ],
     )
@@ -253,8 +293,8 @@ def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, output
             y=result.equity_curve.values,
             mode="lines",
             name="Portfolio Equity ($)",
-            line=dict(color="#00C853", width=2),
-            hovertemplate="Time: %{x}<br>Equity: $%{y:,.2f}<extra></extra>",
+            line=dict(color="#00E676", width=2),
+            hovertemplate="<b>Date:</b> %{x}<br><b>Equity:</b> $%{y:,.2f}<extra></extra>",
         ),
         row=1, col=1,
     )
@@ -267,19 +307,24 @@ def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, output
             mode="lines",
             fill="tozeroy",
             name="Drawdown (%)",
-            line=dict(color="#D50000", width=1.5),
-            fillcolor="rgba(213, 0, 0, 0.2)",
-            hovertemplate="Time: %{x}<br>Drawdown: %{y:.2f}%<extra></extra>",
+            line=dict(color="#FF1744", width=1.5),
+            fillcolor="rgba(255, 23, 68, 0.2)",
+            hovertemplate="<b>Date:</b> %{x}<br><b>Drawdown:</b> %{y:.2f}%<extra></extra>",
         ),
         row=2, col=1,
     )
 
     fig.update_layout(
         template="plotly_dark",
-        title_text=f"<b>Crypto Alpha Engine: {strategy_name.upper()} Tearsheet</b> | Sharpe: {result.sharpe_ratio:.2f} | Max DD: {result.max_drawdown_pct:.2f}%",
-        height=750,
+        title_text=(
+            f"<b>Crypto Alpha Engine: {strategy_name.upper()} Tearsheet</b> | "
+            f"Sharpe: {result.sharpe_ratio:.2f} | "
+            f"CAGR: {result.cagr_pct:.2f}% | "
+            f"Max DD: {result.max_drawdown_pct:.2f}%"
+        ),
+        height=800,
         showlegend=True,
-        margin=dict(l=60, r=40, t=80, b=40),
+        margin=dict(l=60, r=40, t=90, b=40),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,10 +332,10 @@ def generate_plotly_tearsheet(result: BacktestResult, strategy_name: str, output
     print(f"📊 Interactive Plotly tear sheet exported to: {output_path}")
 
 
-def print_performance_table(result: BacktestResult, strategy_name: str) -> None:
+def print_performance_table(result: BacktestResult, strategy_name: str, preset: str) -> None:
     """Prints institutional summary table."""
     print("\n" + "=" * 70)
-    print(f"  INSTITUTIONAL PERFORMANCE REPORT: {strategy_name.upper()}")
+    print(f"  INSTITUTIONAL PERFORMANCE REPORT: {strategy_name.upper()} ({preset.upper()})")
     print("=" * 70)
     print(f"  Total Return:        {result.total_return_pct:+8.2f}%")
     print(f"  CAGR (Annualized):   {result.cagr_pct:+8.2f}%")
@@ -301,34 +346,39 @@ def print_performance_table(result: BacktestResult, strategy_name: str) -> None:
     print(f"  Max Drawdown:        {result.max_drawdown_pct:8.2f}%")
     print(f"  Profit Factor:       {result.profit_factor:8.2f}")
     print(f"  Win Rate:            {result.win_rate_pct:8.2f}%")
-    print(f"  Total Trades:        {result.total_trades:8d}")
+    print(f"  Active Trades:       {result.total_trades:8d}")
     print("=" * 70 + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Institutional Crypto Strategy Backtester")
     parser.add_argument("--strategy", choices=["momentum", "stat_arb", "carry", "meta"], default="meta", help="Strategy to evaluate.")
-    parser.add_argument("--preset", choices=["top5", "top10"], default="top5", help="Asset universe preset.")
-    parser.add_argument("--source", choices=["drive", "synthetic"], default="synthetic", help="Data source.")
+    parser.add_argument("--preset", choices=["top5", "top10", "top20"], default="top10", help="Asset universe preset.")
+    parser.add_argument("--source", choices=["drive", "synthetic"], default="drive", help="Data source.")
+    parser.add_argument("--rebalance-freq", type=int, default=8, help="Rebalancing frequency in bars (e.g. 8 for 8-hour settlements).")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial portfolio capital.")
-    parser.add_argument("--report", default="reports/backtest_tearsheet.html", help="Output path for HTML report.")
+    parser.add_argument("--start", type=str, default=None, help="Backtest start date (YYYY-MM-DD).")
+    parser.add_argument("--end", type=str, default=None, help="Backtest end date (YYYY-MM-DD).")
+    parser.add_argument("--report", default=None, help="Output path for HTML report.")
     args = parser.parse_args()
 
     symbols = PRESETS[args.preset]
+    report_file = Path(args.report) if args.report else Path(f"reports/tearsheet_{args.strategy}_{args.preset}.html")
 
     print("=" * 70)
     print("  CRYPTO ALPHA ENGINE: INSTITUTIONAL BACKTEST RUNNER")
     print("=" * 70)
-    print(f"  Strategy:  {args.strategy.upper()}")
-    print(f"  Universe:  {args.preset.upper()} ({', '.join(symbols)})")
-    print(f"  Source:    {args.source.upper()}")
-    print(f"  Capital:   ${args.capital:,.2f}")
+    print(f"  Strategy:         {args.strategy.upper()}")
+    print(f"  Universe:         {args.preset.upper()} ({len(symbols)} symbols: {', '.join(symbols[:5])}...)")
+    print(f"  Source:           {args.source.upper()}")
+    print(f"  Initial Capital:  ${args.capital:,.2f}")
+    print(f"  Rebalance Freq:   Every {args.rebalance_freq} bars")
     print("-" * 70)
 
     if args.source == "drive":
         bars_dict, funding_dict = load_drive_market_data(symbols=symbols)
-        if not bars_dict:
-            print("⚠️  No data retrieved from Drive. Falling back to synthetic simulation.")
+        if not bars_dict or len(bars_dict) < len(symbols):
+            print("⚠️  Missing data from Drive. Supplementing with synthetic simulation.")
             bars_dict, funding_dict = generate_synthetic_universe(symbols=symbols)
     else:
         bars_dict, funding_dict = generate_synthetic_universe(symbols=symbols)
@@ -338,10 +388,13 @@ def main():
         bars_dict=bars_dict,
         funding_dict=funding_dict,
         initial_capital=args.capital,
+        rebalance_freq_bars=args.rebalance_freq,
+        start_date=args.start,
+        end_date=args.end,
     )
 
-    print_performance_table(result, args.strategy)
-    generate_plotly_tearsheet(result, args.strategy, Path(args.report))
+    print_performance_table(result, args.strategy, args.preset)
+    generate_plotly_tearsheet(result, args.strategy, args.preset, report_file)
 
 
 if __name__ == "__main__":
