@@ -41,3 +41,41 @@ def test_vision_downloader_save_parquet(tmp_path):
     })
     count2 = downloader.save_klines_to_parquet("BTCUSDT", Timeframe.H1, df_overlapping)
     assert count2 == 3  # 2 + 1 new = 3
+
+
+def test_vision_downloader_save_metrics(tmp_path):
+    downloader = BinanceVisionDownloader(output_dir=tmp_path)
+
+    metrics_data = {
+        "create_time": ["2024-01-01 00:00:00", "2024-01-01 00:05:00"],
+        "symbol": ["BTCUSDT", "BTCUSDT"],
+        "sum_open_interest": [74000.0, 74100.0],
+        "sum_open_interest_value": [3.1e9, 3.12e9],
+        "count_toptrader_long_short_ratio": [1.35, 1.36],
+        "sum_toptrader_long_short_ratio": [1.25, 1.26],
+        "count_long_short_ratio": [1.50, 1.51],
+        "sum_taker_long_short_vol_ratio": [1.31, 1.28],
+    }
+    df = pd.DataFrame(metrics_data)
+    count = downloader.save_metrics_to_parquet("BTCUSDT", df)
+    assert count == 2
+
+    metrics_file = tmp_path / "metrics" / "5m" / "BTCUSDT.parquet"
+    assert metrics_file.exists()
+
+
+def test_vision_downloader_save_funding(tmp_path):
+    downloader = BinanceVisionDownloader(output_dir=tmp_path)
+
+    funding_data = {
+        "calc_time": [1704067200000, 1704096000000],
+        "funding_interval_hours": [8, 8],
+        "last_funding_rate": [0.000374, 0.000272],
+    }
+    df = pd.DataFrame(funding_data)
+    count = downloader.save_funding_to_parquet("BTCUSDT", df)
+    assert count == 2
+
+    funding_file = tmp_path / "funding" / "BTCUSDT.parquet"
+    assert funding_file.exists()
+
