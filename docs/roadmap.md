@@ -103,3 +103,20 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 * **Issue #26**: Execution: Live Paper Trading Deployment & Telemetry Dashboard with Real-Time Prices
   * Connect `TradingDaemon` to CCXT public data feed and monitor live rebalancing via terminal dashboard.
 
+---
+
+## Milestone 8: Operational Resilience & Cross-Exchange Infrastructure (M8)
+**Objective**: Build high-availability exchange connectivity, shadow accounting, real-time alerts, and cross-exchange funding arbitrage.
+
+* **Issue #27**: Infra: Exchange Rate Limiting, WebSocket Heartbeats & Auto-Reconnect Resilience
+  * Leaky-bucket weight limiter, 24h forced-disconnect recovery, and REST fallback.
+* **Issue #28**: Risk: Shadow Accounting & Real-Time Position Reconciliation Engine
+  * Periodic position sync, drift detection, and automatic circuit-breaker lockout upon mismatch.
+* **Issue #29**: Alerts: Real-Time Incident Response & Telemetry Webhooks (Telegram / Discord)
+  * Priority webhook alerting for risk breaches, trade notifications, and daily EOD PnL tear sheets.
+* **Issue #30**: Arbitrage: Multi-Exchange Perp-Perp Funding Spread Arbitrage (Binance vs Bybit)
+  * Dual-exchange delta-neutral funding rate harvesting without spot margin fees.
+* **Issue #31**: Security: Zero-Trust API Key Vault & Read/Trade Permission Validator
+  * Automated pre-flight check guaranteeing withdrawal permissions are disabled on trading keys.
+
+
