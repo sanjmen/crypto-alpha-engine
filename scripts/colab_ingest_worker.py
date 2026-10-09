@@ -35,8 +35,36 @@ else:
 BINANCE_VISION_S3_BASE = "https://data.binance.vision"
 
 TOP_SYMBOLS = [
+    # Top 10 Major Benchmarks
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
-    "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT"
+    "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
+    # Layer 1 / Alt L1 Ecosystem
+    "SUIUSDT", "APTUSDT", "DOTUSDT", "ATOMUSDT", "FTMUSDT",
+    "ALGOUSDT", "EGLDUSDT", "KAVAUSDT", "IOTAUSDT", "MINAUSDT",
+    "ICPUSDT", "SEIUSDT", "TIAUSDT", "THETAUSDT", "ZILUSDT",
+    # Layer 2 / Rollups & Scaling
+    "ARBUSDT", "OPUSDT", "MATICUSDT", "STRKUSDT", "ZKUSDT",
+    "METUSDT", "ZROUSDT",
+    # DeFi / DEX / Lending
+    "UNIUSDT", "AAVEUSDT", "CRVUSDT", "MKRUSDT", "SNXUSDT",
+    "COMPUSDT", "1INCHUSDT", "SUSHIUSDT", "DYDXUSDT", "JUPUSDT",
+    "ENAUSDT", "INJUSDT", "RUNEUSDT", "LDOUSDT", "PENDLEUSDT",
+    # AI & Compute Narrative
+    "FETUSDT", "RENDERUSDT", "TAOUSDT", "WLDUSDT", "GRTUSDT",
+    "RLCUSDT",
+    # Legacy Large Caps & Proof of Work
+    "LTCUSDT", "BCHUSDT", "ETCUSDT", "XMRUSDT", "ZECUSDT",
+    "FILUSDT",
+    # Meme & High Beta
+    "1000PEPEUSDT", "1000SHIBUSDT", "1000FLOKIUSDT", "BONKUSDT",
+    "WIFUSDT", "MEMEUSDT",
+    # Gaming & Metaverse / NFT
+    "SANDUSDT", "MANAUSDT", "AXSUSDT", "GALAUSDT", "ENJUSDT",
+    "CHZUSDT", "MAGICUSDT",
+    # Infrastructure & Oracles
+    "PYTHUSDT", "ONDOUSDT", "QNTUSDT", "BATUSDT", "SKLUSDT",
+    "CTSIUSDT", "GTCUSDT", "OGNUSDT", "KSMUSDT", "FLOWUSDT",
+    "WUSDT"
 ]
 
 TIMEFRAMES = ["1h", "15m"]
@@ -200,18 +228,22 @@ def run_pipeline():
     # 1. Download Klines (1h, 15m) for all symbols
     log("\n📥 Phase 1: Downloading Historical Klines (1h & 15m)...")
     for tf in TIMEFRAMES:
-        for sym in symbols:
+        for i, sym in enumerate(symbols, 1):
             _, _, count = process_symbol_klines(sym, tf)
             total_klines += count
+            if i % 15 == 0:
+                sync_to_drive()
 
     # Sync Klines
     sync_to_drive()
 
     # 2. Download Funding Rates for all symbols
     log("\n📥 Phase 2: Downloading Historical 8h Funding Rates...")
-    for sym in symbols:
+    for i, sym in enumerate(symbols, 1):
         _, count = process_symbol_funding(sym)
         total_funding += count
+        if i % 25 == 0:
+            sync_to_drive()
 
     elapsed = time.time() - start_time
     log(f"\n🎉 [COMPLETE] Ingestion finished in {elapsed:.1f}s.")
