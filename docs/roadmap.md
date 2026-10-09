@@ -1,0 +1,83 @@
+# Development Roadmap: Crypto Alpha Engine
+
+This roadmap structures the development of the **Crypto Alpha Engine** into six progressive, test-driven milestones. Each milestone is decoupled, adheres to Clean Architecture and SOLID principles, and is verified by comprehensive unit tests.
+
+---
+
+## Milestone 1: Ingestion & Market Data Pipeline (M1)
+**Objective**: Build a high-throughput, free crypto market data pipeline utilizing CCXT, Binance, and Bybit public endpoints, persisting to partitioned Parquet files with DuckDB querying.
+
+* **Issue #1**: Define Core Domain Entities & Data Ports
+  * `Bar`, `Tick`, `OrderBook`, `FundingRate`, `SymbolInfo` domain entities.
+  * `IDataProvider`, `IBarStorage`, `IFundingStorage` port abstractions.
+* **Issue #2**: CCXT Free Data Adapter
+  * Integration with Binance USDT-M Futures & Bybit Linear Futures.
+  * OHLCV 1m, 5m, 15m, 1h download with automatic rate limit handling and pagination.
+* **Issue #3**: Parquet Storage & DuckDB Cache Engine
+  * Fast storage partitioned by `symbol/timeframe`.
+  * Incremental append and deduplication via DuckDB.
+* **Issue #4**: CLI Data Download & Cache Telemetry Tool
+  * `scripts/download_market_data.py` supporting Top 30 altcoin universe presets.
+
+---
+
+## Milestone 2: Feature Engineering & Alpha Porting (M2)
+**Objective**: Port and refactor mathematical estimators from `crunch-synth` and `datacrunch-2` into modular, decoupled feature extractors.
+
+* **Issue #5**: Intraday Volatility Estimators
+  * Parkinson, Garman-Klass, Rogers-Satchell, Online GARCH(1,1), Online EWMA.
+* **Issue #6**: Market Microstructure Estimators
+  * Corwin-Schultz bid-ask spread, Amihud illiquidity ratio, Roll effective spread.
+* **Issue #7**: Fractal Hurst Exponent Analysis
+  * Rescaled Range (R/S) and Detrended Fluctuation Analysis (DFA) calibrator.
+* **Issue #8**: Cross-Sectional Normalization & Beta Neutralization
+  * Gaussian rank transformation, cross-sectional z-score, orthogonal market beta projection.
+
+---
+
+## Milestone 3: Regime Detection & Risk Sizing Engine (M3)
+**Objective**: Port density and regime trackers from `synth`, converting probabilistic distributions into capital sizing and circuit breakers.
+
+* **Issue #9**: Student-$t$ Heavy Tail Modeling
+  * Maximum Likelihood estimation of degrees of freedom $\nu$, tail risk assessment (VaR / CVaR).
+* **Issue #10**: Gaussian Mixture Jump Detector
+  * 2-state GMM separating normal diffusion from tail jumps / flash crashes.
+* **Issue #11**: Market Regime Classifier
+  * Categorization into `TRENDING`, `RANGING`, `VOLATILE` with state confidence.
+* **Issue #12**: Volatility-Targeted & Fractional Kelly Position Sizer
+  * Position sizing scaling inversely with Garman-Klass volatility and proportional to expected drift.
+
+---
+
+## Milestone 4: Strategy Engines & Signal Orchestration (M4)
+**Objective**: Build production-grade trading strategies bridging cross-sectional ranking and real-time regime signals.
+
+* **Issue #13**: Cross-Sectional Market-Neutral Long/Short Strategy
+  * Long top quantiles, Short bottom quantiles across Top 30 altcoins.
+* **Issue #14**: Fractal Hurst Regime-Switching Strategy
+  * Momentum trend-following when $H > 0.55$, mean-reversion oscillator when $H < 0.45$, cash when volatile.
+* **Issue #15**: Perpetual Funding Rate Harvesting Strategy
+  * Delta-neutral carry collection with GMM tail jump safety brake.
+* **Issue #16**: Meta-Strategy Ensemble Allocator
+  * Dynamic weight blending across strategies based on rolling Sharpe / CRPS metrics.
+
+---
+
+## Milestone 5: Backtesting Engine with Real Slippage & Fees (M5)
+**Objective**: Build a realistic backtest simulation engine preventing lookahead bias, accounting for maker/taker fees, slippage, and funding cashflows.
+
+* **Issue #17**: Event-Driven & Vectorized Backtest Simulator
+  * Strict time-step simulation preventing data leakage.
+* **Issue #18**: Cost & Execution Impact Models
+  * Binance Futures tier fee schedules (0.02% maker, 0.05% taker) + quadratic market impact.
+* **Issue #19**: Performance Analytics & Plotly Tear Sheets
+  * Cumulative PnL, Annualized Return, Sharpe Ratio, Sortino Ratio, Max Drawdown, Calmar Ratio.
+
+---
+
+## Milestone 6: Paper Trading & Live Execution Bot (M6)
+**Objective**: Build paper trading simulation on testnet and live execution capabilities with automated safety stops.
+
+* **Issue #20**: Paper Trading Engine with Latency & Partial Fill Simulation
+* **Issue #21**: CCXT Execution Adapter with Hard Circuit Breakers
+* **Issue #22**: Live Terminal Telemetry Dashboard & CLI Daemon
