@@ -83,6 +83,23 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 ## Milestone 6: Paper Trading & Live Execution Bot (M6)
 **Objective**: Build paper trading simulation on testnet and live execution capabilities with automated safety stops.
 
-* **Issue #20**: Paper Trading Engine with Latency & Partial Fill Simulation
-* **Issue #21**: CCXT Execution Adapter with Hard Circuit Breakers
-* **Issue #22**: Live Terminal Telemetry Dashboard & CLI Daemon
+* **Issue #20**: Automated Trading Daemon & Multi-Strategy Rebalancer
+
+---
+
+## Milestone 7: Quantitative Research & Production Hardening (M7)
+**Objective**: Empirically calibrate machine learning models, sector cointegration, non-linear market impact, and run full-universe backtests and paper trading.
+
+* **Issue #21**: ML: Purged Walk-Forward Cross-Validation & LightGBM Hyperparameter Tuning in Colab GPU
+  * Prevent temporal leakage and train models across 83 symbols utilizing Colab GPU compute credits.
+* **Issue #22**: Stat-Arb: Sector Clustering & Multi-Asset Cointegration Testing for Pair Baskets
+  * Cluster assets (L1, DeFi, Meme, AI) and model stationary cointegrated spreads.
+* **Issue #23**: Execution Alpha: Rebalance Frequency Optimization & Passive Maker Order Execution
+  * Quantify fee drag and model post-only limit orders to capture VIP maker rebates.
+* **Issue #24**: Microstructure: Non-Linear Market Impact & Slippage Modeling via L2 Book Depth
+  * Square-root market impact law ($\Delta P \propto \sigma \sqrt{Q/V}$) calibrated with L2 book depth.
+* **Issue #25**: Backtest: Full Universe Multi-Asset Simulation (2023–2026) on 83 Symbols via Google Drive
+  * Benchmark multi-year performance across the 12.45 million bar dataset stored in Drive.
+* **Issue #26**: Execution: Live Paper Trading Deployment & Telemetry Dashboard with Real-Time Prices
+  * Connect `TradingDaemon` to CCXT public data feed and monitor live rebalancing via terminal dashboard.
+
