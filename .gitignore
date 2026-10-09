@@ -60,3 +60,5 @@ secrets/
 .pytest_cache/
 .coverage
 htmlcov/
+reports/*.html
+reports/*.png
