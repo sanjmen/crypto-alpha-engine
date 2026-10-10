@@ -67,5 +67,23 @@ pytest -v tests/
 
 ---
 
+## 🛰️ Live Shadow Trading Engine (0 Capital Risk)
+
+Run simulated execution against real-time Binance USDS-M Futures Mainnet prices with local SQLite WAL persistence:
+
+```bash
+# 1. Run a single synchronous step (poll Binance Mainnet, evaluate orders, record snapshot):
+python scripts/run_shadow_trading.py --once
+
+# 2. Run the continuous background daemon:
+python scripts/run_shadow_trading.py --daemon
+
+# 3. Launch the real-time Rich terminal telemetry dashboard:
+python scripts/run_shadow_trading.py --monitor
+```
+
+---
+
 ## 📜 License
 MIT License. Developed for quantitative investment and algorithmic trading research.
+
