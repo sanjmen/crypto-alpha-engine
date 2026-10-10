@@ -62,3 +62,10 @@ secrets/
 htmlcov/
 reports/*.html
 reports/*.png
+
+# Local Databases
+*.db
+*.db-shm
+*.db-wal
+data/*.db*
+
