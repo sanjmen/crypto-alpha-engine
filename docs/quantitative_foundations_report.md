@@ -135,6 +135,24 @@ Miden la concentración secuencial de compras o ventas continuas, detectando alg
 
 ---
 
+## 6. Solución a la Paradoja de Desincronización: Canastas Agregadas y Arquitectura Híbrida
+
+Para conciliar la necesidad de sincronía de los modelos transversales (estilo CrunchDAO) con las ventajas estadísticas de las barras de información (López de Prado), se diseñan dos arquitecturas matemáticas:
+
+### 6.1. Canasta Agregada de Mercado (*Market-Wide Basket Dollar Bars*)
+En lugar de muestrear cada activo por separado con su propio umbral $D$, se calcula el volumen nocional transaccionado por **todo el mercado agregado de 83 activos**:
+$$D_{\text{mercado}, k} = \sum_{t \in B_k} \sum_{i=1}^N P_{i,t} v_{i,t} \ge \bar{D}_{\text{mercado}}$$
+* Por ejemplo, fijar $\bar{D}_{\text{mercado}} = \$500\text{M}$.
+* En el instante exacto en que el mercado cripto consolidado alcanza los \$500M negociados, se emite un pulso global y se toma una **foto instantánea sincrónica de todos los 83 activos**.
+* **Ventaja**: Todos los activos comparten exactamente el mismo timestamp $t_k$, preservando la validez del ranking transversal, pero el espaciado temporal se comprime durante crisis y se expande en consolidaciones.
+
+### 6.2. Arquitectura Híbrida Desacoplada
+* **Capa 1 (Activos Ancla - Alta Liquidez)**: Para BTC y ETH, se calculan Dollar Imbalance Bars individuales independientes. Estos activos mueven el 60% del volumen del ecosistema y sus señales son predictoras directas de régimen e impulso general.
+* **Capa 2 (Universo Transversal - 83 Activos)**: Se mantiene la sincronización en Klines de 1h o Basket Dollar Bars para clasificar el valor relativo transversalmente.
+* **Capa 3 (Meta-Allocator)**: El motor de asignación pondera la señal direccional ancla con las señales relativas del universo altcoin, resolviendo la desincronización en la capa de optimización de portafolio y no forzando matrices transversales mal condicionadas.
+
+---
+
 ## 7. La Paradoja de la Desincronización Transversal: CrunchDAO vs. López de Prado
 
 ### 7.1. El Conflicto Metodológico entre Torneos Cuantitativos y Dollar Bars
@@ -240,4 +258,59 @@ La teoría de López de Prado propone una técnica específica para construir Me
 1. **CrunchDAO y Synth usan Klines** por necesidad matemática: el ranking transversal de 83 activos requiere sincronía temporal estricta $t$.
 2. **López de Prado usa Dollar Bars** para modelos direccionales de series temporales de un solo activo (BTC, futuros E-mini), donde no existe desincronización.
 3. **El Ensamble Heterogéneo (Meta-Modelo) es superior a cualquier modelo individual**: Al combinar modelos transversales (CrunchDAO), modelos basados en Dollar Bars (López de Prado), reversión fractal y carry, los errores se cancelan y el Sharpe ratio del portafolio consolidado aumenta estructuralmente.
+
+---
+
+## 10. Organización del Trabajo y Roadmap de Milestones (M1 a M10)
+
+Para transformar esta fundamentación matemática en un sistema de producción institucional sin incurrir en deuda técnica ni dispersión, el trabajo se estructura en **10 Milestones secuenciales y 5 Fases Operativas**:
+
+### 10.1. Matriz de Milestones y Asignación de Tareas
+
+| Milestone | Nombre | Enfoque Principal | Estado / Issues Clave |
+| :--- | :--- | :--- | :--- |
+| **M1** | *Ingestion & Market Data Pipeline* | Ingestión S3 / DuckDB / Zero Disk | Completado (Issues #1 a #4) |
+| **M2** | *Feature Engineering & Alpha Porting* | Estimadores Volatilidad, Hurst, Microestructura | Completado (Issues #5 a #8) |
+| **M3** | *Regime Detection & Risk Sizing Engine* | GMM Jumps, Heavy Tails, Regime Classifier | Completado (Issues #9 a #10) |
+| **M4** | *Strategy Engines & Signal Orchestration* | Alfas Transversales, Stat-Arb, Carry, Meta-Allocator | Completado (Issues #11 a #15) |
+| **M5** | *Backtesting Engine with Real Slippage & Fees* | Simulación Vectorizada, Fees VIP, Maker Alpha | Completado (Issues #16, #17, #23) |
+| **M6** | *Paper Trading & Live Execution Bot* | Broker Paper, Circuit Breakers, Trading Daemon | Completado (Issues #18 a #20) |
+| **M7** | *Quantitative Research & ML Alpha Optimization* | Purged Walk-Forward CV, Optuna GPU, Cointegración | **Activo** (Issues #21, #22, #24, #25) |
+| **M8** | *Operational Resilience & Exchange Infrastructure* | Paper Trading en Vivo, Webhooks, Shadow Accounting | **Activo** (Issues #26, #27, #28, #29, #30, #31) |
+| **M9** | *Information-Driven Bars & aggTrades Synthesis* | Ingestión aggTrades, Dollar Bars, Basket Bars | **Activo** (Issues #32, #33, #34) |
+| **M10** | *Heterogeneous Meta-Model Ensembling & Meta-Labeling* | Triple Barrier Method, Meta-Labeling ML, Asignación HRP | **Activo** (Issues #35, #36) |
+
+---
+
+### 10.2. Las 5 Fases de Ejecución Progresiva
+
+```mermaid
+flowchart LR
+    Fase1["Fase 1: Despliegue en Vivo<br>Paper Trading Daemon (#26)<br>Meta-Estrategia Validada (Sharpe 0.77)"]
+    Fase2["Fase 2: Simulación Masiva<br>Backtest Multi-Activo (#25)<br>83 Símbolos 2023-2026 (Drive)"]
+    Fase3["Fase 3: Datos de Microestructura<br>aggTrades & Dollar Bars (#32-#34)<br>Desacoplamiento López de Prado"]
+    Fase4["Fase 4: Optimización ML<br>Purged CV & Meta-Labeling (#21, #35)<br>Entrenamiento GPU en Colab"]
+    Fase5["Fase 5: Ensamble Meta-Modelo<br>Asignación HRP & Multi-Exchange (#36, #30)<br>Resiliencia y Monitoreo (#28, #29)"]
+
+    Fase1 --> Fase2
+    Fase2 --> Fase3
+    Fase3 --> Fase4
+    Fase4 --> Fase5
+```
+
+1. **Fase 1 (Inmediata - Poner el Motor a Rodar)**:
+   * **Objetivo**: Conectar el `TradingDaemon` y el `SmartExecutionRouter` en modo Paper Trading conectado a los websockets/tickers públicos de Binance en tiempo real ([Issue #26](https://github.com/sanjmen/crypto-alpha-engine/issues/26)).
+   * **Justificación**: El motor actual ya ha demostrado ser rentable (+53.50% neto, Sharpe 0.77). Ponerlo a correr en paper trading valida la infraestructura de ejecución pasiva (Maker) y telemetría en tiempo real de inmediato sin esperar a los modelos ML avanzados.
+2. **Fase 2 (Estrés Histórico del Universo Completo)**:
+   * **Objetivo**: Correr la simulación completa 2023–2026 sobre los 83 activos descargados en Google Drive ([Issue #25](https://github.com/sanjmen/crypto-alpha-engine/issues/25)).
+   * **Justificación**: Confirmar que el alfa sobrevive en cross-section a lo largo de bull markets, bear markets y períodos de compresión lateral de volatilidad.
+3. **Fase 3 (Datos de Información & Microestructura - López de Prado)**:
+   * **Objetivo**: Ingestar `aggTrades` de BTC/ETH en Google Drive y sintetizar `Dollar Bars` e `Imbalance Bars` ([Issues #32, #33, #34](https://github.com/sanjmen/crypto-alpha-engine/issues/32)).
+   * **Justificación**: Desbloquear el alfa de microestructura y flujo de órdenes institucional para los activos ancla.
+4. **Fase 4 (Entrenamiento ML Riguroso & Meta-Labeling en Colab GPU)**:
+   * **Objetivo**: Ejecutar Purged Walk-Forward Cross-Validation y optimización Bayesiana (Optuna) de LightGBM en Colab con GPU credits ([Issue #21](https://github.com/sanjmen/crypto-alpha-engine/issues/21)), seguido del Meta-Labeling con Triple Barrier Method ([Issue #35](https://github.com/sanjmen/crypto-alpha-engine/issues/35)).
+   * **Justificación**: Entrenar modelos de predicción y dimensionamiento de posición matemáticamente correctos y libres de filtración temporal (*look-ahead bias*).
+5. **Fase 5 (Ensamble Meta-Modelo Consolidado & Resiliencia)**:
+   * **Objetivo**: Integrar los 4 sub-modelos ortogonales bajo asignación Hierarchical Risk Parity (HRP) ([Issue #36](https://github.com/sanjmen/crypto-alpha-engine/issues/36)) y robustecer con reconciliación de órdenes (*shadow accounting*) y webhooks de alerta ([Issues #28, #29](https://github.com/sanjmen/crypto-alpha-engine/issues/28)).
+
 
