@@ -34,6 +34,21 @@ from src.strategies.funding_carry_arbitrage import FundingCarryArbitrageStrategy
 from src.strategies.meta_allocator import MetaStrategyAllocator
 from src.strategies.stat_arb_mean_reversion import StatArbMeanReversionStrategy
 
+ALL_82_SYMBOLS = [
+    "1000FLOKIUSDT", "1000PEPEUSDT", "1000SHIBUSDT", "1INCHUSDT", "AAVEUSDT", "ADAUSDT",
+    "ALGOUSDT", "APTUSDT", "ARBUSDT", "ATOMUSDT", "AVAXUSDT", "AXSUSDT", "BATUSDT",
+    "BCHUSDT", "BNBUSDT", "BTCUSDT", "CHZUSDT", "COMPUSDT", "CRVUSDT", "CTSIUSDT",
+    "DOGEUSDT", "DOTUSDT", "DYDXUSDT", "EGLDUSDT", "ENAUSDT", "ENJUSDT", "ETCUSDT",
+    "ETHUSDT", "FETUSDT", "FILUSDT", "FLOWUSDT", "FTMUSDT", "GALAUSDT", "GRTUSDT",
+    "GTCUSDT", "ICPUSDT", "INJUSDT", "IOTAUSDT", "JUPUSDT", "KAVAUSDT", "KSMUSDT",
+    "LDOUSDT", "LINKUSDT", "LTCUSDT", "MAGICUSDT", "MANAUSDT", "MATICUSDT", "MEMEUSDT",
+    "METUSDT", "MINAUSDT", "MKRUSDT", "NEARUSDT", "OGNUSDT", "ONDOUSDT", "OPUSDT",
+    "PENDLEUSDT", "PYTHUSDT", "QNTUSDT", "RENDERUSDT", "RLCUSDT", "RUNEUSDT", "SANDUSDT",
+    "SEIUSDT", "SKLUSDT", "SNXUSDT", "SOLUSDT", "STRKUSDT", "SUIUSDT", "SUSHIUSDT",
+    "TAOUSDT", "THETAUSDT", "TIAUSDT", "UNIUSDT", "WIFUSDT", "WLDUSDT", "WUSDT",
+    "XMRUSDT", "XRPUSDT", "ZECUSDT", "ZILUSDT", "ZKUSDT", "ZROUSDT",
+]
+
 PRESETS = {
     "top5": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"],
     "top10": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT"],
@@ -41,6 +56,8 @@ PRESETS = {
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
         "SUIUSDT", "APTUSDT", "DOTUSDT", "ATOMUSDT", "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "KAVAUSDT", "ICPUSDT", "ARBUSDT"
     ],
+    "all82": ALL_82_SYMBOLS,
+    "all": ALL_82_SYMBOLS,
 }
 
 
@@ -177,21 +194,24 @@ def run_simulation(
     if not valid_symbols:
         raise ValueError("No valid price data available for backtest.")
 
-    # Find common date index
-    common_idx = bars_dict[valid_symbols[0]].index
-    for sym in valid_symbols[1:]:
-        common_idx = common_idx.intersection(bars_dict[sym].index)
+    # Anchor date index to BTCUSDT or longest series to preserve full historical horizon
+    anchor_sym = "BTCUSDT" if "BTCUSDT" in valid_symbols else valid_symbols[0]
+    master_idx = bars_dict[anchor_sym].index
 
     if start_date:
-        common_idx = common_idx[common_idx >= pd.Timestamp(start_date, tz="UTC")]
+        master_idx = master_idx[master_idx >= pd.Timestamp(start_date, tz="UTC")]
     if end_date:
-        common_idx = common_idx[common_idx <= pd.Timestamp(end_date, tz="UTC")]
+        master_idx = master_idx[master_idx <= pd.Timestamp(end_date, tz="UTC")]
 
-    if len(common_idx) < 100:
-        raise ValueError(f"Insufficient aligned bars ({len(common_idx)}) to evaluate backtest.")
+    if len(master_idx) < 100:
+        raise ValueError(f"Insufficient aligned bars ({len(master_idx)}) to evaluate backtest.")
 
-    # Price matrix & returns
-    close_df = pd.DataFrame({sym: bars_dict[sym].loc[common_idx, "close"] for sym in valid_symbols})
+    # Price matrix & returns with forward-fill and dynamic survivorship
+    close_dfs = {}
+    for sym in valid_symbols:
+        s_series = bars_dict[sym]["close"]
+        close_dfs[sym] = s_series.reindex(master_idx)
+    close_df = pd.DataFrame(close_dfs)
     returns_df = close_df.pct_change().fillna(0.0)
 
     # Funding settlements matrix (forward-fill 8h settlements across 1h bars)
@@ -199,12 +219,12 @@ def run_simulation(
     for sym in valid_symbols:
         if sym in funding_dict and not funding_dict[sym].empty:
             f_series = funding_dict[sym]["funding_rate"]
-            f_aligned = f_series.reindex(common_idx, method="ffill").fillna(0.0)
+            f_aligned = f_series.reindex(master_idx, method="ffill").fillna(0.0)
             # Funding is only paid/received on the 8h settlement bar (00:00, 08:00, 16:00)
-            is_settlement = common_idx.hour.isin([0, 8, 16])
+            is_settlement = master_idx.hour.isin([0, 8, 16])
             funding_dfs[sym] = f_aligned * is_settlement
         else:
-            funding_dfs[sym] = pd.Series(0.0, index=common_idx)
+            funding_dfs[sym] = pd.Series(0.0, index=master_idx)
     funding_df = pd.DataFrame(funding_dfs)
 
     # Initialize strategy
@@ -221,23 +241,36 @@ def run_simulation(
     portfolio = Portfolio(cash=initial_capital, initial_cash=initial_capital)
 
     lookback = 72
-    print(f"⚙️  Simulating {strategy_name.upper()} across {len(common_idx)} bars ({common_idx[0].strftime('%Y-%m-%d')} to {common_idx[-1].strftime('%Y-%m-%d')})...")
+    print(f"⚙️  Simulating {strategy_name.upper()} across {len(master_idx)} bars ({master_idx[0].strftime('%Y-%m-%d')} to {master_idx[-1].strftime('%Y-%m-%d')})...")
     print(f"⏱️  Rebalance Frequency: Every {rebalance_freq_bars} bars | Execution: {execution_mode.upper()} | Deadband: {turnover_deadband*100:.1f}%")
 
     current_weights = {sym: 0.0 for sym in valid_symbols}
 
-    for i in range(lookback, len(common_idx)):
-        ts = common_idx[i]
+    for i in range(lookback, len(master_idx)):
+        ts = master_idx[i]
 
         # Rebalance only at specified bar cadence
         if (i - lookback) % rebalance_freq_bars == 0:
             window_start = max(0, i - 120)
-            sub_idx = common_idx[window_start:i + 1]
-            sub_market = {sym: bars_dict[sym].loc[sub_idx] for sym in valid_symbols}
-            sub_funding = {sym: funding_dict[sym].loc[funding_dict[sym].index <= ts] for sym in valid_symbols if sym in funding_dict}
+            sub_idx = master_idx[window_start:i + 1]
+            sub_market = {}
+            for sym in valid_symbols:
+                if sym in bars_dict:
+                    common_sub = bars_dict[sym].index.intersection(sub_idx)
+                    if len(common_sub) >= 30:
+                        sub_market[sym] = bars_dict[sym].loc[common_sub]
+
+            sub_funding = {
+                sym: funding_dict[sym].loc[funding_dict[sym].index <= ts]
+                for sym in valid_symbols
+                if sym in funding_dict and not funding_dict[sym].empty
+            }
 
             # Intraday rolling volatility
-            volatilities = {sym: float(returns_df[sym].iloc[max(0, i - 24):i].std()) or 0.02 for sym in valid_symbols}
+            volatilities = {
+                sym: float(returns_df[sym].iloc[max(0, i - 24):i].std()) or 0.02
+                for sym in sub_market
+            }
 
             if strategy_name == "meta":
                 target_dollars, _, _ = strat.generate_portfolio_allocations(
@@ -263,7 +296,7 @@ def run_simulation(
 
     # Build weights DataFrame
     weight_records = {ts: w for ts, w in weights_history}
-    weights_df = pd.DataFrame.from_dict(weight_records, orient="index").reindex(common_idx).fillna(0.0)
+    weights_df = pd.DataFrame.from_dict(weight_records, orient="index").reindex(master_idx).fillna(0.0)
 
     # Run backtester with Execution Alpha
     backtester = VectorizedBacktester(
@@ -363,7 +396,7 @@ def print_performance_table(result: BacktestResult, strategy_name: str, preset: 
 def main():
     parser = argparse.ArgumentParser(description="Institutional Crypto Strategy Backtester")
     parser.add_argument("--strategy", choices=["momentum", "stat_arb", "carry", "meta"], default="meta", help="Strategy to evaluate.")
-    parser.add_argument("--preset", choices=["top5", "top10", "top20"], default="top10", help="Asset universe preset.")
+    parser.add_argument("--preset", choices=["top5", "top10", "top20", "all82", "all"], default="all82", help="Asset universe preset.")
     parser.add_argument("--source", choices=["drive", "synthetic"], default="drive", help="Data source.")
     parser.add_argument("--rebalance-freq", type=int, default=8, help="Rebalancing frequency in bars (e.g. 8 for 8-hour settlements).")
     parser.add_argument("--execution-mode", choices=["taker", "maker", "hybrid"], default="maker", help="Execution mode (maker=0.02%% limit, taker=0.04%% market+slip, hybrid).")
