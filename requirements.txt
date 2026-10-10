@@ -8,6 +8,7 @@ duckdb>=0.9.0
 # Machine Learning & Quantitative Modeling
 scikit-learn>=1.3.0
 lightgbm>=4.0.0
+optuna>=3.0.0
 
 # Crypto Exchange Ingestion & Execution
 ccxt>=4.2.0
