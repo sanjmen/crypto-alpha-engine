@@ -8,14 +8,15 @@ Includes:
 3. Amihud (2002) Illiquidity Ratio.
 """
 
-from typing import List, Union
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
 
 def corwin_schultz_spread(
-    high: Union[np.ndarray, pd.Series, List[float]],
-    low: Union[np.ndarray, pd.Series, List[float]],
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
 ) -> np.ndarray:
     """
     Computes Corwin-Schultz (2012) Bid-Ask Spread from consecutive high-low pairs.
@@ -58,7 +59,22 @@ def corwin_schultz_spread(
     return spreads
 
 
-def roll_effective_spread(prices: Union[np.ndarray, pd.Series, List[float]]) -> float:
+def rolling_corwin_schultz_spread(
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
+    window: int = 24,
+) -> np.ndarray:
+    """
+    Computes rolling mean of Corwin-Schultz spread over specified window.
+    Useful for smoothing single-bar microstructure noise.
+    """
+    raw_spreads = corwin_schultz_spread(high, low)
+    s = pd.Series(raw_spreads)
+    rolling_s = s.rolling(window=window, min_periods=1).mean().values
+    return np.asarray(rolling_s, dtype=np.float64)
+
+
+def roll_effective_spread(prices: np.ndarray | pd.Series | list[float]) -> float:
     """
     Computes Roll (1984) Effective Spread from serial covariance of price increments.
     S = 2 * sqrt(-cov(dr_t, dr_{t-1})) when cov < 0, else 0.
@@ -76,8 +92,8 @@ def roll_effective_spread(prices: Union[np.ndarray, pd.Series, List[float]]) -> 
 
 
 def amihud_illiquidity(
-    returns: Union[np.ndarray, pd.Series, List[float]],
-    volumes: Union[np.ndarray, pd.Series, List[float]],
+    returns: np.ndarray | pd.Series | list[float],
+    volumes: np.ndarray | pd.Series | list[float],
 ) -> float:
     """
     Computes Amihud (2002) Illiquidity ratio:
@@ -97,3 +113,22 @@ def amihud_illiquidity(
     v_v = v[valid_mask]
     illiq = np.mean(r_v / v_v)
     return float(illiq)
+
+
+def rolling_amihud_illiquidity(
+    returns: np.ndarray | pd.Series | list[float],
+    volumes: np.ndarray | pd.Series | list[float],
+    window: int = 24,
+) -> np.ndarray:
+    """Computes rolling Amihud illiquidity over a specified bar window."""
+    r = np.asarray(returns, dtype=np.float64)
+    v = np.asarray(volumes, dtype=np.float64)
+    n = len(r)
+    if n == 0 or len(v) != n:
+        return np.zeros(n, dtype=np.float64)
+
+    ratio = np.where(v > 0, np.abs(r) / np.maximum(v, 1.0), 0.0)
+    s = pd.Series(ratio)
+    rolling_illiq = s.rolling(window=window, min_periods=1).mean().values
+    return np.asarray(rolling_illiq, dtype=np.float64)
+

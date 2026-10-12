@@ -5,13 +5,11 @@ and stores clean, deduplicated Parquet files.
 Works seamlessly on Local Mac, Google Colab, and Google Drive mounts.
 """
 
-from datetime import datetime, timezone
 import io
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Union
 import urllib.request
 import zipfile
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -41,6 +39,10 @@ FUNDING_COLUMN_NAMES = [
     "calc_time", "funding_interval_hours", "last_funding_rate"
 ]
 
+BOOK_DEPTH_COLUMN_NAMES = [
+    "timestamp", "percentage", "depth", "notional"
+]
+
 
 class BinanceVisionDownloader:
     """
@@ -48,36 +50,38 @@ class BinanceVisionDownloader:
     Zero rate limits, zero API keys, in-memory decompression.
     """
 
-    def __init__(self, output_dir: Union[str, Path]):
+    def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _fetch_zip_as_df(self, url: str, column_names: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
+    def _fetch_zip_as_df(self, url: str, column_names: list[str] | None = None) -> pd.DataFrame | None:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                with zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
-                    csv_name = zf.namelist()[0]
-                    # Check if file has header
-                    with zf.open(csv_name) as f:
-                        first_line = f.readline().decode("utf-8")
-                        has_header = (
-                            "open_time" in first_line
-                            or "create_time" in first_line
-                            or "calc_time" in first_line
-                        )
+                data_bytes = resp.read()
+            with zipfile.ZipFile(io.BytesIO(data_bytes)) as zf:
+                csv_name = zf.namelist()[0]
+                # Check if file has header
+                with zf.open(csv_name) as f:
+                    first_line = f.readline().decode("utf-8")
+                    has_header = (
+                        "open_time" in first_line
+                        or "create_time" in first_line
+                        or "calc_time" in first_line
+                        or "percentage" in first_line
+                    )
 
-                    if has_header:
-                        df = pd.read_csv(zf.open(csv_name))
-                    else:
-                        df = pd.read_csv(zf.open(csv_name), header=None, names=column_names)
-                    return df
+                if has_header:
+                    df = pd.read_csv(zf.open(csv_name))
+                else:
+                    df = pd.read_csv(zf.open(csv_name), header=None, names=column_names)
+                return df
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
             logger.warning(f"HTTP Error {e.code} for {url}")
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Error streaming {url}: {e}")
             return None
 
@@ -87,7 +91,7 @@ class BinanceVisionDownloader:
         year: int,
         month: int,
         timeframe: Timeframe = Timeframe.H1,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Downloads a single monthly klines ZIP archive and parses into a DataFrame."""
         clean_sym = symbol.replace("/", "").replace(":", "").upper()
         month_str = f"{month:02d}"
@@ -99,7 +103,7 @@ class BinanceVisionDownloader:
         symbol: str,
         date_str: str,  # YYYY-MM-DD
         timeframe: Timeframe = Timeframe.H1,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Downloads a single daily klines ZIP archive and parses into a DataFrame."""
         clean_sym = symbol.replace("/", "").replace(":", "").upper()
         url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/daily/klines/{clean_sym}/{timeframe.value}/{clean_sym}-{timeframe.value}-{date_str}.zip"
@@ -109,7 +113,7 @@ class BinanceVisionDownloader:
         self,
         symbol: str,
         date_str: str,  # YYYY-MM-DD
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Downloads 5-minute derivatives metrics for a specific date."""
         clean_sym = symbol.replace("/", "").replace(":", "").upper()
         url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/daily/metrics/{clean_sym}/{clean_sym}-metrics-{date_str}.zip"
@@ -120,7 +124,7 @@ class BinanceVisionDownloader:
         symbol: str,
         year: int,
         month: int,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Downloads monthly 8h funding rate settlements."""
         clean_sym = symbol.replace("/", "").replace(":", "").upper()
         month_str = f"{month:02d}"
@@ -265,6 +269,64 @@ class BinanceVisionDownloader:
             merged_df = duckdb.query(query).to_df().drop(columns=["rn"])
         else:
             merged_df = df_clean.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        table = pa.Table.from_pandas(merged_df)
+        pq.write_table(table, file_path, compression="zstd")
+        return len(merged_df)
+
+    def download_daily_book_depth(
+        self,
+        symbol: str,
+        date_str: str,  # YYYY-MM-DD
+    ) -> pd.DataFrame | None:
+        """Downloads a single daily L2 bookDepth ZIP archive and parses into a DataFrame."""
+        clean_sym = symbol.replace("/", "").replace(":", "").upper()
+        url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/daily/bookDepth/{clean_sym}/{clean_sym}-bookDepth-{date_str}.zip"
+        return self._fetch_zip_as_df(url, BOOK_DEPTH_COLUMN_NAMES)
+
+    def save_book_depth_to_parquet(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+    ) -> int:
+        """Saves L2 bookDepth snapshots to partitioned Parquet file."""
+        if df is None or df.empty:
+            return 0
+
+        clean_sym = symbol.replace("/", "_").replace(":", "_").upper()
+        target_dir = self.output_dir / "book_depth" / "daily"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{clean_sym}.parquet"
+
+        if "timestamp" in df.columns:
+            ts = pd.to_datetime(df["timestamp"], utc=True)
+            ts_epoch = (ts - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)
+        else:
+            ts_epoch = pd.Series(np.zeros(len(df), dtype=np.int64))
+
+        df_clean = pd.DataFrame({
+            "timestamp": ts_epoch.astype(np.int64),
+            "symbol": symbol,
+            "percentage": pd.to_numeric(df["percentage"], errors="coerce").astype(np.int64),
+            "depth": pd.to_numeric(df["depth"], errors="coerce").astype(np.float64),
+            "notional": pd.to_numeric(df["notional"], errors="coerce").astype(np.float64),
+        })
+
+        if file_path.exists():
+            query = f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp, percentage ORDER BY timestamp) as rn
+                    FROM (
+                        SELECT * FROM read_parquet('{file_path}')
+                        UNION ALL
+                        SELECT * FROM df_clean
+                    )
+                ) WHERE rn = 1
+                ORDER BY timestamp ASC, percentage ASC
+            """
+            merged_df = duckdb.query(query).to_df().drop(columns=["rn"])
+        else:
+            merged_df = df_clean.drop_duplicates(subset=["timestamp", "percentage"]).sort_values(["timestamp", "percentage"]).reset_index(drop=True)
 
         table = pa.Table.from_pandas(merged_df)
         pq.write_table(table, file_path, compression="zstd")

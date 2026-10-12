@@ -5,10 +5,11 @@ exchange slippage, and 8-hour perpetual funding rate cashflows.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+
+from src.features.market_impact import NonLinearMarketImpactModel
 
 
 @dataclass
@@ -50,6 +51,7 @@ class VectorizedBacktester:
         execution_mode: str = "taker",        # "taker", "maker", or "hybrid"
         turnover_deadband: float = 0.0,       # Deadband buffer (e.g. 0.03 for 3%)
         periods_per_year: int = 8760,         # 8,760 hours in a year (1h bars)
+        impact_model: NonLinearMarketImpactModel | None = None,
     ):
         self.initial_capital = initial_capital
         self.taker_fee = taker_fee
@@ -58,6 +60,7 @@ class VectorizedBacktester:
         self.execution_mode = execution_mode.lower()
         self.turnover_deadband = turnover_deadband
         self.periods_per_year = periods_per_year
+        self.impact_model = impact_model
 
         # Determine effective cost per turnover unit
         if self.execution_mode == "maker":
@@ -74,10 +77,13 @@ class VectorizedBacktester:
         self,
         returns_df: pd.DataFrame,
         weights_df: pd.DataFrame,
-        funding_rates_df: Optional[pd.DataFrame] = None,
+        funding_rates_df: pd.DataFrame | None = None,
+        volumes_df: pd.DataFrame | None = None,
+        volatilities_df: pd.DataFrame | None = None,
     ) -> BacktestResult:
         """
-        Executes portfolio simulation with optional turnover deadband and passive execution.
+        Executes portfolio simulation with optional turnover deadband, passive execution,
+        and dynamic market impact slippage modeling.
         """
         # Align index and symbols
         common_idx = returns_df.index.intersection(weights_df.index)
@@ -88,7 +94,6 @@ class VectorizedBacktester:
 
         # Apply turnover deadband filter (hysteresis buffer)
         if self.turnover_deadband > 0:
-            effective_weights = target_weights.copy()
             prev_w = np.zeros(len(common_symbols))
             weights_arr = target_weights.values
             effective_arr = np.zeros_like(weights_arr)
@@ -112,7 +117,25 @@ class VectorizedBacktester:
 
         # 2. Transaction costs from weight turnover: sum(|w_t - w_{t-1}|) * cost
         weight_turnover = (weights - shifted_weights).abs().sum(axis=1)
-        transaction_costs = weight_turnover * self.total_cost_per_turnover
+        if self.impact_model is not None and volumes_df is not None and volatilities_df is not None:
+            v_common = [c for c in common_symbols if c in volumes_df.columns and c in volatilities_df.columns]
+            if v_common:
+                vols = volumes_df.reindex(index=common_idx, columns=v_common).fillna(50_000_000.0)
+                sigmas = volatilities_df.reindex(index=common_idx, columns=v_common).fillna(0.005)
+                turnover_mat = (weights[v_common] - shifted_weights[v_common]).abs()
+                q_mat = turnover_mat * self.initial_capital
+                q_v = (q_mat / np.maximum(vols, 1000.0)).clip(lower=1e-7, upper=1.0)
+                y_coef = self.impact_model.params.Y_coefficient
+                alpha_exp = self.impact_model.params.alpha_exponent
+                impact_mat = y_coef * sigmas * (q_v ** alpha_exp)
+                half_spread = self.impact_model.params.min_slippage_bps / 10_000.0
+                dynamic_slippage = np.maximum(half_spread, half_spread + impact_mat)
+                effective_cost_mat = self.taker_fee + dynamic_slippage
+                transaction_costs = (turnover_mat * effective_cost_mat).sum(axis=1)
+            else:
+                transaction_costs = weight_turnover * self.total_cost_per_turnover
+        else:
+            transaction_costs = weight_turnover * self.total_cost_per_turnover
 
         # 3. Funding rate cashflows: sum(w_{t-1} * funding_rate_t)
         funding_pnl = pd.Series(0.0, index=common_idx)

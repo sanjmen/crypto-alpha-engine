@@ -5,19 +5,22 @@ enforcing hard safety circuit breakers, passive Maker touch execution,
 taker slippage, 8h funding cashflows, and local SQLite persistence.
 """
 
-from datetime import datetime, timezone
 import logging
-from typing import Dict, List, Optional
 import uuid
+from datetime import datetime, timezone
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.execution.database import ShadowDatabase
 from src.execution.live_broker import (
-    CircuitBreakerError,
+    MarketCapacityExceededError,
     MaxDrawdownStopError,
     MaxLeverageExceededError,
     MaxOrderNotionalExceededError,
+)
+from src.features.market_impact import (
+    CapitalCapacityCeiling,
+    NonLinearMarketImpactModel,
 )
 from src.ports.execution_ports import IExecutionClient
 
@@ -32,7 +35,7 @@ class ShadowExecutionBroker(IExecutionClient):
 
     def __init__(
         self,
-        database: Optional[ShadowDatabase] = None,
+        database: ShadowDatabase | None = None,
         initial_cash: float = 100_000.0,
         taker_fee_pct: float = 0.0004,     # 0.04% taker
         maker_fee_pct: float = 0.0002,     # 0.02% maker
@@ -40,6 +43,9 @@ class ShadowExecutionBroker(IExecutionClient):
         max_gross_leverage: float = 2.5,   # Hard circuit breaker
         max_order_notional: float = 25_000.0,
         max_drawdown_stop: float = 0.15,   # 15% drawdown halts execution
+        impact_model: NonLinearMarketImpactModel | None = None,
+        capacity_ceiling: CapitalCapacityCeiling | None = None,
+        enforce_capacity_ceiling: bool = False,
     ):
         self.db = database or ShadowDatabase()
         self.taker_fee_pct = taker_fee_pct
@@ -48,6 +54,10 @@ class ShadowExecutionBroker(IExecutionClient):
         self.max_gross_leverage = max_gross_leverage
         self.max_order_notional = max_order_notional
         self.max_drawdown_stop = max_drawdown_stop
+        self.impact_model = impact_model
+        self.capacity_ceiling = capacity_ceiling or (impact_model.capacity_ceiling if impact_model else None)
+        self.enforce_capacity_ceiling = enforce_capacity_ceiling
+        self.symbol_microstructure: dict[str, dict] = {}
 
         # Restore from database or initialize fresh
         latest_acc = self.db.get_latest_account()
@@ -66,9 +76,9 @@ class ShadowExecutionBroker(IExecutionClient):
             positions=open_positions,
         )
         self.peak_equity = max(self.portfolio.total_equity, init_cash)
-        self.market_prices: Dict[str, float] = {}
-        self.market_bids: Dict[str, float] = {}
-        self.market_asks: Dict[str, float] = {}
+        self.market_prices: dict[str, float] = {}
+        self.market_bids: dict[str, float] = {}
+        self.market_asks: dict[str, float] = {}
 
         # If fresh db, record initial account snapshot
         if not latest_acc:
@@ -78,8 +88,8 @@ class ShadowExecutionBroker(IExecutionClient):
         self,
         symbol: str,
         price: float,
-        bid: Optional[float] = None,
-        ask: Optional[float] = None,
+        bid: float | None = None,
+        ask: float | None = None,
     ) -> None:
         """Updates best price levels for a symbol and mark-to-markets open positions."""
         p = float(price)
@@ -92,10 +102,30 @@ class ShadowExecutionBroker(IExecutionClient):
             pos.current_price = p
             self.db.save_position(pos)
 
-    def set_market_prices(self, prices: Dict[str, float]) -> None:
+    def set_market_prices(self, prices: dict[str, float]) -> None:
         """Batch updates mark prices."""
         for sym, price in prices.items():
             self.set_market_price(sym, price)
+
+    def set_symbol_microstructure(
+        self,
+        symbol: str,
+        volatility: float,
+        volume: float,
+        depth_1pct_usd: float | None = None,
+        cs_spread: float | None = None,
+        amihud: float | None = None,
+        is_flash_crash: bool = False,
+    ) -> None:
+        """Configures dynamic microstructure metrics for realistic slippage calculations."""
+        self.symbol_microstructure[symbol] = {
+            "volatility": float(volatility),
+            "volume": float(volume),
+            "depth_1pct_usd": float(depth_1pct_usd) if depth_1pct_usd is not None else None,
+            "cs_spread": float(cs_spread) if cs_spread is not None else None,
+            "amihud": float(amihud) if amihud is not None else None,
+            "is_flash_crash": bool(is_flash_crash),
+        }
 
     def get_portfolio(self) -> Portfolio:
         """Returns the current portfolio snapshot."""
@@ -122,10 +152,10 @@ class ShadowExecutionBroker(IExecutionClient):
             return True
         return False
 
-    def get_trade_history(self) -> List[Trade]:
+    def get_trade_history(self) -> list[Trade]:
         """Returns executed trade records."""
         trade_rows = self.db.get_trades(limit=500)
-        trades: List[Trade] = []
+        trades: list[Trade] = []
         for r in trade_rows:
             trades.append(
                 Trade(
@@ -152,8 +182,7 @@ class ShadowExecutionBroker(IExecutionClient):
             )
 
         current_equity = self.portfolio.total_equity
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
+        self.peak_equity = max(self.peak_equity, current_equity)
 
         drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if drawdown >= self.max_drawdown_stop:
@@ -175,9 +204,9 @@ class ShadowExecutionBroker(IExecutionClient):
         side: OrderSide,
         order_type: OrderType,
         quantity: float,
-        price: Optional[float] = None,
-        role: Optional[str] = None,
-        client_order_id: Optional[str] = None,
+        price: float | None = None,
+        role: str | None = None,
+        client_order_id: str | None = None,
     ) -> Order:
         """
         Submits an order through risk verification and matching.
@@ -189,6 +218,22 @@ class ShadowExecutionBroker(IExecutionClient):
 
         # 1. Enforce safety circuit breakers
         self.verify_risk_circuit_breakers(symbol, quantity, est_price)
+
+        if self.enforce_capacity_ceiling and self.capacity_ceiling:
+            order_notional = est_price * quantity
+            micro = self.symbol_microstructure.get(symbol, {})
+            cap_report = self.capacity_ceiling.evaluate_capacity(
+                symbol=symbol,
+                order_size_usd=order_notional,
+                depth_1pct_usd=micro.get("depth_1pct_usd"),
+                bar_volume_usd=micro.get("volume"),
+            )
+            if not cap_report.within_capacity:
+                raise MarketCapacityExceededError(
+                    f"Order notional ${order_notional:,.2f} exceeds capacity ceiling "
+                    f"${cap_report.max_allowed_size_usd:,.2f} for {symbol}. "
+                    f"Recommended chunks: {cap_report.recommended_chunks}"
+                )
 
         order_id = f"shd_ord_{uuid.uuid4().hex[:10]}"
         order = Order(
@@ -214,14 +259,44 @@ class ShadowExecutionBroker(IExecutionClient):
         return order
 
     def _fill_market_order(self, order: Order) -> None:
-        """Executes an aggressive Taker order with slippage and 0.04% fee."""
+        """Executes an aggressive Taker order with dynamic non-linear slippage and fee."""
         symbol = order.symbol
         if order.side == OrderSide.BUY:
             base_price = self.market_asks.get(symbol, self.market_prices.get(symbol, 100.0))
-            fill_price = base_price * (1.0 + self.slippage)
         else:
             base_price = self.market_bids.get(symbol, self.market_prices.get(symbol, 100.0))
-            fill_price = base_price * (1.0 - self.slippage)
+
+        if self.impact_model:
+            micro = self.symbol_microstructure.get(symbol, {})
+            vol = micro.get("volatility", 0.005)
+            vol_usd = micro.get("volume", 50_000_000.0)
+            depth_1pct = micro.get("depth_1pct_usd")
+            cs_spread = micro.get("cs_spread")
+            amihud = micro.get("amihud")
+            is_flash_crash = micro.get("is_flash_crash", False)
+
+            fill_price, estimate = self.impact_model.apply_execution_slippage(
+                order=order,
+                mark_price=base_price,
+                volatility=vol,
+                volume=vol_usd,
+                depth_1pct_usd=depth_1pct,
+                cs_spread=cs_spread,
+                amihud=amihud,
+                is_flash_crash=is_flash_crash,
+            )
+
+            if self.enforce_capacity_ceiling and not estimate.capacity_report.within_capacity:
+                raise MarketCapacityExceededError(
+                    f"Order notional ${order.quantity * base_price:,.2f} exceeds capacity ceiling "
+                    f"${estimate.capacity_report.max_allowed_size_usd:,.2f} for {symbol}. "
+                    f"Recommended chunks: {estimate.capacity_report.recommended_chunks}"
+                )
+        else:
+            if order.side == OrderSide.BUY:
+                fill_price = base_price * (1.0 + self.slippage)
+            else:
+                fill_price = base_price * (1.0 - self.slippage)
 
         fee = fill_price * order.quantity * self.taker_fee_pct
 
@@ -307,13 +382,13 @@ class ShadowExecutionBroker(IExecutionClient):
         self.db.save_trade(trade, is_maker=True, realized_pnl=realized_pnl)
         self._record_account_snapshot()
 
-    def check_pending_orders(self, symbol_ticks: Dict[str, Dict[str, float]]) -> List[Order]:
+    def check_pending_orders(self, symbol_ticks: dict[str, dict[str, float]]) -> list[Order]:
         """
         Evaluates all pending limit orders against fresh market ticks (bid/ask/low/high).
         Fills orders whose limits have been breached.
         """
         pending_orders = self.db.get_pending_orders()
-        filled_orders: List[Order] = []
+        filled_orders: list[Order] = []
 
         for order in pending_orders:
             symbol = order.symbol
@@ -343,7 +418,7 @@ class ShadowExecutionBroker(IExecutionClient):
         self,
         symbol: str,
         funding_rate: float,
-        timestamp: Optional[datetime] = None,
+        timestamp: datetime | None = None,
     ) -> float:
         """
         Settles 8h perpetual funding payment for an open position.
@@ -378,8 +453,8 @@ class ShadowExecutionBroker(IExecutionClient):
 
     def mark_to_market(
         self,
-        prices: Dict[str, float],
-        timestamp: Optional[datetime] = None,
+        prices: dict[str, float],
+        timestamp: datetime | None = None,
     ) -> Portfolio:
         """
         Updates mark prices and refreshes unrealized PnL, equity, and account state.
@@ -450,7 +525,7 @@ class ShadowExecutionBroker(IExecutionClient):
         self.db.save_position(pos, realized_pnl=realized_pnl)
         return realized_pnl
 
-    def _record_account_snapshot(self, timestamp: Optional[datetime] = None) -> None:
+    def _record_account_snapshot(self, timestamp: datetime | None = None) -> None:
         """Calculates portfolio aggregates and persists an account snapshot."""
         equity = self.portfolio.total_equity
         margin_used = sum(abs(p.market_value) for p in self.portfolio.positions.values())

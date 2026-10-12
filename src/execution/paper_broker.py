@@ -4,12 +4,15 @@ Simulates realistic exchange order execution with configurable slippage,
 maker/taker fee schedules, and position accounting.
 """
 
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
 import uuid
+from datetime import datetime, timezone
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
+from src.features.market_impact import (
+    CapitalCapacityCeiling,
+    NonLinearMarketImpactModel,
+)
 from src.ports.execution_ports import IExecutionClient
 
 
@@ -25,6 +28,9 @@ class PaperExecutionBroker(IExecutionClient):
         taker_fee_pct: float = 0.0004,     # 0.04% taker
         maker_fee_pct: float = 0.0002,     # 0.02% maker
         slippage_bps: float = 1.0,         # 1 bp slippage
+        impact_model: NonLinearMarketImpactModel | None = None,
+        capacity_ceiling: CapitalCapacityCeiling | None = None,
+        enforce_capacity_ceiling: bool = False,
     ):
         self.portfolio = Portfolio(
             cash=initial_cash,
@@ -34,10 +40,34 @@ class PaperExecutionBroker(IExecutionClient):
         self.taker_fee_pct = taker_fee_pct
         self.maker_fee_pct = maker_fee_pct
         self.slippage = slippage_bps / 10_000.0
+        self.impact_model = impact_model
+        self.capacity_ceiling = capacity_ceiling or (impact_model.capacity_ceiling if impact_model else None)
+        self.enforce_capacity_ceiling = enforce_capacity_ceiling
+        self.symbol_microstructure: dict[str, dict] = {}
 
-        self.orders: Dict[str, Order] = {}
-        self.trades: List[Trade] = []
-        self.market_prices: Dict[str, float] = {}
+        self.orders: dict[str, Order] = {}
+        self.trades: list[Trade] = []
+        self.market_prices: dict[str, float] = {}
+
+    def set_symbol_microstructure(
+        self,
+        symbol: str,
+        volatility: float,
+        volume: float,
+        depth_1pct_usd: float | None = None,
+        cs_spread: float | None = None,
+        amihud: float | None = None,
+        is_flash_crash: bool = False,
+    ) -> None:
+        """Configures dynamic microstructure metrics for symbol."""
+        self.symbol_microstructure[symbol] = {
+            "volatility": float(volatility),
+            "volume": float(volume),
+            "depth_1pct_usd": float(depth_1pct_usd) if depth_1pct_usd is not None else None,
+            "cs_spread": float(cs_spread) if cs_spread is not None else None,
+            "amihud": float(amihud) if amihud is not None else None,
+            "is_flash_crash": bool(is_flash_crash),
+        }
 
     def set_market_price(self, symbol: str, price: float) -> None:
         """Updates current mark price for a symbol and mark-to-markets existing positions."""
@@ -45,7 +75,7 @@ class PaperExecutionBroker(IExecutionClient):
         if symbol in self.portfolio.positions:
             self.portfolio.positions[symbol].current_price = float(price)
 
-    def set_market_prices(self, prices: Dict[str, float]) -> None:
+    def set_market_prices(self, prices: dict[str, float]) -> None:
         """Batch updates mark prices."""
         for sym, price in prices.items():
             self.set_market_price(sym, price)
@@ -69,7 +99,7 @@ class PaperExecutionBroker(IExecutionClient):
                 return True
         return False
 
-    def get_trade_history(self) -> List[Trade]:
+    def get_trade_history(self) -> list[Trade]:
         """Returns all executed trades."""
         return list(self.trades)
 
@@ -79,7 +109,7 @@ class PaperExecutionBroker(IExecutionClient):
         side: OrderSide,
         order_type: OrderType,
         quantity: float,
-        price: Optional[float] = None,
+        price: float | None = None,
     ) -> Order:
         """
         Creates and executes an order against current market prices.
@@ -107,13 +137,33 @@ class PaperExecutionBroker(IExecutionClient):
         return order
 
     def _execute_order(self, order: Order, mark_price: float) -> None:
-        """Internal execution engine with fee and slippage modeling."""
+        """Internal execution engine with fee and dynamic slippage modeling."""
         if order.order_type == OrderType.MARKET:
-            # Slippage: buy pays higher, sell receives lower
-            if order.side == OrderSide.BUY:
-                fill_price = mark_price * (1.0 + self.slippage)
+            if self.impact_model:
+                micro = self.symbol_microstructure.get(order.symbol, {})
+                vol = micro.get("volatility", 0.005)
+                vol_usd = micro.get("volume", 50_000_000.0)
+                depth_1pct = micro.get("depth_1pct_usd")
+                cs_spread = micro.get("cs_spread")
+                amihud = micro.get("amihud")
+                is_flash_crash = micro.get("is_flash_crash", False)
+
+                fill_price, _ = self.impact_model.apply_execution_slippage(
+                    order=order,
+                    mark_price=mark_price,
+                    volatility=vol,
+                    volume=vol_usd,
+                    depth_1pct_usd=depth_1pct,
+                    cs_spread=cs_spread,
+                    amihud=amihud,
+                    is_flash_crash=is_flash_crash,
+                )
             else:
-                fill_price = mark_price * (1.0 - self.slippage)
+                # Slippage: buy pays higher, sell receives lower
+                if order.side == OrderSide.BUY:
+                    fill_price = mark_price * (1.0 + self.slippage)
+                else:
+                    fill_price = mark_price * (1.0 - self.slippage)
             fee_pct = self.taker_fee_pct
         else:
             # Limit order

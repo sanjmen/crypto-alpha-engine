@@ -4,10 +4,9 @@ Safeguards real trading capital against unexpected fat-finger errors,
 extreme leverage, and flash drawdowns.
 """
 
-from datetime import datetime, timezone
 import logging
-from typing import Dict, List, Optional
 import uuid
+from datetime import datetime, timezone
 
 import ccxt
 
@@ -20,22 +19,22 @@ logger = logging.getLogger(__name__)
 
 class CircuitBreakerError(Exception):
     """Raised when a risk or safety circuit breaker halts execution."""
-    pass
 
 
 class MaxLeverageExceededError(CircuitBreakerError):
     """Raised when an order would push portfolio gross leverage beyond limit."""
-    pass
 
 
 class MaxOrderNotionalExceededError(CircuitBreakerError):
     """Raised when an individual order exceeds the maximum single-trade dollar ceiling."""
-    pass
 
 
 class MaxDrawdownStopError(CircuitBreakerError):
     """Raised when portfolio drawdown exceeds the hard emergency stop threshold."""
-    pass
+
+
+class MarketCapacityExceededError(CircuitBreakerError):
+    """Raised when an order consumes more than the allowed top-of-book depth fraction."""
 
 
 class CCXTExecutionAdapter(IExecutionClient):
@@ -46,8 +45,8 @@ class CCXTExecutionAdapter(IExecutionClient):
     def __init__(
         self,
         exchange_id: str = "binance",
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
+        api_key: str | None = None,
+        api_secret: str | None = None,
         dry_run: bool = True,
         max_gross_leverage: float = 2.5,
         max_order_notional: float = 25_000.0,
@@ -78,8 +77,8 @@ class CCXTExecutionAdapter(IExecutionClient):
             positions={},
         )
         self.peak_equity = 100_000.0
-        self.trade_history: List[Trade] = []
-        self.orders: Dict[str, Order] = {}
+        self.trade_history: list[Trade] = []
+        self.orders: dict[str, Order] = {}
 
     def get_portfolio(self) -> Portfolio:
         return self.portfolio
@@ -95,7 +94,7 @@ class CCXTExecutionAdapter(IExecutionClient):
             return True
         return False
 
-    def get_trade_history(self) -> List[Trade]:
+    def get_trade_history(self) -> list[Trade]:
         return list(self.trade_history)
 
     def verify_risk_circuit_breakers(self, symbol: str, quantity: float, est_price: float) -> None:
@@ -112,8 +111,7 @@ class CCXTExecutionAdapter(IExecutionClient):
             )
 
         current_equity = self.portfolio.total_equity
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
+        self.peak_equity = max(self.peak_equity, current_equity)
 
         drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if drawdown >= self.max_drawdown_stop:
@@ -136,7 +134,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         side: OrderSide,
         order_type: OrderType,
         quantity: float,
-        price: Optional[float] = None,
+        price: float | None = None,
     ) -> Order:
         est_price = price or 100.0
 
