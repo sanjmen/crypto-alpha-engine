@@ -8,14 +8,14 @@ Provides:
 - AssetHurstCalibrator for dynamic persistence estimation per asset.
 """
 
-from typing import Dict, List, Optional, Union
+
 import numpy as np
 import pandas as pd
 
 
 def estimate_hurst_variance_time(
-    prices: Union[np.ndarray, pd.Series, List[float]],
-    lags: Optional[List[int]] = None,
+    prices: np.ndarray | pd.Series | list[float],
+    lags: list[int] | None = None,
 ) -> float:
     """
     Estimates the Hurst exponent using log-log Variance-Time regression:
@@ -25,6 +25,11 @@ def estimate_hurst_variance_time(
     p = np.asarray(prices, dtype=np.float64)
     if len(p) < 64:
         return 0.5
+
+    # If series contains negative or zero values (e.g. spread residuals), shift to positive space
+    min_val = np.min(p)
+    if min_val <= 0:
+        p = p - min_val + 1.0
 
     log_p = np.log(p)
     lags = lags or [1, 2, 4, 8, 16, 32, 64]
@@ -52,9 +57,9 @@ def estimate_hurst_variance_time(
 
 
 def estimate_hurst_rs(
-    series: Union[np.ndarray, pd.Series, List[float]],
+    series: np.ndarray | pd.Series | list[float],
     min_chunk: int = 16,
-    max_chunk: Optional[int] = None,
+    max_chunk: int | None = None,
 ) -> float:
     """
     Estimates the Hurst exponent via Classical Rescaled Range (R/S) Analysis.
@@ -104,9 +109,9 @@ class AssetHurstCalibrator:
 
     def __init__(self, default_hurst: float = 0.50):
         self.default_hurst = default_hurst
-        self.calibrated_hursts: Dict[str, float] = {}
+        self.calibrated_hursts: dict[str, float] = {}
 
-    def calibrate(self, symbol: str, prices: Union[np.ndarray, pd.Series, List[float]]) -> float:
+    def calibrate(self, symbol: str, prices: np.ndarray | pd.Series | list[float]) -> float:
         h = estimate_hurst_variance_time(prices)
         self.calibrated_hursts[symbol] = h
         return h
