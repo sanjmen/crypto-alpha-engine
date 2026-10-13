@@ -4,14 +4,13 @@ Stores accounts, positions, orders, trades, funding settlements, and rebalance s
 Uses SQLite WAL (Write-Ahead Logging) mode for high-concurrency non-blocking reads.
 """
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
-from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any
 
 from src.domain.entities import Order, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
@@ -150,11 +149,26 @@ class ShadowDatabase:
                 );
             """)
 
+            # 7. Reconciliation audit logs
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reconciliation_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    drift_count INTEGER NOT NULL,
+                    orphan_count INTEGER NOT NULL,
+                    cash_drift REAL NOT NULL,
+                    trading_halted INTEGER NOT NULL,
+                    details_json TEXT NOT NULL
+                );
+            """)
+
             # Indices
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_ts ON accounts(timestamp);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_funding_ts ON funding_settlements(timestamp);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reconciliation_ts ON reconciliation_audit_logs(timestamp);")
 
     def close(self) -> None:
         """Closes the underlying database connection."""
@@ -175,7 +189,7 @@ class ShadowDatabase:
         margin_used: float,
         free_margin: float,
         leverage: float,
-        timestamp: Optional[datetime] = None,
+        timestamp: datetime | None = None,
     ) -> int:
         """Inserts an account equity snapshot."""
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
@@ -202,7 +216,7 @@ class ShadowDatabase:
             )
             return cursor.lastrowid
 
-    def get_latest_account(self) -> Optional[Dict[str, Any]]:
+    def get_latest_account(self) -> dict[str, Any] | None:
         """Returns the most recent account snapshot or None."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -210,7 +224,7 @@ class ShadowDatabase:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_account_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_account_history(self, limit: int = 100) -> list[dict[str, Any]]:
         """Returns recent account equity snapshots in ascending order."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -232,8 +246,8 @@ class ShadowDatabase:
         self,
         position: Position,
         realized_pnl: float = 0.0,
-        liquidation_price: Optional[float] = None,
-        timestamp: Optional[datetime] = None,
+        liquidation_price: float | None = None,
+        timestamp: datetime | None = None,
     ) -> None:
         """Upserts an active or flat position record."""
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
@@ -272,7 +286,7 @@ class ShadowDatabase:
                 ),
             )
 
-    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def get_position(self, symbol: str) -> dict[str, Any] | None:
         """Queries single position by symbol."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -280,7 +294,7 @@ class ShadowDatabase:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_open_positions(self) -> Dict[str, Position]:
+    def get_open_positions(self) -> dict[str, Position]:
         """Returns all non-flat positions mapped to domain Position objects."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -288,7 +302,7 @@ class ShadowDatabase:
                 "SELECT * FROM positions WHERE side != 'FLAT' AND quantity > 0"
             )
             rows = cursor.fetchall()
-            positions: Dict[str, Position] = {}
+            positions: dict[str, Position] = {}
             for r in rows:
                 side_enum = PositionSide(r["side"])
                 positions[r["symbol"]] = Position(
@@ -307,8 +321,8 @@ class ShadowDatabase:
     def save_order(
         self,
         order: Order,
-        role: Optional[str] = None,
-        client_order_id: Optional[str] = None,
+        role: str | None = None,
+        client_order_id: str | None = None,
     ) -> None:
         """Inserts or updates an order in the database."""
         created_str = (
@@ -363,7 +377,7 @@ class ShadowDatabase:
         filled_quantity: float,
         average_fill_price: float,
         fee: float,
-        role: Optional[str] = None,
+        role: str | None = None,
     ) -> bool:
         """Updates fill state and status of an order."""
         status_val = status.value if hasattr(status, "value") else str(status)
@@ -393,7 +407,7 @@ class ShadowDatabase:
             )
             return cursor.rowcount > 0
 
-    def get_order(self, order_id: str) -> Optional[Order]:
+    def get_order(self, order_id: str) -> Order | None:
         """Retrieves domain Order entity by id."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -422,7 +436,7 @@ class ShadowDatabase:
                 created_at=datetime.fromisoformat(row["created_at"]),
             )
 
-    def get_pending_orders(self, symbol: Optional[str] = None) -> List[Order]:
+    def get_pending_orders(self, symbol: str | None = None) -> list[Order]:
         """Retrieves all open or partially filled orders."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -501,7 +515,7 @@ class ShadowDatabase:
                 ),
             )
 
-    def get_trades(self, limit: int = 50, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_trades(self, limit: int = 50, symbol: str | None = None) -> list[dict[str, Any]]:
         """Returns recent trade executions."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -528,7 +542,7 @@ class ShadowDatabase:
         position_side: str,
         position_notional: float,
         cashflow_credited: float,
-        timestamp: Optional[datetime] = None,
+        timestamp: datetime | None = None,
     ) -> int:
         """Records an official 8h perpetual funding settlement."""
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
@@ -552,7 +566,7 @@ class ShadowDatabase:
             )
             return cursor.lastrowid
 
-    def get_funding_settlements(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_funding_settlements(self, limit: int = 50) -> list[dict[str, Any]]:
         """Returns recent funding settlements."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -572,9 +586,9 @@ class ShadowDatabase:
         momentum_weight: float,
         stat_arb_weight: float,
         carry_weight: float,
-        target_allocations: Dict[str, float],
-        executed_delta: Dict[str, float],
-        timestamp: Optional[datetime] = None,
+        target_allocations: dict[str, float],
+        executed_delta: dict[str, float],
+        timestamp: datetime | None = None,
     ) -> int:
         """Saves a meta-strategy allocation snapshot."""
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
@@ -600,7 +614,7 @@ class ShadowDatabase:
             )
             return cursor.lastrowid
 
-    def get_latest_rebalance_snapshot(self) -> Optional[Dict[str, Any]]:
+    def get_latest_rebalance_snapshot(self) -> dict[str, Any] | None:
         """Returns the most recent rebalance snapshot."""
         with self._lock:
             cursor = self._conn.cursor()
@@ -613,6 +627,56 @@ class ShadowDatabase:
             res["executed_delta"] = json.loads(res["executed_delta_json"])
             return res
 
+    def save_reconciliation_audit(
+        self,
+        status: str,
+        drift_count: int,
+        orphan_count: int,
+        cash_drift: float,
+        trading_halted: bool,
+        details: dict[str, Any],
+        timestamp: datetime | None = None,
+    ) -> int:
+        """Records an audit log entry for a portfolio reconciliation cycle."""
+        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO reconciliation_audit_logs (
+                    timestamp, status, drift_count, orphan_count,
+                    cash_drift, trading_halted, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    status,
+                    int(drift_count),
+                    int(orphan_count),
+                    float(cash_drift),
+                    1 if trading_halted else 0,
+                    json.dumps(details),
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_recent_reconciliations(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Returns recent reconciliation audit entries."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT * FROM reconciliation_audit_logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            results = []
+            for r in rows:
+                item = dict(r)
+                item["details"] = json.loads(item["details_json"])
+                item["trading_halted"] = bool(item["trading_halted"])
+                results.append(item)
+            return results
+
     def reset_all_data(self) -> None:
         """Clears all records from all tables (used for testing and fresh start)."""
         with self._lock:
@@ -623,3 +687,4 @@ class ShadowDatabase:
             cursor.execute("DELETE FROM accounts;")
             cursor.execute("DELETE FROM funding_settlements;")
             cursor.execute("DELETE FROM rebalance_snapshots;")
+            cursor.execute("DELETE FROM reconciliation_audit_logs;")
