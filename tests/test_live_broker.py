@@ -3,13 +3,13 @@ Unit tests for CCXTExecutionAdapter and safety circuit breakers.
 """
 
 import pytest
-from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
-from src.domain.entities import Position
+
+from src.domain.enums import OrderSide, OrderStatus, OrderType
 from src.execution.live_broker import (
     CCXTExecutionAdapter,
+    MaxDrawdownStopError,
     MaxLeverageExceededError,
     MaxOrderNotionalExceededError,
-    MaxDrawdownStopError,
 )
 
 
@@ -82,3 +82,16 @@ def test_dry_run_successful_execution():
     assert order.filled_quantity == 0.2
     assert "BTC/USDT:USDT" in adapter.portfolio.positions
     assert len(adapter.get_trade_history()) == 1
+
+
+def test_adapter_initialization_with_credentials():
+    from src.security.vault import ExchangeCredentials
+    creds = ExchangeCredentials(
+        exchange_id="binance",
+        api_key="mock_key_12345",
+        api_secret="mock_secret_67890",
+    )
+    adapter = CCXTExecutionAdapter(credentials=creds, dry_run=True)
+    assert adapter.client.apiKey == "mock_key_12345"
+    assert adapter.client.secret == "mock_secret_67890"
+

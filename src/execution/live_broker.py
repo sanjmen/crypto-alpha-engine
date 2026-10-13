@@ -13,6 +13,7 @@ import ccxt
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.ports.execution_ports import IExecutionClient
+from src.security.vault import ExchangeCredentials, PreFlightPermissionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,8 @@ class CCXTExecutionAdapter(IExecutionClient):
         exchange_id: str = "binance",
         api_key: str | None = None,
         api_secret: str | None = None,
+        credentials: ExchangeCredentials | None = None,
+        validate_permissions: bool = False,
         dry_run: bool = True,
         max_gross_leverage: float = 2.5,
         max_order_notional: float = 25_000.0,
@@ -54,6 +57,11 @@ class CCXTExecutionAdapter(IExecutionClient):
         taker_fee_pct: float = 0.0004,
         maker_fee_pct: float = 0.0002,
     ):
+        if credentials is not None:
+            exchange_id = credentials.exchange_id
+            api_key = credentials.api_key
+            api_secret = credentials.api_secret
+
         self.exchange_id = exchange_id
         self.dry_run = dry_run
         self.max_gross_leverage = max_gross_leverage
@@ -70,6 +78,9 @@ class CCXTExecutionAdapter(IExecutionClient):
             "options": {"defaultType": "future"},
         }
         self.client: ccxt.Exchange = exchange_class(config)
+
+        if validate_permissions and not self.dry_run and api_key:
+            PreFlightPermissionValidator.validate_binance_permissions(self.client)
 
         self.portfolio = Portfolio(
             cash=100_000.0,
