@@ -5,19 +5,24 @@ reconciles live mark-to-market prices, enforces passive Maker execution alpha,
 triggers 8h multi-strategy rebalancing, and settles real funding cashflows in SQLite.
 """
 
-from datetime import datetime, timezone
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any
+
 import ccxt
-import numpy as np
 import pandas as pd
 
-from src.domain.entities import Order, Portfolio, Position
-from src.domain.enums import MarketRegime, OrderSide, OrderStatus, OrderType, PositionSide
+from src.domain.entities import Order, Portfolio
+from src.domain.enums import (
+    OrderSide,
+    PositionSide,
+)
 from src.execution.execution_router import ExecutionUrgency, SmartExecutionRouter
+from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
+from src.execution.ws_manager import PriceTick, ResilientWebSocketClient
 from src.features.volatility import parkinson_volatility
 from src.strategies.meta_allocator import MetaStrategyAllocator
 
@@ -45,14 +50,16 @@ class ShadowTradingDaemon:
     def __init__(
         self,
         broker: ShadowExecutionBroker,
-        allocator: Optional[MetaStrategyAllocator] = None,
-        router: Optional[SmartExecutionRouter] = None,
-        exchange_client: Optional[ccxt.Exchange] = None,
-        symbols: Optional[List[str]] = None,
+        allocator: MetaStrategyAllocator | None = None,
+        router: SmartExecutionRouter | None = None,
+        exchange_client: ccxt.Exchange | None = None,
+        symbols: list[str] | None = None,
         fast_interval_sec: float = 10.0,
         rebalance_interval_sec: float = 28_800.0,  # 8 hours
         min_rebalance_notional: float = 50.0,
         turnover_deadband: float = 0.04,          # 4% deadband to eliminate fee drag
+        rate_limiter: ExchangeRateLimiter | None = None,
+        ws_client: ResilientWebSocketClient | None = None,
     ):
         self.broker = broker
         self.allocator = allocator or MetaStrategyAllocator()
@@ -62,6 +69,12 @@ class ShadowTradingDaemon:
         self.rebalance_interval_sec = rebalance_interval_sec
         self.min_rebalance_notional = min_rebalance_notional
         self.turnover_deadband = turnover_deadband
+        self.rate_limiter = rate_limiter or ExchangeRateLimiter()
+        self.ws_client = ws_client
+
+        if self.ws_client:
+            self.ws_client.on_tick_callback = self._on_ws_tick
+            self.ws_client.rest_poll_callback = self.fetch_live_tickers
 
         # Free public read-only client for Binance Futures
         if exchange_client:
@@ -74,19 +87,37 @@ class ShadowTradingDaemon:
             })
 
         self.is_running = False
-        self._thread: Optional[threading.Thread] = None
-        self.last_rebalance_time: Optional[datetime] = None
-        self.last_funding_check_time: Optional[datetime] = None
-        self.latest_tickers: Dict[str, Dict[str, float]] = {}
+        self._thread: threading.Thread | None = None
+        self.last_rebalance_time: datetime | None = None
+        self.last_funding_check_time: datetime | None = None
+        self.latest_tickers: dict[str, dict[str, float]] = {}
 
-    def fetch_live_tickers(self) -> Dict[str, Dict[str, float]]:
+    def _on_ws_tick(self, tick: PriceTick) -> None:
+        """Processes real-time WebSocket tick updates."""
+        # Normalize symbol formatting e.g. BTCUSDT -> BTC/USDT
+        sym_slash = f"{tick.symbol[:-4]}/{tick.symbol[-4:]}" if tick.symbol.endswith("USDT") else tick.symbol
+        self.latest_tickers[sym_slash] = {
+            "price": tick.price,
+            "bid": tick.bid,
+            "ask": tick.ask,
+            "high": tick.price,
+            "low": tick.price,
+        }
+        self.broker.set_market_price(sym_slash, price=tick.price, bid=tick.bid, ask=tick.ask)
+
+    def fetch_live_tickers(self) -> dict[str, dict[str, float]]:
         """
         Fetches current top-of-book L1 prices from Binance Futures public API.
         Returns mapping: symbol -> {price, bid, ask, high, low}
         """
-        ticks: Dict[str, Dict[str, float]] = {}
+        ticks: dict[str, dict[str, float]] = {}
         try:
+            if self.rate_limiter:
+                self.rate_limiter.acquire(weight=2, priority="LOW", wait=True)
             raw_tickers = self.exchange.fetch_tickers(self.symbols)
+            if self.rate_limiter and hasattr(self.exchange, "last_response_headers"):
+                self.rate_limiter.on_http_response(200, self.exchange.last_response_headers)
+
             for sym, t in raw_tickers.items():
                 last = float(t.get("last") or t.get("close") or 0.0)
                 bid = float(t.get("bid") or last)
@@ -102,7 +133,7 @@ class ShadowTradingDaemon:
                         "high": high,
                         "low": low,
                     }
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Error fetching live tickers from Binance: {e}")
 
         self.latest_tickers = ticks
@@ -111,15 +142,19 @@ class ShadowTradingDaemon:
     def fetch_symbol_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
         """Fetches recent OHLCV bars for alpha calculation."""
         try:
+            if self.rate_limiter:
+                self.rate_limiter.acquire(weight=5, priority="LOW", wait=True)
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if self.rate_limiter and hasattr(self.exchange, "last_response_headers"):
+                self.rate_limiter.on_http_response(200, self.exchange.last_response_headers)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             return df
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Error fetching klines for {symbol}: {e}")
             return pd.DataFrame()
 
-    def run_fast_cycle(self) -> Tuple[Portfolio, List[Order]]:
+    def run_fast_cycle(self) -> tuple[Portfolio, list[Order]]:
         """
         Executes fast loop (every 5-10s):
         1. Fetch fresh L1 tickers
@@ -148,7 +183,7 @@ class ShadowTradingDaemon:
 
         return portfolio, filled_orders
 
-    def run_rebalance_cycle(self) -> List[Order]:
+    def run_rebalance_cycle(self) -> list[Order]:
         """
         Executes multi-strategy portfolio rebalance:
         1. Download klines for universe
@@ -156,9 +191,9 @@ class ShadowTradingDaemon:
         3. Net orders through turnover deadband
         4. Route passive Maker limit orders at the touch
         """
-        market_data: Dict[str, pd.DataFrame] = {}
-        volatilities: Dict[str, float] = {}
-        current_prices: Dict[str, float] = {}
+        market_data: dict[str, pd.DataFrame] = {}
+        volatilities: dict[str, float] = {}
+        current_prices: dict[str, float] = {}
 
         for sym in self.symbols:
             df = self.fetch_symbol_klines(sym, timeframe="1h", limit=100)
@@ -185,8 +220,8 @@ class ShadowTradingDaemon:
             volatilities=volatilities,
         )
 
-        executed_orders: List[Order] = []
-        executed_deltas: Dict[str, float] = {}
+        executed_orders: list[Order] = []
+        executed_deltas: dict[str, float] = {}
         total_equity = max(portfolio.total_equity, 1.0)
 
         all_symbols = set(self.symbols) | set(portfolio.positions.keys())
@@ -231,7 +266,7 @@ class ShadowTradingDaemon:
                 )
                 executed_orders.append(order)
                 executed_deltas[sym] = dollar_delta
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to submit rebalance order for {sym}: {e}")
 
         # Persist snapshot
@@ -246,11 +281,11 @@ class ShadowTradingDaemon:
         self.last_rebalance_time = datetime.now(timezone.utc)
         return executed_orders
 
-    def run_funding_cycle(self) -> Dict[str, float]:
+    def run_funding_cycle(self) -> dict[str, float]:
         """
         Polls official Binance funding rates and settles cashflows for open positions.
         """
-        settled_cashflows: Dict[str, float] = {}
+        settled_cashflows: dict[str, float] = {}
         open_positions = self.broker.portfolio.positions
 
         for sym, pos in list(open_positions.items()):
@@ -261,13 +296,13 @@ class ShadowTradingDaemon:
                 rate = float(funding_info.get("fundingRate") or 0.0)
                 cf = self.broker.settle_funding(sym, rate)
                 settled_cashflows[sym] = cf
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error settling funding for {sym}: {e}")
 
         self.last_funding_check_time = datetime.now(timezone.utc)
         return settled_cashflows
 
-    def step(self) -> Dict[str, Any]:
+    def step(self) -> dict[str, Any]:
         """
         Performs a single synchronous step across fast, rebalance, and funding cycles.
         Useful for scheduled cron executions and unit tests.
@@ -279,9 +314,7 @@ class ShadowTradingDaemon:
 
         # 2. Check if rebalance is due
         rebalance_due = False
-        if self.last_rebalance_time is None:
-            rebalance_due = True
-        elif (now - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec:
+        if self.last_rebalance_time is None or (now - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec:
             rebalance_due = True
 
         rebalance_orders = []
@@ -290,12 +323,15 @@ class ShadowTradingDaemon:
 
         # 3. Check if funding settlement is due (00:00, 08:00, 16:00 UTC)
         funding_due = False
-        if now.minute in (0, 1) and now.hour in (0, 8, 16):
-            if (
+        if (
+            now.minute in (0, 1)
+            and now.hour in (0, 8, 16)
+            and (
                 self.last_funding_check_time is None
                 or (now - self.last_funding_check_time).total_seconds() > 300
-            ):
-                funding_due = True
+            )
+        ):
+            funding_due = True
 
         funding_cashflows = {}
         if funding_due:
@@ -315,6 +351,8 @@ class ShadowTradingDaemon:
         if self.is_running:
             return
         self.is_running = True
+        if self.ws_client:
+            self.ws_client.start()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         logger.info("ShadowTradingDaemon started successfully.")
@@ -322,6 +360,8 @@ class ShadowTradingDaemon:
     def stop(self) -> None:
         """Stops the daemon background thread."""
         self.is_running = False
+        if self.ws_client:
+            self.ws_client.stop()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
         logger.info("ShadowTradingDaemon stopped.")
@@ -331,6 +371,6 @@ class ShadowTradingDaemon:
         while self.is_running:
             try:
                 self.step()
-            except Exception as e:
-                logger.error(f"Error in shadow daemon loop: {e}", exc_info=True)
+            except Exception:
+                logger.exception("Error in shadow daemon loop")
             time.sleep(self.fast_interval_sec)
