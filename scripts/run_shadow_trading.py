@@ -25,8 +25,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.execution.database import DEFAULT_DB_PATH, ShadowDatabase
 from src.execution.execution_router import SmartExecutionRouter
 from src.execution.monitor import ShadowMonitor
+from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.shadow_daemon import DEFAULT_SHADOW_SYMBOLS, ShadowTradingDaemon
+from src.execution.ws_manager import ResilientWebSocketClient
 from src.strategies.meta_allocator import MetaStrategyAllocator
 
 logging.basicConfig(
@@ -44,6 +46,8 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Run the autonomous shadow trading daemon loop")
     parser.add_argument("--monitor", action="store_true", help="Launch the real-time Rich terminal telemetry dashboard")
     parser.add_argument("--once", action="store_true", help="Execute a single step across all cycles and print status")
+    parser.add_argument("--capital", type=float, default=1000.0, help="Initial shadow portfolio capital in USDT (default: 1000.0)")
+    parser.add_argument("--reset", action="store_true", help="Reset all previous database records before starting")
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (e.g. 'BTC/USDT,ETH/USDT')")
     parser.add_argument("--fast-interval", type=float, default=10.0, help="Fast loop interval in seconds (default: 10.0)")
@@ -63,9 +67,15 @@ def main():
     # 2. Daemon Initialization
     logger.info(f"Initializing Shadow Trading Database at {args.db}...")
     db = ShadowDatabase(db_path=args.db)
-    broker = ShadowExecutionBroker(database=db, initial_cash=100_000.0)
+    if args.reset:
+        logger.info("Resetting all previous database records...")
+        db.reset_all_data()
+
+    broker = ShadowExecutionBroker(database=db, initial_cash=args.capital)
     router = SmartExecutionRouter(broker=broker)
     allocator = MetaStrategyAllocator()
+    rate_limiter = ExchangeRateLimiter()
+    ws_client = ResilientWebSocketClient(symbols=symbols)
 
     daemon = ShadowTradingDaemon(
         broker=broker,
@@ -74,6 +84,8 @@ def main():
         symbols=symbols,
         fast_interval_sec=args.fast_interval,
         rebalance_interval_sec=args.rebalance_interval,
+        rate_limiter=rate_limiter,
+        ws_client=ws_client,
     )
 
     # 3. Single-step execution mode

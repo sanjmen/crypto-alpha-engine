@@ -69,3 +69,7 @@ reports/*.png
 *.db-wal
 data/*.db*
 
+# Logs
+logs/
+*.log
+
