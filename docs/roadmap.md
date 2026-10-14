@@ -119,4 +119,27 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 * **Issue #31**: Security: Zero-Trust API Key Vault & Read/Trade Permission Validator
   * Automated pre-flight check guaranteeing withdrawal permissions are disabled on trading keys.
 
+---
+
+## Milestone 9: Information-Driven Bars & aggTrades Synthesis (M9) [COMPLETED]
+**Objective**: Ingest tick aggTrades from Binance Vision, synthesize Dollar Bars and Dollar Imbalance Bars for market microstructure modeling.
+
+* **Issue #32**: Research: Information-Driven & Dollar Volume Bars Synthesis from aggTrades
+  * Statistical sampling over dynamic dollar thresholds, statistical properties normalization.
+* **Issue #33**: Data: Market-Wide Aggregated Trades Collector & S3 Streaming Pipeline
+  * Low-latency streaming collector with rolling tick buffer and memory-safe batch flush.
+* **Issue #34**: Pipeline: Binance Vision Bulk Historical aggTrades Ingestion
+  * High-throughput downloader for tick archives with parquet synthesis.
+
+---
+
+## Milestone 10: Heterogeneous Meta-Model Ensembling & Meta-Labeling (M10) [COMPLETED]
+**Objective**: Build secondary meta-labeling filter to improve primary alpha precision and allocate capital via Hierarchical Risk Parity (HRP).
+
+* **Issue #35**: ML: Meta-Labeling Engine with Triple-Barrier Method & Bet Sizing
+  * Triple barrier labeling, Secondary Random Forest / LightGBM meta-model, and probability-based position sizing.
+* **Issue #36**: Meta: Hierarchical Risk Parity (HRP) Portfolio Allocation Engine
+  * Quasi-diagonalization, dendrogram bisection, and tree-based risk allocation eliminating correlation inversion instability.
+
+
 
