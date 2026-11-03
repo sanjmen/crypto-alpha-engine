@@ -29,7 +29,10 @@ from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.shadow_daemon import DEFAULT_SHADOW_SYMBOLS, ShadowTradingDaemon
 from src.execution.ws_manager import ResilientWebSocketClient
+from src.risk.stepped_leverage import SteppedLeverageController
+from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.meta_allocator import MetaStrategyAllocator
+from src.strategies.seven_factor_engine import SevenFactorOnlineEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,11 +54,41 @@ def main():
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (e.g. 'BTC/USDT,ETH/USDT')")
     parser.add_argument("--fast-interval", type=float, default=10.0, help="Fast loop interval in seconds (default: 10.0)")
-    parser.add_argument("--rebalance-interval", type=float, default=28800.0, help="Rebalance interval in seconds (default: 28800 = 8h)")
+    parser.add_argument("--rebalance-interval", type=float, default=14400.0, help="Rebalance interval in seconds (default: 14400 = 4h)")
+    parser.add_argument("--start-leverage", type=float, default=2.5, help="Initial gross leverage tier (default: 2.5x)")
+    parser.add_argument("--max-leverage", type=float, default=5.0, help="Maximum stepped gross leverage tier (default: 5.0x)")
+    parser.add_argument("--step-leverage", type=float, default=0.5, help="Leverage increment per HWM milestone (default: 0.5x)")
+    parser.add_argument("--milestone-gain", type=float, default=0.15, help="HWM compound gain required per +0.5x step (default: 0.15 = +15%%)")
+    parser.add_argument("--legacy-allocator", action="store_true", help="Use legacy 3-strategy allocator instead of the 7-Factor Causal Online Engine")
+    parser.add_argument(
+        "--enable-anomalies",
+        dest="enable_anomalies",
+        action="store_true",
+        default=True,
+        help="Enable extreme anomaly & illiquid tail strategies (ENABLED by default)",
+    )
+    parser.add_argument(
+        "--disable-anomalies",
+        dest="enable_anomalies",
+        action="store_false",
+        help="Disable extreme anomaly satellite strategies",
+    )
+    parser.add_argument("--enable-pairs", action="store_true", help="Enable Cointegrated Pairs strategy alongside the 3 core Meta-Strategy pillars")
+    parser.add_argument("--anomaly-size", type=float, default=15.0, help="Max dollar allocation per anomaly event (default: 15.0 USDT test mode, 100.0 USDT prod)")
+    parser.add_argument("--min-volume", type=float, default=20000000.0, help="Minimum 24h volume filter in USDT for anomaly scanning (default: 20M)")
+    parser.add_argument("--profit-lock-trigger", type=float, default=0.035, help="Peak gain required to arm Core Profit-Lock Stop-Profit (default: 0.035 = +3.5%%)")
+    parser.add_argument("--profit-lock-level", type=float, default=0.015, help="Net profit floor locked when Core Profit-Lock triggers (default: 0.015 = +1.5%%)")
+    parser.add_argument("--trailing-trigger", type=float, default=0.045, help="Peak gain required to arm Core continuous Trailing Stop (default: 0.045 = +4.5%%)")
+    parser.add_argument("--trailing-distance", type=float, default=0.020, help="Distance behind peak price for Core Trailing Stop (default: 0.020 = 2.0%%)")
+    parser.add_argument("--core-tp", type=float, default=0.080, help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.080 = +8.0%%)")
 
     args = parser.parse_args()
 
-    symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS
+    symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS.copy()
+    if args.enable_anomalies and args.legacy_allocator and not args.symbols:
+        for extra in ["CTSI/USDT", "MAGIC/USDT", "OGN/USDT", "RLC/USDT"]:
+            if extra not in symbols:
+                symbols.append(extra)
 
     # 1. Monitor Mode
     if args.monitor:
@@ -71,9 +104,68 @@ def main():
         logger.info("Resetting all previous database records...")
         db.reset_all_data()
 
-    broker = ShadowExecutionBroker(database=db, initial_cash=args.capital)
+    broker = ShadowExecutionBroker(
+        database=db,
+        initial_cash=args.capital,
+        max_gross_leverage=max(6.0, args.max_leverage * 1.25),
+    )
     router = SmartExecutionRouter(broker=broker)
-    allocator = MetaStrategyAllocator()
+    pairs_strategy = CointegratedPairsStrategy() if args.enable_pairs else None
+    use_seven_factor = not args.legacy_allocator
+    seven_factor_engine = SevenFactorOnlineEngine() if use_seven_factor else None
+    stepped_leverage_ctrl = (
+        SteppedLeverageController(
+            initial_capital=args.capital,
+            start_leverage=args.start_leverage,
+            max_leverage=args.max_leverage,
+            step_leverage=args.step_leverage,
+            gain_per_step=args.milestone_gain,
+            dd_bracket=0.10,
+        )
+        if use_seven_factor
+        else None
+    )
+
+    if use_seven_factor:
+        logger.info(
+            f"7-Factor Causal Online Engine ENABLED | Stepped Leverage: "
+            f"{args.start_leverage:.1f}x -> {args.max_leverage:.1f}x "
+            f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM)"
+        )
+
+    if args.enable_anomalies:
+        from src.strategies.extreme_anomaly import (
+            create_illiquid_early_breakout,
+            create_illiquid_funding_fade,
+            create_illiquid_oversold_bounce,
+        )
+        bounce_strat = create_illiquid_oversold_bounce(test_mode=(args.anomaly_size <= 25.0))
+        bounce_strat.symbols_filter = None
+        bounce_strat.max_position_usd = args.anomaly_size
+        breakout_strat = create_illiquid_early_breakout(test_mode=(args.anomaly_size <= 25.0))
+        breakout_strat.symbols_filter = None
+        breakout_strat.max_position_usd = args.anomaly_size
+        fade_strat = create_illiquid_funding_fade(test_mode=(args.anomaly_size <= 25.0))
+        fade_strat.symbols_filter = None
+        fade_strat.max_position_usd = args.anomaly_size
+
+        logger.info(f"Extreme Anomaly Strategies ENABLED on Illiquid Tail (Max Notional: ${args.anomaly_size:.2f} USDT)")
+        allocator = MetaStrategyAllocator(
+            pairs_strategy=pairs_strategy,
+            oversold_bounce_strategy=bounce_strat,
+            early_breakout_strategy=breakout_strat,
+            funding_fade_strategy=fade_strat,
+            seven_factor_engine=seven_factor_engine,
+            stepped_leverage_controller=stepped_leverage_ctrl,
+            use_seven_factor_engine=use_seven_factor,
+        )
+    else:
+        allocator = MetaStrategyAllocator(
+            pairs_strategy=pairs_strategy,
+            seven_factor_engine=seven_factor_engine,
+            stepped_leverage_controller=stepped_leverage_ctrl,
+            use_seven_factor_engine=use_seven_factor,
+        )
     rate_limiter = ExchangeRateLimiter()
     ws_client = ResilientWebSocketClient(symbols=symbols)
 
@@ -86,6 +178,16 @@ def main():
         rebalance_interval_sec=args.rebalance_interval,
         rate_limiter=rate_limiter,
         ws_client=ws_client,
+        min_volume_24h_usd=args.min_volume,
+        enable_market_scan=True,
+        enable_anomalies=args.enable_anomalies,
+        anomaly_size=args.anomaly_size,
+        profit_lock_trigger_pct=args.profit_lock_trigger,
+        profit_lock_level_pct=args.profit_lock_level,
+        trailing_trigger_pct=args.trailing_trigger,
+        trailing_distance_pct=args.trailing_distance,
+        core_take_profit_pct=args.core_tp,
+        min_rebalance_notional=min(10.0, args.anomaly_size) if args.enable_anomalies else max(10.0, min(50.0, args.capital * 0.01)),
     )
 
     # 3. Single-step execution mode

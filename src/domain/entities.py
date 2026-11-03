@@ -84,6 +84,7 @@ class Order:
     filled_quantity: float = 0.0
     average_fill_price: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
+    strategy: Optional[str] = None
 
 
 @dataclass
@@ -96,6 +97,22 @@ class Position:
     quantity: float = 0.0
     entry_price: float = 0.0
     current_price: float = 0.0
+    peak_price: float = 0.0
+    take_profit: Optional[float] = None
+    stop_loss: Optional[float] = None
+    strategy: Optional[str] = None
+    opened_at: Optional[datetime] = None
+
+    @property
+    def is_profit_locked(self) -> bool:
+        """Indicates whether stop-loss has ratcheted into profitable territory."""
+        if self.stop_loss is None or self.entry_price <= 0:
+            return False
+        if self.side == PositionSide.LONG:
+            return self.stop_loss > self.entry_price
+        elif self.side == PositionSide.SHORT:
+            return self.stop_loss < self.entry_price
+        return False
 
     @property
     def market_value(self) -> float:
@@ -107,6 +124,46 @@ class Position:
             return float(self.quantity * (self.current_price - self.entry_price))
         elif self.side == PositionSide.SHORT:
             return float(self.quantity * (self.entry_price - self.current_price))
+        return 0.0
+
+    @property
+    def tp_pnl_usd(self) -> Optional[float]:
+        if self.take_profit is None:
+            return None
+        if self.side == PositionSide.LONG:
+            return float(self.quantity * (self.take_profit - self.entry_price))
+        elif self.side == PositionSide.SHORT:
+            return float(self.quantity * (self.entry_price - self.take_profit))
+        return 0.0
+
+    @property
+    def tp_pnl_pct(self) -> Optional[float]:
+        if self.take_profit is None or self.entry_price <= 0:
+            return None
+        if self.side == PositionSide.LONG:
+            return float((self.take_profit / self.entry_price - 1.0) * 100.0)
+        elif self.side == PositionSide.SHORT:
+            return float((1.0 - self.take_profit / self.entry_price) * 100.0)
+        return 0.0
+
+    @property
+    def sl_pnl_usd(self) -> Optional[float]:
+        if self.stop_loss is None:
+            return None
+        if self.side == PositionSide.LONG:
+            return float(self.quantity * (self.stop_loss - self.entry_price))
+        elif self.side == PositionSide.SHORT:
+            return float(self.quantity * (self.entry_price - self.stop_loss))
+        return 0.0
+
+    @property
+    def sl_pnl_pct(self) -> Optional[float]:
+        if self.stop_loss is None or self.entry_price <= 0:
+            return None
+        if self.side == PositionSide.LONG:
+            return float((self.stop_loss / self.entry_price - 1.0) * 100.0)
+        elif self.side == PositionSide.SHORT:
+            return float((1.0 - self.stop_loss / self.entry_price) * 100.0)
         return 0.0
 
 
@@ -146,3 +203,4 @@ class Trade:
     price: float
     fee: float
     timestamp: datetime
+    strategy: Optional[str] = None

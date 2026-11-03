@@ -207,6 +207,7 @@ class ShadowExecutionBroker(IExecutionClient):
         price: float | None = None,
         role: str | None = None,
         client_order_id: str | None = None,
+        strategy: str | None = None,
     ) -> Order:
         """
         Submits an order through risk verification and matching.
@@ -245,6 +246,7 @@ class ShadowExecutionBroker(IExecutionClient):
             price=price,
             status=OrderStatus.PENDING,
             created_at=datetime.now(timezone.utc),
+            strategy=strategy,
         )
 
         assigned_role = role or ("MAKER" if order_type == OrderType.LIMIT else "TAKER")
@@ -298,6 +300,11 @@ class ShadowExecutionBroker(IExecutionClient):
             else:
                 fill_price = base_price * (1.0 - self.slippage)
 
+        self._fill_taker_order(order, fill_price)
+
+    def _fill_taker_order(self, order: Order, fill_price: float) -> None:
+        """Fills order as Taker and updates balance and position."""
+        symbol = order.symbol
         fee = fill_price * order.quantity * self.taker_fee_pct
 
         trade = Trade(
@@ -309,6 +316,7 @@ class ShadowExecutionBroker(IExecutionClient):
             price=fill_price,
             fee=fee,
             timestamp=datetime.now(timezone.utc),
+            strategy=getattr(order, "strategy", None),
         )
 
         # Update order state
@@ -326,7 +334,7 @@ class ShadowExecutionBroker(IExecutionClient):
             role="TAKER",
         )
         realized_pnl = self._update_portfolio_position(trade)
-        self.db.save_trade(trade, is_maker=False, realized_pnl=realized_pnl)
+        self.db.save_trade(trade, is_maker=False, realized_pnl=realized_pnl, strategy=getattr(order, "strategy", None))
         self._record_account_snapshot()
 
     def _evaluate_limit_order(self, order: Order) -> None:
@@ -364,6 +372,7 @@ class ShadowExecutionBroker(IExecutionClient):
             price=fill_price,
             fee=fee,
             timestamp=datetime.now(timezone.utc),
+            strategy=getattr(order, "strategy", None),
         )
 
         order.status = OrderStatus.FILLED
@@ -379,38 +388,155 @@ class ShadowExecutionBroker(IExecutionClient):
             role="MAKER",
         )
         realized_pnl = self._update_portfolio_position(trade)
-        self.db.save_trade(trade, is_maker=True, realized_pnl=realized_pnl)
+        self.db.save_trade(trade, is_maker=True, realized_pnl=realized_pnl, strategy=getattr(order, "strategy", None))
         self._record_account_snapshot()
+
+    def create_bracket_orders(
+        self,
+        symbol: str,
+        take_profit: float | None = None,
+        stop_loss: float | None = None,
+    ) -> tuple[Order | None, Order | None] | None:
+        """
+        Attaches Take-Profit and/or Stop-Loss orders to an active position.
+        Persists TP/SL levels in the position record and stores pending bracket orders in DB.
+        Supports Take-Profit-only initialization (stop_loss=None) for core basket positions
+        where Stop-Profit / Trailing Stop is armed dynamically once profit thresholds are reached.
+        """
+        pos = self.portfolio.positions.get(symbol)
+        if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
+            return None
+
+        pos.take_profit = float(take_profit) if take_profit is not None else None
+        pos.stop_loss = float(stop_loss) if stop_loss is not None else None
+        self.db.save_position(pos)
+
+        # Cancel any existing pending TP/SL orders for this symbol first
+        for o in self.db.get_pending_orders():
+            if o.symbol == symbol and o.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
+                self.db.update_order_status(o.id, OrderStatus.CANCELED)
+
+        # Order side to close position
+        close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+
+        tp_order: Order | None = None
+        sl_order: Order | None = None
+
+        if pos.take_profit is not None:
+            tp_order = Order(
+                id=f"shd_tp_{uuid.uuid4().hex[:10]}",
+                symbol=symbol,
+                side=close_side,
+                order_type=OrderType.TAKE_PROFIT,
+                quantity=pos.quantity,
+                price=pos.take_profit,
+                status=OrderStatus.PENDING,
+                strategy=getattr(pos, "strategy", None),
+            )
+            self.db.save_order(tp_order, role="MAKER")
+
+        if pos.stop_loss is not None:
+            sl_order = Order(
+                id=f"shd_sl_{uuid.uuid4().hex[:10]}",
+                symbol=symbol,
+                side=close_side,
+                order_type=OrderType.STOP_LOSS,
+                quantity=pos.quantity,
+                price=pos.stop_loss,
+                status=OrderStatus.PENDING,
+                strategy=getattr(pos, "strategy", None),
+            )
+            self.db.save_order(sl_order, role="TAKER")
+
+        return tp_order, sl_order
+
+    def update_stop_loss(self, symbol: str, new_stop_loss: float) -> Order | None:
+        """
+        Ratchets the Stop-Loss order for an active position (Profit-Lock / Trailing Stop).
+        Updates the position stop_loss attribute and replaces the pending STOP_LOSS order in DB.
+        """
+        pos = self.portfolio.positions.get(symbol)
+        if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
+            return None
+
+        pos.stop_loss = float(new_stop_loss)
+        self.db.save_position(pos)
+
+        # Cancel existing pending SL order for this symbol
+        for o in self.db.get_pending_orders():
+            if o.symbol == symbol and o.order_type == OrderType.STOP_LOSS:
+                self.db.update_order_status(o.id, OrderStatus.CANCELED)
+
+        close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+        new_sl_order = Order(
+            id=f"shd_sl_{uuid.uuid4().hex[:10]}",
+            symbol=symbol,
+            side=close_side,
+            order_type=OrderType.STOP_LOSS,
+            quantity=pos.quantity,
+            price=pos.stop_loss,
+            status=OrderStatus.PENDING,
+            strategy=getattr(pos, "strategy", None),
+        )
+        self.db.save_order(new_sl_order, role="TAKER")
+        return new_sl_order
 
     def check_pending_orders(self, symbol_ticks: dict[str, dict[str, float]]) -> list[Order]:
         """
-        Evaluates all pending limit orders against fresh market ticks (bid/ask/low/high).
-        Fills orders whose limits have been breached.
+        Evaluates all pending limit, take-profit, and stop-loss orders against fresh market ticks.
+        Fills orders whose trigger conditions have been met and enforces OCO bracket cancellation.
         """
         pending_orders = self.db.get_pending_orders()
         filled_orders: list[Order] = []
 
         for order in pending_orders:
             symbol = order.symbol
-            tick = symbol_ticks.get(symbol)
+            tick = symbol_ticks.get(symbol) or symbol_ticks.get(symbol.replace("/", ""))
             if not tick or order.price is None:
                 continue
 
             limit_price = order.price
-            low = tick.get("low", tick.get("bid", limit_price))
-            high = tick.get("high", tick.get("ask", limit_price))
+            current = float(tick.get("price", limit_price))
+            bid = float(tick.get("bid", current))
+            ask = float(tick.get("ask", current))
+            low = float(tick.get("low", tick.get("bid", limit_price)))
+            high = float(tick.get("high", tick.get("ask", limit_price)))
 
             should_fill = False
-            if order.side == OrderSide.BUY:
-                if low <= limit_price:
+            if order.order_type == OrderType.TAKE_PROFIT:
+                # Sell TP triggers when current market price rises to/above target; Buy TP triggers when current drops to/below target
+                if order.side == OrderSide.SELL and (bid >= limit_price or current >= limit_price):
+                    should_fill = True
+                elif order.side == OrderSide.BUY and (ask <= limit_price or current <= limit_price):
+                    should_fill = True
+            elif order.order_type == OrderType.STOP_LOSS:
+                # Sell SL triggers when current market price drops to/below stop; Buy SL triggers when current rises to/above stop
+                if order.side == OrderSide.SELL and (bid <= limit_price or current <= limit_price):
+                    should_fill = True
+                elif order.side == OrderSide.BUY and (ask >= limit_price or current >= limit_price):
                     should_fill = True
             else:
-                if high >= limit_price:
+                # Standard passive LIMIT order:
+                # Buy limit fills when market ask, current, or low drops to or crosses limit
+                # Sell limit fills when market bid, current, or high rises to or crosses limit
+                if order.side == OrderSide.BUY and (ask <= limit_price or current <= limit_price or low <= limit_price):
+                    should_fill = True
+                elif order.side == OrderSide.SELL and (bid >= limit_price or current >= limit_price or high >= limit_price):
                     should_fill = True
 
             if should_fill:
-                self._fill_maker_order(order, fill_price=limit_price)
+                if order.order_type == OrderType.STOP_LOSS:
+                    self._fill_taker_order(order, fill_price=limit_price)
+                else:
+                    self._fill_maker_order(order, fill_price=limit_price)
                 filled_orders.append(order)
+
+                # OCO bracket logic: Cancel opposing bracket order if TP or SL triggered
+                if order.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
+                    opposing = OrderType.STOP_LOSS if order.order_type == OrderType.TAKE_PROFIT else OrderType.TAKE_PROFIT
+                    for other in self.db.get_pending_orders():
+                        if other.symbol == symbol and other.order_type == opposing:
+                            self.db.update_order_status(other.id, OrderStatus.CANCELED)
 
         return filled_orders
 
@@ -463,6 +589,12 @@ class ShadowExecutionBroker(IExecutionClient):
         self._record_account_snapshot(timestamp)
         return self.portfolio
 
+    def _cancel_bracket_orders(self, symbol: str) -> None:
+        """Cancels any pending Take-Profit or Stop-Loss bracket orders for a symbol."""
+        for o in self.db.get_pending_orders(symbol=symbol):
+            if o.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
+                self.db.update_order_status(o.id, OrderStatus.CANCELED)
+
     def _update_portfolio_position(self, trade: Trade) -> float:
         """
         Updates in-memory portfolio position and deducts fee.
@@ -481,9 +613,14 @@ class ShadowExecutionBroker(IExecutionClient):
                 quantity=trade.quantity,
                 entry_price=trade.price,
                 current_price=trade.price,
+                strategy=getattr(trade, "strategy", None),
+                opened_at=trade.timestamp,
             )
             self.portfolio.positions[symbol] = pos
         else:
+            if not pos.strategy and getattr(trade, "strategy", None):
+                pos.strategy = trade.strategy
+
             # Existing position
             is_increasing = (
                 (pos.side == PositionSide.LONG and trade.side == OrderSide.BUY)
@@ -491,11 +628,25 @@ class ShadowExecutionBroker(IExecutionClient):
             )
 
             if is_increasing:
-                total_qty = pos.quantity + trade.quantity
-                avg_entry = (pos.quantity * pos.entry_price + trade.quantity * trade.price) / total_qty
+                old_qty = pos.quantity
+                old_peak = pos.peak_price
+                total_qty = old_qty + trade.quantity
+                avg_entry = (old_qty * pos.entry_price + trade.quantity * trade.price) / total_qty
                 pos.quantity = total_qty
                 pos.entry_price = avg_entry
                 pos.current_price = trade.price
+
+                # Preserve active Profit-Lock / Trailing Stop and peak_price on minor neutrality scale-ins (< 20% size increase)
+                if old_qty > 0 and (trade.quantity / old_qty) < 0.20 and old_peak > 0:
+                    if pos.side == PositionSide.LONG:
+                        pos.peak_price = max(old_peak, trade.price, avg_entry)
+                    else:
+                        pos.peak_price = min(old_peak, trade.price, avg_entry)
+                else:
+                    pos.peak_price = trade.price
+                    pos.take_profit = None
+                    pos.stop_loss = None
+                    self._cancel_bracket_orders(symbol)
             else:
                 # Reducing or reversing position
                 closed_qty = min(pos.quantity, trade.quantity)
@@ -506,12 +657,18 @@ class ShadowExecutionBroker(IExecutionClient):
 
                 self.portfolio.cash += realized_pnl
 
-                if trade.quantity < pos.quantity:
-                    pos.quantity -= trade.quantity
-                    pos.current_price = trade.price
-                elif trade.quantity == pos.quantity:
+                if abs(trade.quantity - pos.quantity) <= 1e-9:
                     pos.quantity = 0.0
                     pos.side = PositionSide.FLAT
+                    pos.current_price = trade.price
+                    pos.take_profit = None
+                    pos.stop_loss = None
+                    pos.peak_price = 0.0
+                    pos.strategy = None
+                    pos.opened_at = None
+                    self._cancel_bracket_orders(symbol)
+                elif trade.quantity < pos.quantity:
+                    pos.quantity -= trade.quantity
                     pos.current_price = trade.price
                 else:
                     # Reversed side
@@ -520,9 +677,20 @@ class ShadowExecutionBroker(IExecutionClient):
                     pos.quantity = remaining_qty
                     pos.entry_price = trade.price
                     pos.current_price = trade.price
+                    pos.take_profit = None
+                    pos.stop_loss = None
+                    pos.peak_price = 0.0
+                    pos.strategy = getattr(trade, "strategy", None)
+                    pos.opened_at = trade.timestamp
+                    self._cancel_bracket_orders(symbol)
 
         # Update DB position record
         self.db.save_position(pos, realized_pnl=realized_pnl)
+
+        # Keep any active TP/SL bracket order quantities synchronized with updated position size
+        if pos.side != PositionSide.FLAT and pos.quantity > 0 and (pos.take_profit is not None or pos.stop_loss is not None):
+            self.create_bracket_orders(symbol=symbol, take_profit=pos.take_profit, stop_loss=pos.stop_loss)
+
         return realized_pnl
 
     def _record_account_snapshot(self, timestamp: datetime | None = None) -> None:

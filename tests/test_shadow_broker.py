@@ -194,3 +194,155 @@ def test_mark_to_market_portfolio(broker: ShadowExecutionBroker):
 
     latest_acc = broker.db.get_latest_account()
     assert latest_acc["unrealized_pnl"] > 950.0
+
+
+def test_bracket_orders_and_pnl_estimation(broker: ShadowExecutionBroker):
+    """Verifies creation of Take-Profit and Stop-Loss orders with PnL estimations."""
+    broker.set_market_price("WAL/USDT", price=0.0600)
+    broker.create_order(
+        symbol="WAL/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=1000.0,
+    )
+
+    pos = broker.portfolio.positions["WAL/USDT"]
+    assert pos.quantity == 1000.0
+
+    # Attach brackets: TP @ 0.0690 (+15%), SL @ 0.0576 (-4%)
+    tp_order, sl_order = broker.create_bracket_orders(
+        symbol="WAL/USDT",
+        take_profit=0.0690,
+        stop_loss=0.0576,
+    )
+
+    assert tp_order.order_type == OrderType.TAKE_PROFIT
+    assert tp_order.price == 0.0690
+    assert sl_order.order_type == OrderType.STOP_LOSS
+    assert sl_order.price == 0.0576
+
+    # Verify estimated PnLs
+    assert pos.tp_pnl_usd is not None
+    assert pos.tp_pnl_pct is not None
+    assert pos.sl_pnl_usd is not None
+    assert pos.sl_pnl_pct is not None
+    assert round(pos.tp_pnl_pct, 1) == 15.0
+    assert round(pos.sl_pnl_pct, 1) == -4.0
+
+    # Simulate price hitting TP
+    ticks = {"WAL/USDT": {"price": 0.0700, "bid": 0.0695, "ask": 0.0700, "high": 0.0705, "low": 0.0650}}
+    filled = broker.check_pending_orders(ticks)
+    assert len(filled) == 1
+    assert filled[0].order_type == OrderType.TAKE_PROFIT
+
+    # Verify SL order was cancelled (OCO)
+    pending_orders = broker.db.get_pending_orders()
+    assert len(pending_orders) == 0
+
+
+def test_bracket_orders_stop_loss_trigger(broker: ShadowExecutionBroker):
+    """Verifies Stop-Loss execution as Taker and OCO cancellation of Take-Profit."""
+    broker.set_market_price("ETH/USDT", price=3000.0)
+    broker.create_order(
+        symbol="ETH/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=1.0,
+    )
+
+    tp_order, sl_order = broker.create_bracket_orders(
+        symbol="ETH/USDT",
+        take_profit=3300.0,
+        stop_loss=2850.0,
+    )
+
+    # Price drops to 2840.0 hitting Stop Loss
+    ticks = {"ETH/USDT": {"price": 2840.0, "bid": 2839.0, "ask": 2841.0, "high": 2900.0, "low": 2835.0}}
+    filled = broker.check_pending_orders(ticks)
+    assert len(filled) == 1
+    assert filled[0].order_type == OrderType.STOP_LOSS
+
+    # TP order should be cancelled
+    pending = broker.db.get_pending_orders()
+    assert len(pending) == 0
+
+    # Trade should be recorded with realized loss
+    trades = broker.db.get_trades(symbol="ETH/USDT")
+    assert len(trades) >= 2
+    latest = trades[0]
+    assert latest["order_id"] == sl_order.id
+    assert latest["is_maker"] == 0  # Taker execution for stop loss
+    assert latest["realized_pnl"] < 0  # Realized loss
+
+
+def test_broker_update_stop_loss(broker: ShadowExecutionBroker):
+    """Verifies ratcheting stop-loss replaces pending order and locks profit."""
+    broker.set_market_price("ETH/USDT", price=3000.0)
+    broker.create_order(
+        symbol="ETH/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=1.0,
+    )
+
+    broker.create_bracket_orders(
+        symbol="ETH/USDT",
+        take_profit=3300.0,
+        stop_loss=2850.0,
+    )
+
+    # Ratchet SL above entry to lock in profit
+    updated_sl = broker.update_stop_loss("ETH/USDT", 3050.0)
+    assert updated_sl is not None
+    assert updated_sl.price == 3050.0
+
+    pos = broker.portfolio.positions["ETH/USDT"]
+    assert pos.stop_loss == 3050.0
+    assert pos.is_profit_locked is True
+    assert round(pos.sl_pnl_pct, 1) == 1.7
+
+    # Verify pending orders in DB
+    pending = broker.db.get_pending_orders()
+    assert len(pending) == 2  # 1 TP + 1 new SL
+    sl_orders = [o for o in pending if o.order_type == OrderType.STOP_LOSS]
+    assert len(sl_orders) == 1
+    assert sl_orders[0].price == 3050.0
+
+
+def test_position_reversal_clears_brackets_and_cancels_orders(broker: ShadowExecutionBroker):
+    """Verifies that closing or flipping a position cancels orphaned TP/SL orders and clears brackets in DB."""
+    broker.set_market_price("SOL/USDT", price=200.0)
+    broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        strategy="Early Breakout",
+    )
+    broker.create_bracket_orders(symbol="SOL/USDT", take_profit=230.0, stop_loss=192.0)
+    assert len(broker.db.get_pending_orders(symbol="SOL/USDT")) == 2
+
+    # Reverse position from 10 LONG to 5 SHORT via SELL 15
+    broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=15.0,
+        strategy="Cross-Sectional Momentum",
+    )
+
+    pos = broker.portfolio.positions["SOL/USDT"]
+    assert pos.side == PositionSide.SHORT
+    assert pos.quantity == 5.0
+    assert pos.take_profit is None
+    assert pos.stop_loss is None
+    assert pos.strategy == "Cross-Sectional Momentum"
+    assert len(broker.db.get_pending_orders(symbol="SOL/USDT")) == 0
+
+    db_pos = broker.db.get_position("SOL/USDT")
+    assert db_pos["side"] == "SHORT"
+    assert db_pos["take_profit"] is None
+    assert db_pos["stop_loss"] is None
+    assert db_pos["strategy"] == "Cross-Sectional Momentum"
+
+
