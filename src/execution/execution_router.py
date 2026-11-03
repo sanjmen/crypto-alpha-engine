@@ -43,6 +43,29 @@ class SmartExecutionRouter:
         self.taker_fee_pct = taker_fee_pct
         self.tick_offset = tick_offset_bps / 10_000.0
 
+    @staticmethod
+    def compute_order_book_imbalance(
+        order_book: Optional[Dict],
+        levels: int = 5,
+    ) -> float:
+        """
+        Computes Top-N Level-2 Order Book Imbalance (OBI):
+            OBI_N = (sum(V_bid, 1..N) - sum(V_ask, 1..N)) / (sum(V_bid, 1..N) + sum(V_ask, 1..N))
+        Returns a scalar in [-1.0, +1.0], or 0.0 if order book depth is unavailable.
+        """
+        if not order_book or not isinstance(order_book, dict):
+            return 0.0
+        bids = order_book.get("bids") or []
+        asks = order_book.get("asks") or []
+        if not bids and not asks:
+            return 0.0
+        v_bid = sum(float(level[1]) for level in bids[:levels] if len(level) >= 2)
+        v_ask = sum(float(level[1]) for level in asks[:levels] if len(level) >= 2)
+        tot = v_bid + v_ask
+        if tot <= 1e-12:
+            return 0.0
+        return float(np.clip((v_bid - v_ask) / tot, -1.0, 1.0))
+
     def route_order(
         self,
         symbol: str,
@@ -52,9 +75,11 @@ class SmartExecutionRouter:
         urgency: Optional[ExecutionUrgency] = None,
         bid_ask_spread_bps: float = 2.0,
         strategy: Optional[str] = None,
+        order_book: Optional[Dict] = None,
+        obi: Optional[float] = None,
     ) -> Order:
         """
-        Routes order according to execution urgency.
+        Routes order according to execution urgency and Level-2 Order Book Imbalance (Issue #47).
         """
         urgency = urgency or self.default_urgency
         extra_kwargs = {"strategy": strategy} if strategy is not None else {}
@@ -70,16 +95,34 @@ class SmartExecutionRouter:
                 **extra_kwargs,
             )
         else:
-            # Passive maker limit order placed at top-of-book touch
+            # Passive maker limit order with optional Level-2 OBI adaptive offset (Issue #47)
             spread = (bid_ask_spread_bps / 10_000.0) * current_price
             half_spread = spread / 2.0
 
-            if side == OrderSide.BUY:
-                # Post at bid (mid - half_spread)
-                limit_price = current_price - half_spread
+            obi_val: Optional[float] = None
+            if obi is not None:
+                obi_val = float(np.clip(obi, -1.0, 1.0))
+            elif order_book is not None:
+                obi_val = self.compute_order_book_imbalance(order_book, levels=5)
+
+            if obi_val is not None:
+                order_sign = 1.0 if side == OrderSide.BUY else -1.0
+                flow_align = order_sign * obi_val
+                if flow_align <= -0.25:
+                    # Adverse flow pushing into our passive limit: post 2.5x half-spread (2.5 bps) deeper
+                    offset = 2.5 * half_spread
+                elif flow_align >= 0.30:
+                    # Strong favorable flow / breakout: join inside mid-touch (0.0 bps offset) for immediate fill
+                    offset = 0.0
+                else:
+                    offset = half_spread
             else:
-                # Post at ask (mid + half_spread)
-                limit_price = current_price + half_spread
+                offset = half_spread
+
+            if side == OrderSide.BUY:
+                limit_price = current_price - offset
+            else:
+                limit_price = current_price + offset
 
             return self.broker.create_order(
                 symbol=symbol,

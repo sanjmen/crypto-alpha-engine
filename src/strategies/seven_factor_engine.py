@@ -348,6 +348,56 @@ class SevenFactorOnlineEngine:
                 low[col] = close[col]
         return high[close.columns], low[close.columns]
 
+    @staticmethod
+    def _extract_open_interest(
+        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        close: pd.DataFrame,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Aligns hourly Open Interest contract series (`sumOpenInterest` or `open_interest`)
+        onto `close.index` for Issue #46 Squeeze/Knife Guard & Breakout Confirmation.
+        """
+        if not open_interest:
+            return None
+        oi_dict: Dict[str, pd.Series] = {}
+        for sym in close.columns:
+            oi_val = open_interest.get(sym)
+            if oi_val is None:
+                continue
+            if isinstance(oi_val, pd.Series):
+                s = oi_val.copy()
+                if not isinstance(s.index, pd.DatetimeIndex):
+                    s.index = pd.to_datetime(s.index, utc=True)
+                elif s.index.tz is None:
+                    s.index = s.index.tz_localize("UTC")
+                s = s[~s.index.duplicated(keep="last")].sort_index()
+                oi_dict[sym] = s.astype(float)
+            elif isinstance(oi_val, pd.DataFrame) and not oi_val.empty:
+                d_o = oi_val.copy()
+                if "timestamp" in d_o.columns:
+                    ts = d_o["timestamp"]
+                    if pd.api.types.is_numeric_dtype(ts):
+                        unit = "ms" if float(ts.dropna().max()) > 1e11 else "s"
+                        d_o = d_o.set_index(pd.to_datetime(ts, unit=unit, utc=True))
+                    else:
+                        d_o = d_o.set_index(pd.to_datetime(ts, utc=True))
+                elif not isinstance(d_o.index, pd.DatetimeIndex):
+                    d_o.index = pd.to_datetime(d_o.index, utc=True)
+                elif d_o.index.tz is None:
+                    d_o.index = d_o.index.tz_localize("UTC")
+                d_o.index = d_o.index.round("1h")
+                d_o = d_o[~d_o.index.duplicated(keep="last")].sort_index()
+                col = "sumOpenInterest" if "sumOpenInterest" in d_o.columns else (
+                    "open_interest" if "open_interest" in d_o.columns else d_o.columns[0]
+                )
+                oi_dict[sym] = d_o[col].astype(float)
+        if not oi_dict:
+            return None
+        oi_df = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+        for sym, s in oi_dict.items():
+            oi_df[sym] = s.reindex(close.index).ffill()
+        return oi_df
+
     def _compute_subhourly_pullback_adjustment(
         self,
         bars_15m: Optional[Dict[str, pd.DataFrame]],
@@ -384,6 +434,7 @@ class SevenFactorOnlineEngine:
         bars_1h: Dict[str, pd.DataFrame],
         funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
         bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
+        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> Dict[str, Union[pd.DataFrame, pd.Series]]:
         """
         Computes full historical matrices for the 7 factors, online factor weights,
@@ -393,6 +444,7 @@ class SevenFactorOnlineEngine:
             bars_1h, funding_rates
         )
         high, low = self._extract_high_low(bars_1h, close)
+        oi_contracts = self._extract_open_interest(open_interest, close)
         idx = close.index
         cols = list(close.columns)
 
@@ -591,6 +643,41 @@ class SevenFactorOnlineEngine:
                     ~rev_drop, np.minimum(conviction, conviction.shift(4).fillna(0.50))
                 )
 
+        # Issue #46 (M13 Ola 2): Real-Time Open Interest (OI) Squeeze/Knife Guard & Confirmation
+        if oi_contracts is not None:
+            oi_chg_4h = oi_contracts.pct_change(4, fill_method=None).fillna(0.0)
+            oi_chg_12h = oi_contracts.pct_change(12, fill_method=None).fillna(0.0)
+            oi_chg_24h = oi_contracts.pct_change(24, fill_method=None).fillna(0.0)
+
+            sq_short = (
+                ((oi_chg_4h >= 0.06) | (oi_chg_12h >= 0.10))
+                & (ann_fund < -0.02)
+                & (zr[4] >= 0.80)
+            )
+            fl_long = (
+                (fw_norm["rev"].values[:, None] > 0.35)
+                & (oi_chg_24h >= 0.06)
+                & (zr[12] <= -1.40)
+                & (cmf_24 < -0.05)
+            )
+            oi_confirm = (
+                (oi_chg_12h >= 0.04)
+                & (zi[24] >= 0.75)
+                & (cmf_24 > 0.05)
+            )
+            oi_flush_bounce = (
+                (oi_chg_12h <= -0.05)
+                & (zi[24] <= -1.20)
+                & (cmf_24 > 0.02)
+            )
+            comb_w = (
+                comb_w
+                .where(~((comb_w < 0.0) & sq_short), 0.25 * comb_w)
+                .where(~((comb_w > 0.0) & fl_long), 0.25 * comb_w)
+                .where(~((comb_w > 0.0) & oi_confirm), 1.15 * comb_w)
+                .where(~((comb_w > 0.0) & oi_flush_bounce), 1.15 * comb_w)
+            )
+
         # Retoque 1C (Nov 1): Causal Cross-Sectional Composite Score Smoothing (EMA span=3h)
         # Prevents single-bar 24h return oscillations from flipping individual coins Long <-> Short
         # across consecutive 4h rebalances while preserving factor conviction.
@@ -675,6 +762,7 @@ class SevenFactorOnlineEngine:
         bars_1h: Dict[str, pd.DataFrame],
         funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
         bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
+        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> SevenFactorAllocationResult:
         """
         Evaluates the 7-Factor Causal Online Engine on the latest bar and returns
@@ -684,6 +772,7 @@ class SevenFactorOnlineEngine:
             bars_1h=bars_1h,
             funding_rates=funding_rates,
             bars_15m=bars_15m,
+            open_interest=open_interest,
         )
 
         w_latest = mats["w_base_1x"].iloc[-1].copy()

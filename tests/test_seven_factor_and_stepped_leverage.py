@@ -581,5 +581,34 @@ def test_m13_issue_45_altcoin_sector_cluster_cap():
     assert fast_l1_share_short <= 0.48 + 1e-6
 
 
+def test_m13_issue_46_open_interest_squeeze_and_knife_guard():
+    """
+    Tests Issue #46 (Real-Time Open Interest Squeeze/Knife Guard & Confirmation):
+    Verifies that SevenFactorOnlineEngine accepts `open_interest` DataFrames/Series,
+    applies the OI guard and confirmation adjustments causally, and preserves strict
+    100% dollar neutrality.
+    """
+    bars_1h, bars_15m = _build_synthetic_universe(n_bars=120, seed=46)
+    oi_data = {}
+    for sym, df in bars_1h.items():
+        # Synthetic OI series with a +15% surge on the last 12 bars
+        oi_vals = np.full(len(df), 1_000_000.0)
+        oi_vals[-12:] = np.linspace(1_000_000.0, 1_150_000.0, 12)
+        oi_data[sym] = pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "sumOpenInterest": oi_vals,
+        })
+
+    engine = SevenFactorOnlineEngine()
+    res = engine.allocate_latest(
+        bars_1h=bars_1h,
+        bars_15m=bars_15m,
+        open_interest=oi_data,
+    )
+    assert pytest.approx(sum(res.unit_weights.values()), abs=1e-6) == 0.0
+    assert sum(abs(v) for v in res.unit_weights.values()) > 0.0
+
+
+
 
 

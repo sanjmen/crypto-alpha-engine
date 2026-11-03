@@ -523,6 +523,76 @@ class ShadowTradingDaemon:
         )
         return df_f
 
+    def fetch_open_interest_history_24h(self, symbol: str, limit: int = 36) -> pd.DataFrame:
+        """
+        Fetches trailing hourly Open Interest history (`sumOpenInterest`) for `symbol`
+        (Issue #46), combining local cache (`data/cache/open_interest/1h/{CLEAN_SYM}.parquet`)
+        with live Binance Futures `/futures/data/openInterestHist`.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        oi_path = self.cache_dir / "open_interest" / "1h" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+
+        if self.enable_warm_start and oi_path.exists():
+            try:
+                raw_oi = pd.read_parquet(oi_path).tail(max(limit, 72))
+                if not raw_oi.empty and "timestamp" in raw_oi.columns and "sumOpenInterest" in raw_oi.columns:
+                    cached_df = raw_oi[["timestamp", "sumOpenInterest"]].copy()
+                    cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
+                    cached_df["sumOpenInterest"] = cached_df["sumOpenInterest"].astype(float)
+            except Exception:
+                pass
+
+        live_records: list[dict[str, Any]] = []
+        try:
+            fn = getattr(self.exchange, "fapiDataGetOpenInterestHist", None)
+            if callable(fn) and not isinstance(fn, MagicMock):
+                rows = fn({"symbol": clean_sym, "period": "1h", "limit": min(limit, 48)})
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, dict) and r.get("sumOpenInterest") is not None:
+                            ts_ms = int(r.get("timestamp") or 0)
+                            if ts_ms > 0:
+                                live_records.append({
+                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                    "sumOpenInterest": float(r["sumOpenInterest"]),
+                                })
+        except Exception:
+            pass
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged
+
+    def fetch_symbol_obi(self, symbol: str, levels: int = 5) -> float | None:
+        """
+        Fetches Top-N Level-2 Order Book depth from Binance Futures and returns
+        Order Book Imbalance `OBI_N` in [-1.0, +1.0] for Adaptive Maker Routing (Issue #47).
+        """
+        try:
+            fn = getattr(self.exchange, "fetch_order_book", None)
+            if not callable(fn):
+                return None
+            ob = fn(symbol, limit=levels)
+            if not isinstance(ob, dict):
+                return None
+            return SmartExecutionRouter.compute_order_book_imbalance(ob, levels=levels)
+        except Exception:
+            return None
+
     def run_fast_cycle(self) -> tuple[Portfolio, list[Order]]:
         """
         Executes fast loop (every 5-10s):
@@ -848,8 +918,9 @@ class ShadowTradingDaemon:
             )
             return []
 
-        # Fetch live funding rates (or 72h history for 7-Factor Engine) for curated universe symbols
+        # Fetch live funding rates (or 72h history for 7-Factor Engine) & Open Interest (Issue #46)
         funding_data: dict[str, pd.DataFrame] = {}
+        open_interest_data: dict[str, pd.DataFrame] = {}
         for sym in self.symbols:
             clean_sym = sym.replace("/", "")
             if clean_sym not in market_data:
@@ -858,6 +929,9 @@ class ShadowTradingDaemon:
                 df_f72 = self.fetch_funding_history_72h(sym)
                 if not df_f72.empty:
                     funding_data[clean_sym] = df_f72
+                df_oi = self.fetch_open_interest_history_24h(sym)
+                if not df_oi.empty:
+                    open_interest_data[clean_sym] = df_oi
             else:
                 try:
                     fr = self.exchange.fetch_funding_rate(sym)
@@ -889,6 +963,7 @@ class ShadowTradingDaemon:
                 funding_data=funding_data,
                 bars_15m=bars_15m if bars_15m else None,
                 current_weights=current_weights_map if current_weights_map else None,
+                open_interest_data=open_interest_data if open_interest_data else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
@@ -952,8 +1027,9 @@ class ShadowTradingDaemon:
             side = OrderSide.BUY if dollar_delta > 0 else OrderSide.SELL
             strat_label = dominant_strats.get(clean_sym) or (pos.strategy if pos and pos.strategy else "Cross-Sectional Momentum")
 
-            # Route as passive Maker limit order at touch
+            # Route as passive Maker limit order with Level-2 OBI Adaptive Routing (Issue #47)
             try:
+                obi_val = self.fetch_symbol_obi(sym, levels=5)
                 order = self.router.route_order(
                     symbol=sym,
                     side=side,
@@ -961,6 +1037,7 @@ class ShadowTradingDaemon:
                     current_price=price,
                     urgency=ExecutionUrgency.LOW,
                     strategy=strat_label,
+                    obi=obi_val,
                 )
                 if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and abs(target_val) > 0:
                     pos.strategy = strat_label
