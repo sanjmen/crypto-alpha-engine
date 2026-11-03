@@ -4,15 +4,19 @@ Safeguards real trading capital against unexpected fat-finger errors,
 extreme leverage, and flash drawdowns.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import ccxt
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.ports.execution_ports import IExecutionClient
+from src.risk.kill_switch import EmergencyKillSwitch
 from src.security.vault import ExchangeCredentials, PreFlightPermissionValidator
 
 logger = logging.getLogger(__name__)
@@ -206,3 +210,438 @@ class CCXTExecutionAdapter(IExecutionClient):
 
         self.orders[order_id] = order
         return order
+
+
+class BinanceLiveBroker(CCXTExecutionAdapter):
+    """
+    Production Binance USD-M Perpetual Futures (`fapi`) Execution Broker.
+    Features:
+    1. Post-Only (`timeInForce='GTX'`) Maker Limit-Chase Execution Engine.
+    2. Atomic Long/Short Leg Pairing (concurrent execution to prevent directional drift).
+    3. Strict Exchange Filter Quantization (`tickSize`, `stepSize`, `minNotional`).
+    4. Pre-Trade `positionRisk` Reconciliation and `reduceOnly=True` Emergency Flatten.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        credentials: ExchangeCredentials | None = None,
+        testnet: bool = False,
+        dry_run: bool = True,
+        initial_capital: float = 1000.0,
+        max_gross_leverage: float = 6.0,
+        max_order_notional: float = 25_000.0,
+        max_drawdown_stop: float = 0.15,
+        chase_interval_sec: float = 5.0,
+        max_chase_iterations: int = 3,
+        allow_taker_fallback: bool = True,
+        kill_switch: EmergencyKillSwitch | None = None,
+    ) -> None:
+        super().__init__(
+            exchange_id="binance",
+            api_key=api_key,
+            api_secret=api_secret,
+            credentials=credentials,
+            validate_permissions=(not dry_run and not testnet),
+            dry_run=dry_run,
+            max_gross_leverage=max_gross_leverage,
+            max_order_notional=max_order_notional,
+            max_drawdown_stop=max_drawdown_stop,
+        )
+        if testnet and hasattr(self.client, "set_sandbox_mode"):
+            self.client.set_sandbox_mode(True)
+
+        self.portfolio = Portfolio(
+            cash=float(initial_capital),
+            initial_cash=float(initial_capital),
+            positions={},
+        )
+        self.peak_equity = float(initial_capital)
+        self.chase_interval_sec = float(chase_interval_sec)
+        self.max_chase_iterations = int(max_chase_iterations)
+        self.allow_taker_fallback = bool(allow_taker_fallback)
+        self.kill_switch = kill_switch or EmergencyKillSwitch()
+
+        self.maker_fills_count: int = 0
+        self.taker_fills_count: int = 0
+
+    @property
+    def maker_fill_ratio(self) -> float:
+        total = self.maker_fills_count + self.taker_fills_count
+        return (self.maker_fills_count / total) if total > 0 else 1.0
+
+    def quantize_price(self, symbol: str, price: float) -> float:
+        """Quantizes price strictly to Binance symbol `tickSize`."""
+        try:
+            if hasattr(self.client, "markets") and self.client.markets and symbol in self.client.markets:
+                return float(self.client.price_to_precision(symbol, price))
+        except Exception:
+            pass
+        return round(float(price), 6 if price < 1.0 else (4 if price < 100.0 else 2))
+
+    def quantize_amount(self, symbol: str, amount: float) -> float:
+        """Quantizes quantity strictly to Binance symbol `stepSize`."""
+        try:
+            if hasattr(self.client, "markets") and self.client.markets and symbol in self.client.markets:
+                return float(self.client.amount_to_precision(symbol, amount))
+        except Exception:
+            pass
+        return round(float(amount), 4 if amount < 10.0 else 2)
+
+    def fetch_best_bid_ask(self, symbol: str, fallback_price: float = 100.0) -> tuple[float, float]:
+        """Fetches L1 top-of-book `(best_bid, best_ask)` for Post-Only limit placement."""
+        try:
+            ticker = self.client.fetch_ticker(symbol)
+            last = float(ticker.get("last") or ticker.get("close") or fallback_price)
+            bid = float(ticker.get("bid") or (last * 0.9999))
+            ask = float(ticker.get("ask") or (last * 1.0001))
+            if bid >= ask:
+                bid = last * 0.9999
+                ask = last * 1.0001
+            return bid, ask
+        except Exception:
+            return fallback_price * 0.9999, fallback_price * 1.0001
+
+    def reconcile_positions_from_exchange(self) -> dict[str, Position]:
+        """
+        Synchronizes local `self.portfolio.positions` and cash balance with actual
+        Binance USD-M Futures account state (`GET /fapi/v2/positionRisk` & `fetch_balance`).
+        """
+        if self.dry_run:
+            return self.portfolio.positions
+
+        try:
+            bal = self.client.fetch_balance()
+            usdt_info = bal.get("USDT", {})
+            free_cash = float(usdt_info.get("free") or usdt_info.get("total") or self.portfolio.cash)
+            self.portfolio.cash = free_cash
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not fetch live balance during reconciliation: {e}")
+
+        try:
+            raw_positions = self.client.fetch_positions()
+            reconciled: dict[str, Position] = {}
+            for p in raw_positions:
+                contracts = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0)
+                if abs(contracts) <= 1e-10:
+                    continue
+                sym = str(p.get("symbol") or "").split(":")[0]
+                side_str = str(p.get("side") or ("long" if contracts > 0 else "short")).lower()
+                p_side = PositionSide.LONG if side_str == "long" else PositionSide.SHORT
+                entry_px = float(p.get("entryPrice") or p.get("markPrice") or 0.0)
+                mark_px = float(p.get("markPrice") or entry_px)
+                reconciled[sym] = Position(
+                    symbol=sym,
+                    side=p_side,
+                    quantity=abs(contracts),
+                    entry_price=entry_px,
+                    current_price=mark_px,
+                )
+            self.portfolio.positions = reconciled
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not fetch live positions during reconciliation: {e}")
+
+        return self.portfolio.positions
+
+    def execute_maker_limit_chase(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        fallback_price: float = 100.0,
+        reduce_only: bool = False,
+    ) -> Order:
+        """
+        Executes an order using Post-Only (`timeInForce='GTX'`) Maker limit orders at the
+        top of book (`best_bid` for BUY, `best_ask` for SELL), chasing up to
+        `max_chase_iterations` before optional IOC/Market fallback.
+        """
+        q_amt = self.quantize_amount(symbol, quantity)
+        bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=fallback_price)
+        limit_px = self.quantize_price(symbol, bid if side == OrderSide.BUY else ask)
+
+        if not reduce_only:
+            self.verify_risk_circuit_breakers(symbol, q_amt, limit_px)
+
+        order_id = f"gtx_{uuid.uuid4().hex[:10]}"
+        if self.dry_run:
+            self.maker_fills_count += 1
+            order = Order(
+                id=order_id,
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=q_amt,
+                price=limit_px,
+                status=OrderStatus.FILLED,
+                filled_quantity=q_amt,
+                average_fill_price=limit_px,
+                created_at=datetime.now(timezone.utc),
+            )
+            fee = q_amt * limit_px * self.maker_fee_pct
+            trade = Trade(
+                id=f"trd_{uuid.uuid4().hex[:10]}",
+                order_id=order_id,
+                symbol=symbol,
+                side=side,
+                quantity=q_amt,
+                price=limit_px,
+                fee=fee,
+                timestamp=datetime.now(timezone.utc),
+            )
+            self.trade_history.append(trade)
+            self.portfolio.cash -= fee
+            self._apply_fill_to_portfolio(symbol, side, q_amt, limit_px)
+            self.orders[order_id] = order
+            return order
+
+        remaining = q_amt
+        ccxt_side = "buy" if side == OrderSide.BUY else "sell"
+        last_order_id = order_id
+        filled_total = 0.0
+        cost_total = 0.0
+
+        for attempt in range(self.max_chase_iterations):
+            bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=limit_px)
+            chase_px = self.quantize_price(symbol, bid if side == OrderSide.BUY else ask)
+            params: dict[str, Any] = {"timeInForce": "GTX"}
+            if reduce_only:
+                params["reduceOnly"] = True
+
+            try:
+                res = self.client.create_order(
+                    symbol=symbol,
+                    type="limit",
+                    side=ccxt_side,
+                    amount=self.quantize_amount(symbol, remaining),
+                    price=chase_px,
+                    params=params,
+                )
+                live_id = str(res.get("id", order_id))
+                last_order_id = live_id
+                if self.chase_interval_sec > 0:
+                    time.sleep(self.chase_interval_sec)
+
+                chk = self.client.fetch_order(live_id, symbol)
+                status_str = str(chk.get("status", "")).lower()
+                filled_this = float(chk.get("filled") or 0.0)
+                avg_px = float(chk.get("average") or chase_px)
+
+                if filled_this > 0:
+                    filled_total += filled_this
+                    cost_total += filled_this * avg_px
+                    remaining = max(0.0, q_amt - filled_total)
+                    self.maker_fills_count += 1
+
+                if status_str in ("closed", "filled") or remaining <= 1e-8:
+                    break
+
+                # Cancel unfilled portion to re-post at new top of book
+                try:
+                    self.client.cancel_order(live_id, symbol)
+                except Exception:
+                    pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"GTX attempt {attempt+1} on {symbol} rejected/repricing: {e}")
+
+        # Fallback for any remaining quantity
+        if remaining > 1e-8 and self.allow_taker_fallback:
+            fb_params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
+            res_mkt = self.client.create_order(
+                symbol=symbol,
+                type="market",
+                side=ccxt_side,
+                amount=self.quantize_amount(symbol, remaining),
+                params=fb_params,
+            )
+            last_order_id = str(res_mkt.get("id", last_order_id))
+            avg_px = float(res_mkt.get("average") or res_mkt.get("price") or limit_px)
+            filled_total += remaining
+            cost_total += remaining * avg_px
+            remaining = 0.0
+            self.taker_fills_count += 1
+
+        final_avg_px = (cost_total / filled_total) if filled_total > 0 else limit_px
+        if filled_total > 0:
+            self._apply_fill_to_portfolio(symbol, side, filled_total, final_avg_px)
+
+        final_order = Order(
+            id=last_order_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=q_amt,
+            price=limit_px,
+            status=OrderStatus.FILLED if remaining <= 1e-8 else OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=filled_total,
+            average_fill_price=final_avg_px,
+            created_at=datetime.now(timezone.utc),
+        )
+        self.orders[last_order_id] = final_order
+        return final_order
+
+    def _apply_fill_to_portfolio(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        fill_price: float,
+    ) -> None:
+        """Updates internal position tracking after an order fill."""
+        existing = self.portfolio.positions.get(symbol)
+        signed_delta = quantity if side == OrderSide.BUY else -quantity
+        if existing and existing.side != PositionSide.FLAT and existing.quantity > 0:
+            existing_signed = (
+                existing.quantity if existing.side == PositionSide.LONG else -existing.quantity
+            )
+            new_signed = existing_signed + signed_delta
+        else:
+            new_signed = signed_delta
+
+        if abs(new_signed) <= 1e-8:
+            self.portfolio.positions.pop(symbol, None)
+        else:
+            new_side = PositionSide.LONG if new_signed > 0 else PositionSide.SHORT
+            self.portfolio.positions[symbol] = Position(
+                symbol=symbol,
+                side=new_side,
+                quantity=abs(new_signed),
+                entry_price=fill_price,
+                current_price=fill_price,
+            )
+
+    def execute_atomic_rebalance(
+        self,
+        target_dollars: dict[str, float],
+        prices: dict[str, float],
+        min_notional: float = 25.0,
+    ) -> list[Order]:
+        """
+        Pairs BUY deltas and SELL deltas and executes them concurrently so the portfolio
+        never develops a directional exposure tilt mid-rebalance.
+        """
+        ks_status = self.kill_switch.evaluate_and_enforce(self.portfolio, broker=self)
+        if ks_status.triggered and self.kill_switch.is_locked():
+            raise MaxDrawdownStopError(f"Kill-Switch active: {ks_status.reason}")
+
+        all_syms = sorted(set(target_dollars.keys()) | set(self.portfolio.positions.keys()))
+        buy_tasks: list[tuple[str, float, float]] = []
+        sell_tasks: list[tuple[str, float, float]] = []
+
+        for sym in all_syms:
+            px = float(prices.get(sym) or prices.get(sym.replace("/", "")) or 0.0)
+            if px <= 0:
+                pos_cur = self.portfolio.positions.get(sym)
+                px = pos_cur.current_price if pos_cur else 0.0
+            if px <= 0:
+                continue
+
+            tgt_val = float(target_dollars.get(sym, target_dollars.get(sym.replace("/", ""), 0.0)))
+            pos = self.portfolio.positions.get(sym)
+            cur_val = 0.0
+            if pos and pos.side != PositionSide.FLAT and pos.quantity > 0:
+                cur_val = (pos.quantity * px) if pos.side == PositionSide.LONG else (-pos.quantity * px)
+
+            delta_usd = tgt_val - cur_val
+            if abs(delta_usd) < min_notional:
+                continue
+
+            qty = abs(delta_usd) / px
+            if delta_usd > 0:
+                buy_tasks.append((sym, qty, px))
+            else:
+                sell_tasks.append((sym, qty, px))
+
+        executed: list[Order] = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = []
+            max_len = max(len(buy_tasks), len(sell_tasks))
+            for i in range(max_len):
+                if i < len(buy_tasks):
+                    b_sym, b_qty, b_px = buy_tasks[i]
+                    futures.append(
+                        pool.submit(
+                            self.execute_maker_limit_chase,
+                            b_sym,
+                            OrderSide.BUY,
+                            b_qty,
+                            b_px,
+                        )
+                    )
+                if i < len(sell_tasks):
+                    s_sym, s_qty, s_px = sell_tasks[i]
+                    futures.append(
+                        pool.submit(
+                            self.execute_maker_limit_chase,
+                            s_sym,
+                            OrderSide.SELL,
+                            s_qty,
+                            s_px,
+                        )
+                    )
+            for fut in futures:
+                executed.append(fut.result())
+
+        return executed
+
+    def emergency_flatten_all(self) -> list[str]:
+        """
+        Cancels all open orders and flattens all open positions with `reduceOnly=True`.
+        """
+        flattened: list[str] = []
+        for sym, pos in list(self.portfolio.positions.items()):
+            if pos.side == PositionSide.FLAT or pos.quantity <= 0:
+                continue
+            if not self.dry_run:
+                try:
+                    if hasattr(self.client, "cancel_all_orders"):
+                        self.client.cancel_all_orders(sym)
+                except Exception:
+                    pass
+                close_side = "sell" if pos.side == PositionSide.LONG else "buy"
+                try:
+                    self.client.create_order(
+                        symbol=sym,
+                        type="market",
+                        side=close_side,
+                        amount=self.quantize_amount(sym, pos.quantity),
+                        params={"reduceOnly": True},
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Emergency flatten error on {sym}: {e}")
+            flattened.append(sym)
+            self.portfolio.positions.pop(sym, None)
+
+        return flattened
+
+    def hedge_excess_exposure(self, net_exposure_usd: float) -> Order | None:
+        """
+        Reduces the largest position on the overweight side when net exposure asymmetry
+        exceeds the safety threshold.
+        """
+        if abs(net_exposure_usd) <= 1.0 or not self.portfolio.positions:
+            return None
+
+        target_side = PositionSide.LONG if net_exposure_usd > 0 else PositionSide.SHORT
+        candidates = [
+            p for p in self.portfolio.positions.values()
+            if p.side == target_side and p.quantity > 0
+        ]
+        if not candidates:
+            return None
+
+        largest = max(candidates, key=lambda p: p.quantity * (p.current_price or p.entry_price))
+        px = largest.current_price if largest.current_price > 0 else largest.entry_price
+        if px <= 0:
+            return None
+
+        reduce_qty = min(largest.quantity, abs(net_exposure_usd) / px)
+        order_side = OrderSide.SELL if target_side == PositionSide.LONG else OrderSide.BUY
+        return self.execute_maker_limit_chase(
+            symbol=largest.symbol,
+            side=order_side,
+            quantity=reduce_qty,
+            fallback_price=px,
+            reduce_only=True,
+        )

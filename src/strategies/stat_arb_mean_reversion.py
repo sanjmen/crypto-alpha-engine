@@ -26,7 +26,7 @@ class StatArbMeanReversionStrategy(IStrategy):
 
     def __init__(
         self,
-        lookback_window: int = 48,          # 48-hour rolling equilibrium
+        lookback_window: int = 72,          # 72-hour rolling equilibrium (>= 64 bars for Hurst)
         hurst_threshold: float = 0.45,       # Must be mean-reverting (H < 0.45)
         entry_zscore: float = 2.0,           # Entry threshold at 2 standard deviations
         exit_zscore: float = 0.5,            # Take-profit / mean-reversion exit
@@ -62,9 +62,10 @@ class StatArbMeanReversionStrategy(IStrategy):
 
             closes = df["close"].values
             window_closes = closes[-self.lookback_window:]
+            hurst_closes = closes[-max(self.lookback_window, 72):]
 
             # 1. Estimate Hurst exponent to verify mean-reversion
-            hurst_val = float(estimate_hurst_variance_time(window_closes))
+            hurst_val = float(estimate_hurst_variance_time(hurst_closes))
 
             # If asset is trending (H >= 0.45), mean-reversion is dangerous (skip)
             if hurst_val >= self.hurst_threshold:

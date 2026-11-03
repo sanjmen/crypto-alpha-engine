@@ -51,11 +51,13 @@ class SmartExecutionRouter:
         current_price: float,
         urgency: Optional[ExecutionUrgency] = None,
         bid_ask_spread_bps: float = 2.0,
+        strategy: Optional[str] = None,
     ) -> Order:
         """
         Routes order according to execution urgency.
         """
         urgency = urgency or self.default_urgency
+        extra_kwargs = {"strategy": strategy} if strategy is not None else {}
 
         if urgency == ExecutionUrgency.HIGH:
             # Aggressive market order
@@ -65,6 +67,7 @@ class SmartExecutionRouter:
                 order_type=OrderType.MARKET,
                 quantity=quantity,
                 price=current_price,
+                **extra_kwargs,
             )
         else:
             # Passive maker limit order placed at top-of-book touch
@@ -84,6 +87,7 @@ class SmartExecutionRouter:
                 order_type=OrderType.LIMIT,
                 quantity=quantity,
                 price=limit_price,
+                **extra_kwargs,
             )
 
     @staticmethod

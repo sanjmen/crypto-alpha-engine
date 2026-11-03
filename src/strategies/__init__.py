@@ -13,6 +13,17 @@ from src.strategies.perp_perp_arbitrage import (
     PerpPerpSpread,
     TransferEvent,
 )
+from src.strategies.extreme_anomaly import (
+    EarlyBreakoutStrategy,
+    OversoldBounceStrategy,
+    PumpFundingFadeStrategy,
+    create_illiquid_early_breakout,
+    create_illiquid_funding_fade,
+    create_illiquid_oversold_bounce,
+    create_liquid_early_breakout,
+    create_liquid_funding_fade,
+    create_liquid_oversold_bounce,
+)
 from src.strategies.stat_arb_mean_reversion import StatArbMeanReversionStrategy
 
 __all__ = [
@@ -21,9 +32,18 @@ __all__ = [
     "CrossExchangeCollateralManager",
     "CrossExchangePerpArbitrageEngine",
     "CrossSectionalMomentumStrategy",
+    "EarlyBreakoutStrategy",
     "FundingCarryArbitrageStrategy",
     "MetaStrategyAllocator",
+    "OversoldBounceStrategy",
     "PerpPerpSpread",
+    "PumpFundingFadeStrategy",
     "StatArbMeanReversionStrategy",
     "TransferEvent",
+    "create_illiquid_early_breakout",
+    "create_illiquid_funding_fade",
+    "create_illiquid_oversold_bounce",
+    "create_liquid_early_breakout",
+    "create_liquid_funding_fade",
+    "create_liquid_oversold_bounce",
 ]
