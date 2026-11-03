@@ -452,3 +452,35 @@ def test_nov3_anomaly_open_pos_tracking_and_48h_timestop(daemon: ShadowTradingDa
     assert pos.quantity == 0.0
     assert "DOSUSDT" in daemon.anomaly_last_exit
 
+
+def test_m13_issue_50_dynamic_confluence_anomaly_sizing(daemon: ShadowTradingDaemon):
+    """
+    Tests Issue #50 (Dynamic Confluence Position Sizing $10.00 - $25.00):
+    1) Marginal low-dispersion setups receive near-minimum sizing (~$10-$13).
+    2) High-confluence extreme capitulation / volume surge setups in high-dispersion regimes
+       scale up toward $22-$25.
+    """
+    from src.strategies.extreme_anomaly import compute_anomaly_confluence_size
+
+    # Marginal bounce: -18.1% drop, RSI 24.8, low volume ratio 1.25x, low market dispersion 1.8%
+    sz_low, conf_low = compute_anomaly_confluence_size(
+        "Extreme Drop Bounce",
+        {"ret_24h": -0.181, "rsi": 24.8, "vol_ratio": 1.25},
+        mkt_disp_24h=0.018,
+        min_notional=10.0,
+        max_notional=25.0,
+    )
+    # High-confluence bounce: -28% drop, RSI 12.0, volume surge 4.5x, high market dispersion 5.5%
+    sz_high, conf_high = compute_anomaly_confluence_size(
+        "Extreme Drop Bounce",
+        {"ret_24h": -0.28, "rsi": 12.0, "vol_ratio": 4.5},
+        mkt_disp_24h=0.055,
+        min_notional=10.0,
+        max_notional=25.0,
+    )
+    assert 10.0 <= sz_low <= 11.5
+    assert conf_low < 0.10
+    assert 24.0 <= sz_high <= 25.0
+    assert conf_high > 0.90
+
+

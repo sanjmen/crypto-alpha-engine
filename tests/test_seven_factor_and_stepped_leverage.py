@@ -547,4 +547,39 @@ def test_nov1_active_leg_concentration_cap_and_waterfill():
     assert max(short_vals) <= 0.32 * 0.625 + 1e-6
 
 
+def test_m13_issue_45_altcoin_sector_cluster_cap():
+    """
+    Tests Issue #45 (Dynamic Altcoin Sector Cluster Cap <= 48% with water-filling):
+    Verifies that when correlated tokens in the same altcoin sector (e.g., AI_COMPUTE: FET+RENDER
+    or FAST_L1: SOL+SUI+AVAX) combine for >48% of a leg, the sector cluster is capped at 48%
+    and excess weight is water-filled into unclipped sectors while preserving 100% dollar neutrality.
+    """
+    cols = [
+        "FET/USDT", "RENDER/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT",
+        "SOL/USDT", "SUI/USDT", "AVAX/USDT", "LINK/USDT", "ARB/USDT",
+    ]
+    # FET (29%) + RENDER (29%) = 58% of Long leg (> 48% AI_COMPUTE cluster cap)
+    # SOL (22%) + SUI (22%) + AVAX (22%) = 66% of Short leg (> 48% FAST_L1 cluster cap)
+    raw_row = [
+        0.145, 0.145, 0.08, 0.07, 0.06,
+        -0.11, -0.11, -0.11, -0.09, -0.08,
+    ]
+    w_df = pd.DataFrame([raw_row], columns=cols)
+
+    capped_df = cap_side_weights_waterfill(w_df, max_side_share=0.30, max_cluster_share=0.48)
+    r = capped_df.iloc[0]
+    pos = r.clip(lower=0.0)
+    neg = (-r).clip(lower=0.0)
+
+    assert pytest.approx(float(r.sum()), abs=1e-7) == 0.0
+    assert pytest.approx(float(pos.sum()), abs=1e-6) == 0.50
+    assert pytest.approx(float(neg.sum()), abs=1e-6) == 0.50
+
+    ai_share_long = float((pos["FET/USDT"] + pos["RENDER/USDT"]) / pos.sum())
+    fast_l1_share_short = float((neg["SOL/USDT"] + neg["SUI/USDT"] + neg["AVAX/USDT"]) / neg.sum())
+    assert ai_share_long <= 0.48 + 1e-6
+    assert fast_l1_share_short <= 0.48 + 1e-6
+
+
+
 

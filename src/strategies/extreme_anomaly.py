@@ -49,6 +49,47 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return pd.Series(rsi, index=series.index).bfill().fillna(50.0)
 
 
+def compute_anomaly_confluence_size(
+    strategy_type: str,
+    metadata: Dict[str, float],
+    mkt_disp_24h: float = 0.030,
+    min_notional: float = 10.0,
+    max_notional: float = 25.0,
+) -> tuple[float, float]:
+    """
+    Computes the multi-factor confluence score `c` in [0.0, 1.0] and maps it linearly
+    to a dynamic position size in `[min_notional, max_notional]` (Issue #50).
+    Returns `(recommended_notional, confluence_score)`.
+    """
+    ret_24h = float(metadata.get("ret_24h", 0.0))
+    ret_4h = float(metadata.get("ret_4h", 0.0))
+    rsi = float(metadata.get("rsi", 50.0))
+    vol_ratio = float(metadata.get("vol_ratio", 1.5))
+    funding_rate = float(metadata.get("funding_rate", 0.0))
+    s_disp = float(np.clip((mkt_disp_24h - 0.020) / 0.030, 0.0, 1.0))
+
+    stype = strategy_type.lower()
+    if "bounce" in stype or "drop" in stype or "oversold" in stype:
+        s_depth = float(np.clip((abs(ret_24h) - 0.18) / 0.08, 0.0, 1.0))
+        s_rsi = float(np.clip((25.0 - rsi) / 12.0, 0.0, 1.0))
+        s_vol = float(np.clip((vol_ratio - 1.2) / 3.0, 0.0, 1.0))
+        conf = float(np.clip(0.35 * s_depth + 0.30 * s_rsi + 0.20 * s_vol + 0.15 * s_disp, 0.0, 1.0))
+    elif "breakout" in stype:
+        s_imp = float(np.clip((ret_4h - 0.10) / 0.06, 0.0, 1.0))
+        s_vol = float(np.clip((vol_ratio - 3.5) / 4.5, 0.0, 1.0))
+        s_sweet = float(1.0 - np.clip(abs(ret_24h - 0.16) / 0.06, 0.0, 1.0))
+        conf = float(np.clip(0.35 * s_imp + 0.30 * s_vol + 0.20 * s_sweet + 0.15 * s_disp, 0.0, 1.0))
+    else:  # Pump & Funding Fade
+        s_pump = float(np.clip((ret_24h - 0.25) / 0.20, 0.0, 1.0))
+        s_fund = float(np.clip((funding_rate - 0.0005) / 0.0015, 0.0, 1.0))
+        s_rsi = float(np.clip((rsi - 72.0) / 15.0, 0.0, 1.0))
+        conf = float(np.clip(0.35 * s_pump + 0.35 * s_fund + 0.15 * s_rsi + 0.15 * s_disp, 0.0, 1.0))
+
+    span = max(0.0, float(max_notional) - float(min_notional))
+    notional = float(np.round(float(min_notional) + span * conf, 2))
+    return notional, round(conf, 4)
+
+
 class OversoldBounceStrategy(IStrategy):
     """
     Oversold Flush & Bounce Strategy (LONG).
@@ -83,8 +124,15 @@ class OversoldBounceStrategy(IStrategy):
 
             closes = df["close"]
             ret_24h = float((closes.iloc[-1] - closes.iloc[-25]) / (closes.iloc[-25] + 1e-8))
+            ret_4h = float((closes.iloc[-1] - closes.iloc[-5]) / (closes.iloc[-5] + 1e-8)) if len(closes) >= 5 else 0.0
             rsi_series = calculate_rsi(closes, period=14)
             rsi_curr = float(rsi_series.iloc[-1])
+            vol_ratio = 1.5
+            if "volume" in df.columns:
+                volumes = df["volume"]
+                vol_curr = float(volumes.iloc[-1])
+                vol_mean_24h = float(volumes.iloc[-25:-1].mean()) + 1e-6
+                vol_ratio = vol_curr / vol_mean_24h
 
             # Flush condition: severe 24h drop and oversold RSI
             if ret_24h <= self.dump_threshold_24h and rsi_curr <= self.rsi_threshold:
@@ -99,7 +147,9 @@ class OversoldBounceStrategy(IStrategy):
                         horizon_minutes=1440,  # 24h holding period
                         metadata={
                             "ret_24h": ret_24h,
+                            "ret_4h": ret_4h,
                             "rsi": rsi_curr,
+                            "vol_ratio": vol_ratio,
                             "entry_price": float(closes.iloc[-1]),
                             "stop_loss": float(closes.iloc[-1] * 0.95),
                             "take_profit": float(closes.iloc[-1] * 1.06),
@@ -184,6 +234,7 @@ class EarlyBreakoutStrategy(IStrategy):
                             confidence=0.75,
                             horizon_minutes=720,  # 12h horizon
                             metadata={
+                                "ret_24h": ret_24h,
                                 "ret_4h": ret_4h,
                                 "vol_ratio": vol_ratio,
                                 "entry_price": float(closes.iloc[-1]),

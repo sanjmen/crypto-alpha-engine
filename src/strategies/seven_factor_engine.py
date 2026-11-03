@@ -53,6 +53,14 @@ DEFAULT_PRIORS: Dict[str, float] = {
     "size": 0.15,
 }
 
+ALT_SECTOR_CLUSTERS: Dict[str, Tuple[str, ...]] = {
+    "AI_COMPUTE": ("FETUSDT", "RENDERUSDT"),
+    "FAST_L1": ("SOLUSDT", "SUIUSDT", "AVAXUSDT"),
+    "ALT_L1": ("NEARUSDT", "APTUSDT"),
+    "PAY_MEME": ("XRPUSDT", "DOGEUSDT", "ADAUSDT"),
+    "INFRA_L2": ("LINKUSDT", "ARBUSDT"),
+}
+
 
 @dataclass
 class SevenFactorAllocationResult:
@@ -107,49 +115,84 @@ def make_continuous_neutral_weights(
 
 def cap_side_weights_waterfill(
     w_df: pd.DataFrame,
-    max_side_share: float = 0.30,
+    max_side_share: Optional[float] = 0.30,
+    max_cluster_share: Optional[float] = None,
+    sector_clusters: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> pd.DataFrame:
     """
     Caps each asset's share of the Long leg (and Short leg) at `max_side_share` (e.g. 30%)
-    and iteratively redistributes clipped excess proportionally across remaining unclipped
+    and each correlated altcoin sector cluster at `max_cluster_share` (e.g. 48%),
+    iteratively redistributing clipped excess proportionally across remaining unclipped
     assets on the same leg (water-filling), preserving strict 100% dollar neutrality.
     """
-    if max_side_share is None or max_side_share >= 1.0:
+    has_side_cap = max_side_share is not None and 0.0 < max_side_share < 1.0
+    has_clust_cap = max_cluster_share is not None and 0.0 < max_cluster_share < 1.0
+    if not has_side_cap and not has_clust_cap:
         return w_df
+
+    clusters_map = sector_clusters if sector_clusters is not None else ALT_SECTOR_CLUSTERS
+    clean_cols = [str(c).split(":")[0].replace("/", "") for c in w_df.columns]
+    cluster_indices: List[List[int]] = []
+    if has_clust_cap and clusters_map:
+        for syms in clusters_map.values():
+            c_idx = [clean_cols.index(s) for s in syms if s in clean_cols]
+            if len(c_idx) >= 2:
+                cluster_indices.append(c_idx)
+
     arr = w_df.values.copy()
     n_rows, _ = arr.shape
+
+    def _waterfill_leg(vec: np.ndarray, total_leg: float) -> np.ndarray:
+        if total_leg <= 1e-10:
+            return vec
+        cap_single = total_leg * float(max_side_share) if has_side_cap else total_leg
+        cap_clust = total_leg * float(max_cluster_share) if has_clust_cap else total_leg
+        active_cnt = int((vec > 1e-10).sum())
+
+        for _ in range(5):
+            changed = False
+            if has_side_cap and active_cnt >= 4:
+                over = vec > cap_single + 1e-9
+                if np.any(over) and not np.all(over):
+                    excess = float((vec[over] - cap_single).sum())
+                    vec[over] = cap_single
+                    under = (~over) & (vec > 1e-10)
+                    if np.any(under):
+                        vec[under] += excess * (vec[under] / float(vec[under].sum()))
+                        changed = True
+
+            if has_clust_cap and cluster_indices:
+                in_capped_clust = np.zeros(len(vec), dtype=bool)
+                clust_excess = 0.0
+                for c_idx in cluster_indices:
+                    c_sum = float(vec[c_idx].sum())
+                    if c_sum > cap_clust + 1e-9:
+                        clust_excess += c_sum - cap_clust
+                        vec[c_idx] *= cap_clust / c_sum
+                        in_capped_clust[c_idx] = True
+                        changed = True
+                if clust_excess > 1e-9:
+                    under_c = (~in_capped_clust) & (vec > 1e-10) & (vec < cap_single - 1e-6)
+                    if np.any(under_c):
+                        vec[under_c] += clust_excess * (vec[under_c] / float(vec[under_c].sum()))
+
+            if not changed:
+                break
+
+        if has_side_cap and active_cnt >= 4:
+            vec = np.minimum(vec, cap_single)
+        return vec
+
     for i in range(n_rows):
         row = arr[i]
         pos = np.maximum(row, 0.0)
         neg = np.maximum(-row, 0.0)
         p_sum = float(pos.sum())
         n_sum = float(neg.sum())
-        if p_sum > 1e-10 and int((pos > 1e-10).sum()) >= 4:
-            cap_p = p_sum * max_side_share
-            for _ in range(3):
-                over = pos > cap_p + 1e-9
-                if not np.any(over) or np.all(over):
-                    pos = np.minimum(pos, cap_p)
-                    break
-                excess = float((pos[over] - cap_p).sum())
-                pos[over] = cap_p
-                under = ~over & (pos > 1e-10)
-                if not np.any(under):
-                    break
-                pos[under] += excess * (pos[under] / float(pos[under].sum()))
-        if n_sum > 1e-10 and int((neg > 1e-10).sum()) >= 4:
-            cap_n = n_sum * max_side_share
-            for _ in range(3):
-                over = neg > cap_n + 1e-9
-                if not np.any(over) or np.all(over):
-                    neg = np.minimum(neg, cap_n)
-                    break
-                excess = float((neg[over] - cap_n).sum())
-                neg[over] = cap_n
-                under = ~over & (neg > 1e-10)
-                if not np.any(under):
-                    break
-                neg[under] += excess * (neg[under] / float(neg[under].sum()))
+        if p_sum > 1e-10:
+            pos = _waterfill_leg(pos, p_sum)
+        if n_sum > 1e-10:
+            neg = _waterfill_leg(neg, n_sum)
         leg = min(float(pos.sum()), float(neg.sum()))
         if leg > 1e-10:
             pos = pos * (leg / float(pos.sum()))
@@ -177,6 +220,7 @@ class SevenFactorOnlineEngine:
         comb_ema_span: Optional[float] = 3.0,
         trend_waterfill_cap: Optional[float] = 0.30,
         trend_waterfill_threshold: float = 0.20,
+        alt_cluster_cap: Optional[float] = 0.48,
     ) -> None:
         self.lookbacks = lookbacks
         self.priors = pd.Series(priors or DEFAULT_PRIORS)
@@ -188,6 +232,7 @@ class SevenFactorOnlineEngine:
         self.comb_ema_span = comb_ema_span
         self.trend_waterfill_cap = trend_waterfill_cap
         self.trend_waterfill_threshold = trend_waterfill_threshold
+        self.alt_cluster_cap = alt_cluster_cap
 
     @staticmethod
     def _find_btc_column(columns: List[str]) -> Optional[str]:
@@ -557,20 +602,34 @@ class SevenFactorOnlineEngine:
             comb_w, ones_df, gross_leverage=1.0, power=self.comb_power
         ).mul(conviction, axis=0)
 
-        # Regime-Conditioned Water-Filling Concentration Cap (30% per side when Trend >= 20%)
-        # Redistributes excess tail concentration across secondary leaders during trending regimes
-        # without inflating low-conviction noise coins during pure mean-reversion chop.
-        if self.trend_waterfill_cap is not None and 0.0 < self.trend_waterfill_cap < 1.0:
-            w_wf_1x = cap_side_weights_waterfill(w_raw_1x, max_side_share=self.trend_waterfill_cap)
+        # Regime-Conditioned Water-Filling Concentration Cap (30% per asset when Trend >= 20%)
+        # & Altcoin Sector Cluster Cap (48% per sector across all regimes — Issue #45).
+        has_wf = self.trend_waterfill_cap is not None and 0.0 < self.trend_waterfill_cap < 1.0
+        has_cl = self.alt_cluster_cap is not None and 0.0 < self.alt_cluster_cap < 1.0
+        if has_wf or has_cl:
+            w_wf_1x = cap_side_weights_waterfill(
+                w_raw_1x,
+                max_side_share=self.trend_waterfill_cap if has_wf else None,
+                max_cluster_share=self.alt_cluster_cap if has_cl else None,
+            )
             if (
-                self.trend_waterfill_threshold is not None
+                has_wf
+                and self.trend_waterfill_threshold is not None
                 and self.trend_waterfill_threshold > 0.0
                 and all(k in fw_norm.columns for k in ("macro", "med", "fast"))
             ):
+                if has_cl:
+                    w_chop_1x = cap_side_weights_waterfill(
+                        w_raw_1x,
+                        max_side_share=None,
+                        max_cluster_share=self.alt_cluster_cap,
+                    )
+                else:
+                    w_chop_1x = w_raw_1x
                 trend_share = fw_norm["macro"] + fw_norm["med"] + fw_norm["fast"]
                 is_trend = (trend_share >= self.trend_waterfill_threshold).values[:, None]
                 w_base_1x = pd.DataFrame(
-                    np.where(is_trend, w_wf_1x.values, w_raw_1x.values),
+                    np.where(is_trend, w_wf_1x.values, w_chop_1x.values),
                     index=idx,
                     columns=cols,
                 )

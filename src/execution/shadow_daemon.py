@@ -28,6 +28,7 @@ from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.ws_manager import PriceTick, ResilientWebSocketClient
 from src.features.volatility import parkinson_volatility
+from src.strategies.extreme_anomaly import compute_anomaly_confluence_size
 from src.strategies.meta_allocator import MetaStrategyAllocator
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,9 @@ class ShadowTradingDaemon:
         anomaly_cooldown_loss_sec: float = 24.0 * 3600.0,
         anomaly_max_hold_hours: float = 48.0,
         anomaly_breakout_min_24h_pct: float = 12.0,
+        anomaly_min_notional: float = 10.0,
+        anomaly_max_notional: float = 25.0,
+        enable_dynamic_anomaly_sizing: bool = True,
         intracycle_drift_threshold_pct: float = 0.25,
         intracycle_min_rebalance_age_sec: float = 1800.0,
         intracycle_post_stop_settle_sec: float = 900.0,
@@ -138,6 +142,9 @@ class ShadowTradingDaemon:
         self.anomaly_cooldown_loss_sec = anomaly_cooldown_loss_sec
         self.anomaly_max_hold_hours = anomaly_max_hold_hours
         self.anomaly_breakout_min_24h_pct = anomaly_breakout_min_24h_pct
+        self.anomaly_min_notional = anomaly_min_notional
+        self.anomaly_max_notional = anomaly_max_notional
+        self.enable_dynamic_anomaly_sizing = enable_dynamic_anomaly_sizing
         self.anomaly_last_exit: dict[str, tuple[datetime, bool]] = {}
         self.intracycle_drift_threshold_pct = intracycle_drift_threshold_pct
         self.intracycle_min_rebalance_age_sec = intracycle_min_rebalance_age_sec
@@ -1133,13 +1140,37 @@ class ShadowTradingDaemon:
             self.last_anomaly_scan_time = datetime.now(timezone.utc)
             return []
 
-        if portfolio.cash < self.anomaly_size:
+        min_req_cash = self.anomaly_min_notional if self.enable_dynamic_anomaly_sizing else self.anomaly_size
+        if portfolio.cash < min_req_cash:
             self.last_anomaly_scan_time = datetime.now(timezone.utc)
             return []
 
         executed_orders: list[Order] = []
         now = datetime.now(timezone.utc)
         self._refresh_anomaly_cooldowns()
+
+        # Compute live 24h cross-sectional dispersion across tracked core symbols for Dynamic Confluence Sizing (Issue #50)
+        core_changes_dec = [
+            float(self.latest_tickers[s].get("change_24h", 0.0)) / 100.0
+            for s in self.symbols
+            if s in self.latest_tickers and "change_24h" in self.latest_tickers[s]
+        ]
+        if len(core_changes_dec) >= 4:
+            mkt_disp_24h = float(pd.Series(core_changes_dec).std())
+        else:
+            mkt_disp_24h = 0.030
+
+        def _resolve_notional(strat_label: str, sig_meta: dict[str, Any]) -> tuple[float, float]:
+            if not self.enable_dynamic_anomaly_sizing:
+                return min(float(self.anomaly_size), float(portfolio.cash)), 0.50
+            rec_not, conf_sc = compute_anomaly_confluence_size(
+                strategy_type=strat_label,
+                metadata=sig_meta or {},
+                mkt_disp_24h=mkt_disp_24h,
+                min_notional=self.anomaly_min_notional,
+                max_notional=self.anomaly_max_notional,
+            )
+            return min(rec_not, float(portfolio.cash)), conf_sc
 
         # Scan latest tickers for anomaly candidates
         candidates = []
@@ -1183,7 +1214,8 @@ class ShadowTradingDaemon:
             if pct <= -15.0 and self.allocator.oversold_bounce_strategy:
                 sigs = self.allocator.oversold_bounce_strategy.generate_signals({sym: df})
                 if sigs:
-                    qty = round(self.anomaly_size / price, 6 if price < 1.0 else 4)
+                    notional_usd, conf_sc = _resolve_notional("Extreme Drop Bounce", sigs[0].metadata or {})
+                    qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
                             order = self.broker.create_order(
@@ -1198,7 +1230,10 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 0.95, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
-                            logger.info(f"Anomaly Executed: Oversold Bounce LONG on {sym} @ ${fill_p:,.4f} (TP: ${tp}, SL: ${sl})")
+                            logger.info(
+                                f"Anomaly Executed: Oversold Bounce LONG on {sym} @ ${fill_p:,.4f} "
+                                f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"
+                            )
                             continue
                         except Exception as e:
                             logger.warning(f"Error executing Oversold Bounce for {sym}: {e}")
@@ -1207,7 +1242,8 @@ class ShadowTradingDaemon:
             if self.anomaly_breakout_min_24h_pct <= pct <= 22.0 and self.allocator.early_breakout_strategy:
                 sigs = self.allocator.early_breakout_strategy.generate_signals({sym: df})
                 if sigs:
-                    qty = round(self.anomaly_size / price, 6 if price < 1.0 else 4)
+                    notional_usd, conf_sc = _resolve_notional("Early Breakout", sigs[0].metadata or {})
+                    qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
                             order = self.broker.create_order(
@@ -1222,7 +1258,10 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 0.96, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
-                            logger.info(f"Anomaly Executed: Early Breakout LONG on {sym} @ ${fill_p:,.4f} (TP: ${tp}, SL: ${sl})")
+                            logger.info(
+                                f"Anomaly Executed: Early Breakout LONG on {sym} @ ${fill_p:,.4f} "
+                                f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"
+                            )
                             continue
                         except Exception as e:
                             logger.warning(f"Error executing Early Breakout for {sym}: {e}")
@@ -1238,7 +1277,8 @@ class ShadowTradingDaemon:
                 df_f = pd.DataFrame([{"funding_rate": f_rate}])
                 sigs = self.allocator.funding_fade_strategy.generate_signals({sym: df}, funding_data={sym: df_f})
                 if sigs:
-                    qty = round(self.anomaly_size / price, 6 if price < 1.0 else 4)
+                    notional_usd, conf_sc = _resolve_notional("Pump & Funding Fade", sigs[0].metadata or {})
+                    qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
                             order = self.broker.create_order(
@@ -1253,7 +1293,10 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 1.05, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
-                            logger.info(f"Anomaly Executed: Pump & Funding Fade SHORT on {sym} @ ${fill_p:,.4f} (TP: ${tp}, SL: ${sl})")
+                            logger.info(
+                                f"Anomaly Executed: Pump & Funding Fade SHORT on {sym} @ ${fill_p:,.4f} "
+                                f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"
+                            )
                             continue
                         except Exception as e:
                             logger.warning(f"Error executing Pump & Funding Fade for {sym}: {e}")
