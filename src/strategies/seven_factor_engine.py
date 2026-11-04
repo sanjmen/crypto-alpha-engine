@@ -398,6 +398,119 @@ class SevenFactorOnlineEngine:
             oi_df[sym] = s.reindex(close.index).ffill()
         return oi_df
 
+    @staticmethod
+    def _extract_taker_flow(
+        taker_flow: Optional[Dict[str, pd.DataFrame]],
+        bars_1h: Dict[str, pd.DataFrame],
+        close: pd.DataFrame,
+    ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+        """
+        Aligns hourly `quote_volume` and `taker_buy_quote_volume` onto `close.index`
+        for Issue #48 True Taker Buy/Sell CVD & Institutional Limit Absorption.
+        """
+        qvol_dict: Dict[str, pd.Series] = {}
+        tbuy_dict: Dict[str, pd.Series] = {}
+        source_map = taker_flow if taker_flow else bars_1h
+        if not source_map:
+            return None
+
+        for sym in close.columns:
+            df = source_map.get(sym)
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if "quote_volume" not in df.columns or "taker_buy_quote_volume" not in df.columns:
+                continue
+            d_t = df.copy()
+            if "timestamp" in d_t.columns:
+                ts = d_t["timestamp"]
+                if pd.api.types.is_numeric_dtype(ts):
+                    unit = "ms" if float(ts.dropna().max()) > 1e11 else "s"
+                    d_t = d_t.set_index(pd.to_datetime(ts, unit=unit, utc=True))
+                else:
+                    d_t = d_t.set_index(pd.to_datetime(ts, utc=True))
+            elif not isinstance(d_t.index, pd.DatetimeIndex):
+                d_t.index = pd.to_datetime(d_t.index, utc=True)
+            elif d_t.index.tz is None:
+                d_t.index = d_t.index.tz_localize("UTC")
+            d_t.index = d_t.index.round("1h")
+            d_t = d_t[~d_t.index.duplicated(keep="last")].sort_index()
+            qvol_dict[sym] = d_t["quote_volume"].astype(float)
+            tbuy_dict[sym] = d_t["taker_buy_quote_volume"].astype(float)
+
+        if not qvol_dict:
+            return None
+
+        qvol_df = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+        tbuy_df = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+        for sym in qvol_dict:
+            s_q = qvol_dict[sym].reindex(close.index)
+            s_b = tbuy_dict[sym].reindex(close.index)
+            if s_q.notna().sum() == 0:
+                s_q = qvol_dict[sym].copy()
+                s_b = tbuy_dict[sym].copy()
+                s_q.index = s_q.index + pd.Timedelta(hours=1)
+                s_b.index = s_b.index + pd.Timedelta(hours=1)
+                s_q = s_q.reindex(close.index)
+                s_b = s_b.reindex(close.index)
+            qvol_df[sym] = s_q.ffill()
+            tbuy_df[sym] = s_b.ffill()
+        return qvol_df, tbuy_df
+
+    @staticmethod
+    def _extract_premium_index(
+        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        close: pd.DataFrame,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Aligns hourly Spot-Perp Premium Index (`close` or `premium_index`) onto `close.index`
+        for Issue #49 Spot-Perp Basis Spread & Premium Index Alpha.
+        """
+        if not premium_index:
+            return None
+        prem_dict: Dict[str, pd.Series] = {}
+        for sym in close.columns:
+            p_val = premium_index.get(sym)
+            if p_val is None:
+                continue
+            if isinstance(p_val, pd.Series):
+                s = p_val.copy()
+                if not isinstance(s.index, pd.DatetimeIndex):
+                    s.index = pd.to_datetime(s.index, utc=True)
+                elif s.index.tz is None:
+                    s.index = s.index.tz_localize("UTC")
+                s = s[~s.index.duplicated(keep="last")].sort_index()
+                prem_dict[sym] = s.astype(float)
+            elif isinstance(p_val, pd.DataFrame) and not p_val.empty:
+                d_p = p_val.copy()
+                if "timestamp" in d_p.columns:
+                    ts = d_p["timestamp"]
+                    if pd.api.types.is_numeric_dtype(ts):
+                        unit = "ms" if float(ts.dropna().max()) > 1e11 else "s"
+                        d_p = d_p.set_index(pd.to_datetime(ts, unit=unit, utc=True))
+                    else:
+                        d_p = d_p.set_index(pd.to_datetime(ts, utc=True))
+                elif not isinstance(d_p.index, pd.DatetimeIndex):
+                    d_p.index = pd.to_datetime(d_p.index, utc=True)
+                elif d_p.index.tz is None:
+                    d_p.index = d_p.index.tz_localize("UTC")
+                d_p.index = d_p.index.round("1h")
+                d_p = d_p[~d_p.index.duplicated(keep="last")].sort_index()
+                col = "close" if "close" in d_p.columns else (
+                    "premium_index" if "premium_index" in d_p.columns else d_p.columns[0]
+                )
+                prem_dict[sym] = d_p[col].astype(float)
+        if not prem_dict:
+            return None
+        prem_df = pd.DataFrame(0.0, index=close.index, columns=close.columns, dtype=float)
+        for sym, s in prem_dict.items():
+            s_re = s.reindex(close.index)
+            if s_re.notna().sum() == 0:
+                s_shift = s.copy()
+                s_shift.index = s_shift.index + pd.Timedelta(hours=1)
+                s_re = s_shift.reindex(close.index)
+            prem_df[sym] = s_re.ffill().fillna(0.0)
+        return prem_df
+
     def _compute_subhourly_pullback_adjustment(
         self,
         bars_15m: Optional[Dict[str, pd.DataFrame]],
@@ -435,6 +548,8 @@ class SevenFactorOnlineEngine:
         funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
         bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
         open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
+        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> Dict[str, Union[pd.DataFrame, pd.Series]]:
         """
         Computes full historical matrices for the 7 factors, online factor weights,
@@ -445,6 +560,8 @@ class SevenFactorOnlineEngine:
         )
         high, low = self._extract_high_low(bars_1h, close)
         oi_contracts = self._extract_open_interest(open_interest, close)
+        taker_pair = self._extract_taker_flow(taker_flow, bars_1h, close)
+        prem_close = self._extract_premium_index(premium_index, close)
         idx = close.index
         cols = list(close.columns)
 
@@ -678,6 +795,86 @@ class SevenFactorOnlineEngine:
                 .where(~((comb_w > 0.0) & oi_flush_bounce), 1.15 * comb_w)
             )
 
+        # Issues #48 & #49 (M13 Ola 3): True Taker Buy/Sell CVD Iceberg Absorption & Spot-Perp Basis Alpha
+        ask_distrib = pd.DataFrame(False, index=idx, columns=cols)
+        bid_absorb = pd.DataFrame(False, index=idx, columns=cols)
+        taker_cvd_24 = pd.DataFrame(0.0, index=idx, columns=cols)
+        has_cvd = taker_pair is not None
+        if has_cvd:
+            qvol_df, tbuy_df = taker_pair
+            net_taker_usd = (2.0 * tbuy_df - qvol_df).fillna(0.0)
+            tot_qvol_usd = qvol_df.fillna(dollar_vol)
+            taker_cvd_24 = (
+                net_taker_usd.rolling(24, min_periods=4).sum()
+                / (tot_qvol_usd.rolling(24, min_periods=4).sum() + 1e-8)
+            ).clip(-1.0, 1.0).fillna(0.0)
+            limit_abs_24 = (cmf_24 - taker_cvd_24).fillna(0.0)
+            ask_distrib = (
+                (limit_abs_24 <= -0.10)
+                & (taker_cvd_24 >= 0.015)
+                & (zi[12] <= -0.20)
+            )
+            bid_absorb = (
+                (limit_abs_24 >= 0.12)
+                & (taker_cvd_24 <= -0.020)
+                & (zi[12] >= 0.30)
+            )
+
+        perp_froth = pd.DataFrame(False, index=idx, columns=cols)
+        spot_led_short_guard = pd.DataFrame(False, index=idx, columns=cols)
+        spot_led_long_confirm = pd.DataFrame(False, index=idx, columns=cols)
+        has_basis = prem_close is not None
+        if has_basis:
+            prem_12h = prem_close.rolling(12, min_periods=3).mean().fillna(0.0)
+            prem_24h = prem_close.rolling(24, min_periods=4).mean().fillna(0.0)
+            prem_168h = prem_close.rolling(168, min_periods=24).mean().fillna(0.0)
+            prem_std_168 = (
+                prem_close.rolling(168, min_periods=24).std().replace(0, 1e-4).fillna(1e-4)
+            )
+            prem_z12 = ((prem_12h - prem_168h) / prem_std_168).clip(-3.5, 3.5).fillna(0.0)
+            prem_z24 = ((prem_24h - prem_168h) / prem_std_168).clip(-3.5, 3.5).fillna(0.0)
+            perp_froth = (
+                (prem_z12 >= 0.60)
+                & (prem_12h >= 0.0001)
+                & (zr[4] <= -0.50)
+                & (cmf_24 < 0.0)
+            )
+            spot_led_short_guard = (
+                (zi[24] >= 0.65)
+                & (prem_24h <= -0.0003)
+                & (prem_z24 <= -0.30)
+                & (cmf_24 > 0.0)
+            )
+            spot_led_long_confirm = (
+                (zi[24] >= 0.40)
+                & (prem_24h <= -0.0003)
+                & (prem_z24 <= -0.30)
+                & (cmf_24 > 0.0)
+            )
+
+        if has_cvd and not has_basis:
+            comb_w = (
+                comb_w
+                .where(~((comb_w > 0.0) & ask_distrib), 0.55 * comb_w)
+                .where(~((comb_w < 0.0) & bid_absorb), 0.60 * comb_w)
+            )
+        elif has_basis and not has_cvd:
+            comb_w = (
+                comb_w
+                .where(~((comb_w > 0.0) & perp_froth), 0.55 * comb_w)
+                .where(~((comb_w < 0.0) & spot_led_short_guard), 0.55 * comb_w)
+            )
+        elif has_cvd and has_basis:
+            comb_w = (
+                comb_w
+                .where(~((comb_w > 0.0) & (ask_distrib | perp_froth)), 0.55 * comb_w)
+                .where(~((comb_w < 0.0) & (bid_absorb | spot_led_short_guard)), 0.60 * comb_w)
+                .where(
+                    ~((comb_w > 0.0) & spot_led_long_confirm & (taker_cvd_24 > 0.0)),
+                    1.06 * comb_w,
+                )
+            )
+
         # Retoque 1C (Nov 1): Causal Cross-Sectional Composite Score Smoothing (EMA span=3h)
         # Prevents single-bar 24h return oscillations from flipping individual coins Long <-> Short
         # across consecutive 4h rebalances while preserving factor conviction.
@@ -763,6 +960,8 @@ class SevenFactorOnlineEngine:
         funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
         bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
         open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
+        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> SevenFactorAllocationResult:
         """
         Evaluates the 7-Factor Causal Online Engine on the latest bar and returns
@@ -773,6 +972,8 @@ class SevenFactorOnlineEngine:
             funding_rates=funding_rates,
             bars_15m=bars_15m,
             open_interest=open_interest,
+            taker_flow=taker_flow,
+            premium_index=premium_index,
         )
 
         w_latest = mats["w_base_1x"].iloc[-1].copy()

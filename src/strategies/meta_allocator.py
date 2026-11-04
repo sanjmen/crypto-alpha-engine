@@ -193,6 +193,8 @@ class MetaStrategyAllocator:
         bars_15m: dict[str, pd.DataFrame] | None = None,
         current_weights: dict[str, float] | None = None,
         open_interest_data: dict[str, pd.DataFrame | pd.Series] | None = None,
+        taker_flow_data: dict[str, pd.DataFrame] | None = None,
+        premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Runs the 7-Factor Causal Online Alpha Engine + Stepped Leverage Controller (2.5x -> 5.0x)
@@ -209,6 +211,8 @@ class MetaStrategyAllocator:
             funding_rates=funding_data,
             bars_15m=bars_15m,
             open_interest=open_interest_data,
+            taker_flow=taker_flow_data,
+            premium_index=premium_index_data,
         )
         self.last_seven_factor_result = sf_res
 
@@ -257,6 +261,8 @@ class MetaStrategyAllocator:
         bars_15m: dict[str, pd.DataFrame] | None = None,
         current_weights: dict[str, float] | None = None,
         open_interest_data: dict[str, pd.DataFrame | pd.Series] | None = None,
+        taker_flow_data: dict[str, pd.DataFrame] | None = None,
+        premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Executes end-to-end multi-strategy signal generation, regime/HRP adaptation,
@@ -271,6 +277,8 @@ class MetaStrategyAllocator:
                 bars_15m=bars_15m,
                 current_weights=current_weights,
                 open_interest_data=open_interest_data,
+                taker_flow_data=taker_flow_data,
+                premium_index_data=premium_index_data,
             )
 
         # 1. Detect market regime

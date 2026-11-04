@@ -609,6 +609,50 @@ def test_m13_issue_46_open_interest_squeeze_and_knife_guard():
     assert sum(abs(v) for v in res.unit_weights.values()) > 0.0
 
 
+def test_m13_wave3_issue_48_and_49_true_taker_cvd_and_basis_alpha():
+    """
+    Tests Milestone M13 Wave 3:
+    1) Issue #48: Factor F8 True Taker Buy/Sell CVD & Institutional Limit Absorption (`taker_flow`).
+    2) Issue #49: Factor F9 Spot-Perp Basis Spread & Premium Index Alpha (`premium_index`).
+    3) Combined Wave 3 (`taker_flow` + `premium_index` + `open_interest`) preserving strict 100% dollar neutrality.
+    """
+    bars_1h, bars_15m = _build_synthetic_universe(n_bars=200, seed=48)
+    taker_flow = {}
+    premium_index = {}
+    for i, (sym, df) in enumerate(bars_1h.items()):
+        qvol = (df["close"] * df["volume"]).values
+        # Alternate net taker buying (55%) vs net taker selling (44%) across symbols
+        tbuy_ratio = 0.55 if (i % 2 == 0) else 0.44
+        taker_flow[sym] = pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "quote_volume": qvol,
+            "taker_buy_quote_volume": qvol * tbuy_ratio,
+        })
+        # Alternate negative Spot-Perp discount (-5 bps) vs positive Perp froth (+6 bps)
+        prem_vals = np.full(len(df), -0.0002 if (i % 2 == 0) else 0.0001)
+        prem_vals[-24:] = -0.0005 if (i % 2 == 0) else 0.0006
+        premium_index[sym] = pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "close": prem_vals,
+        })
+
+    engine = SevenFactorOnlineEngine()
+    res_cvd = engine.allocate_latest(bars_1h=bars_1h, bars_15m=bars_15m, taker_flow=taker_flow)
+    res_bas = engine.allocate_latest(bars_1h=bars_1h, bars_15m=bars_15m, premium_index=premium_index)
+    res_combo = engine.allocate_latest(
+        bars_1h=bars_1h,
+        bars_15m=bars_15m,
+        taker_flow=taker_flow,
+        premium_index=premium_index,
+    )
+
+    assert pytest.approx(sum(res_cvd.unit_weights.values()), abs=1e-6) == 0.0
+    assert pytest.approx(sum(res_bas.unit_weights.values()), abs=1e-6) == 0.0
+    assert pytest.approx(sum(res_combo.unit_weights.values()), abs=1e-6) == 0.0
+    assert sum(abs(v) for v in res_combo.unit_weights.values()) > 0.0
+
+
+
 
 
 

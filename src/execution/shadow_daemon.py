@@ -577,6 +577,117 @@ class ShadowTradingDaemon:
         )
         return merged
 
+    def fetch_taker_flow_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+        """
+        Fetches trailing hourly Taker Buy/Sell Volume (`quote_volume`, `taker_buy_quote_volume`)
+        for `symbol` (Issue #48), combining local cache (`data/cache/taker_flow/1h/{CLEAN_SYM}.parquet`)
+        with live Binance Futures `/fapi/v1/klines`.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        tk_path = self.cache_dir / "taker_flow" / "1h" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+
+        if self.enable_warm_start and tk_path.exists():
+            try:
+                raw_tk = pd.read_parquet(tk_path).tail(max(limit, 240))
+                req_cols = {"timestamp", "quote_volume", "taker_buy_quote_volume"}
+                if not raw_tk.empty and req_cols.issubset(raw_tk.columns):
+                    cached_df = raw_tk[list(req_cols)].copy()
+                    cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
+                    cached_df["quote_volume"] = cached_df["quote_volume"].astype(float)
+                    cached_df["taker_buy_quote_volume"] = cached_df["taker_buy_quote_volume"].astype(float)
+            except Exception:
+                pass
+
+        live_records: list[dict[str, Any]] = []
+        try:
+            fn = getattr(self.exchange, "fapiPublicGetKlines", None)
+            if callable(fn) and not isinstance(fn, MagicMock):
+                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": min(limit, 36)})
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) >= 11:
+                            ts_ms = int(r[0])
+                            if ts_ms > 0:
+                                live_records.append({
+                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                    "quote_volume": float(r[7]),
+                                    "taker_buy_quote_volume": float(r[10]),
+                                })
+        except Exception:
+            pass
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged.tail(limit).reset_index(drop=True)
+
+    def fetch_premium_index_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+        """
+        Fetches trailing hourly Spot-Perp Premium Index (`close`) for `symbol`
+        (Issue #49), combining local cache (`data/cache/premium_index/1h/{CLEAN_SYM}.parquet`)
+        with live Binance Futures `/fapi/v1/premiumIndexKlines`.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        pr_path = self.cache_dir / "premium_index" / "1h" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+
+        if self.enable_warm_start and pr_path.exists():
+            try:
+                raw_pr = pd.read_parquet(pr_path).tail(max(limit, 240))
+                if not raw_pr.empty and "timestamp" in raw_pr.columns and "close" in raw_pr.columns:
+                    cached_df = raw_pr[["timestamp", "close"]].copy()
+                    cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
+                    cached_df["close"] = cached_df["close"].astype(float)
+            except Exception:
+                pass
+
+        live_records: list[dict[str, Any]] = []
+        try:
+            fn = getattr(self.exchange, "fapiPublicGetPremiumIndexKlines", None)
+            if callable(fn) and not isinstance(fn, MagicMock):
+                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": min(limit, 36)})
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) >= 5:
+                            ts_ms = int(r[0])
+                            if ts_ms > 0:
+                                live_records.append({
+                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                    "close": float(r[4]),
+                                })
+        except Exception:
+            pass
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged.tail(limit).reset_index(drop=True)
+
     def fetch_symbol_obi(self, symbol: str, levels: int = 5) -> float | None:
         """
         Fetches Top-N Level-2 Order Book depth from Binance Futures and returns
@@ -918,9 +1029,11 @@ class ShadowTradingDaemon:
             )
             return []
 
-        # Fetch live funding rates (or 72h history for 7-Factor Engine) & Open Interest (Issue #46)
+        # Fetch live funding rates (or 72h history for 7-Factor Engine), Open Interest (#46), Taker Flow (#48) & Premium Index (#49)
         funding_data: dict[str, pd.DataFrame] = {}
         open_interest_data: dict[str, pd.DataFrame] = {}
+        taker_flow_data: dict[str, pd.DataFrame] = {}
+        premium_index_data: dict[str, pd.DataFrame] = {}
         for sym in self.symbols:
             clean_sym = sym.replace("/", "")
             if clean_sym not in market_data:
@@ -932,6 +1045,12 @@ class ShadowTradingDaemon:
                 df_oi = self.fetch_open_interest_history_24h(sym)
                 if not df_oi.empty:
                     open_interest_data[clean_sym] = df_oi
+                df_tk = self.fetch_taker_flow_history(sym)
+                if not df_tk.empty:
+                    taker_flow_data[clean_sym] = df_tk
+                df_pr = self.fetch_premium_index_history(sym)
+                if not df_pr.empty:
+                    premium_index_data[clean_sym] = df_pr
             else:
                 try:
                     fr = self.exchange.fetch_funding_rate(sym)
@@ -964,6 +1083,8 @@ class ShadowTradingDaemon:
                 bars_15m=bars_15m if bars_15m else None,
                 current_weights=current_weights_map if current_weights_map else None,
                 open_interest_data=open_interest_data if open_interest_data else None,
+                taker_flow_data=taker_flow_data if taker_flow_data else None,
+                premium_index_data=premium_index_data if premium_index_data else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
