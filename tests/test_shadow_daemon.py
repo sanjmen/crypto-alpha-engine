@@ -283,20 +283,20 @@ def test_retoque_2_anomaly_asymmetric_cooldown_and_profit_lock(daemon: ShadowTra
     )
     pos = daemon.broker.portfolio.positions["HAEDAL/USDT"]
 
-    # At +3.0% peak ($1.03), anomaly waits for +4.0%
-    r1 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.03}})
+    # At +4.0% peak ($1.04), anomaly waits for +4.5% trigger so it doesn't choke early
+    r1 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.04}})
     assert len(r1) == 0
     assert pos.stop_loss == 0.96
 
-    # At +4.2% peak ($1.042), anomaly locks +3.2% ($1.03)
-    r2 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.042}})
+    # At +4.6% peak ($1.046), anomaly locks +2.5% above entry with 2.0%+ breathing room
+    r2 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.046}})
     assert len(r2) == 1
-    assert pos.stop_loss == 1.03
+    assert pos.stop_loss == round(pos.entry_price * 1.025, 2)
 
-    # At +6.0% peak ($1.06), anomaly trails 1.5% behind peak ($1.06 * 0.985 = $1.04)
-    r3 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.06}})
+    # At +6.5% peak ($1.065), anomaly trails 2.0% behind peak ($1.065 * 0.980 = $1.04)
+    r3 = daemon.manage_trailing_and_profit_locks({"HAEDAL/USDT": {"price": 1.065}})
     assert len(r3) == 1
-    assert pos.stop_loss == round(1.06 * 0.985, 2)
+    assert pos.stop_loss == round(1.065 * 0.980, 2)
 
     # Close position and simulate Stop-Loss exit 15h ago (< 24h loss cooldown -> blocked)
     from src.strategies.extreme_anomaly import OversoldBounceStrategy
@@ -482,5 +482,97 @@ def test_m13_issue_50_dynamic_confluence_anomaly_sizing(daemon: ShadowTradingDae
     assert conf_low < 0.10
     assert 24.0 <= sz_high <= 25.0
     assert conf_high > 0.90
+
+
+def test_nov5_core_bracket_cooldown_and_neutrality_recentering(daemon: ShadowTradingDaemon):
+    """
+    Tests Nov 5 Core Bracket Cooldown & Neutrality Re-Centering:
+    1) When a Core position (e.g. RENDER/USDT SHORT or ETH/USDT LONG) hits its Trailing-Stop
+       or Take-Profit mid-cycle, `_refresh_anomaly_cooldowns` records `core_bracket_last_exit`
+       with the exited PositionSide (and also hydrates it from SQLite trades on restart).
+    2) During the 4h cooldown window (`core_bracket_cooldown_sec = 14400`), `_apply_core_bracket_cooldowns`
+       blocks same-direction re-entry on that symbol ($0.00) and scales down the opposite leg
+       so strict Dollar Neutrality (`sum(Longs) == sum(Shorts)`) is preserved.
+    3) Opposite-direction signals on that symbol are NOT blocked, and once >= 4h have elapsed,
+       normal same-direction allocation is permitted again.
+    """
+    from datetime import datetime, timedelta, timezone
+    from src.domain.entities import Order
+    from src.domain.enums import OrderStatus, OrderType
+
+    now = datetime.now(timezone.utc)
+
+    # 1. Simulate a filled Core Trailing-Stop BUY order closing a RENDER/USDT SHORT position
+    filled_sl_order = Order(
+        id="shd_sl_1bc0e515d2",
+        symbol="RENDER/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.STOP_LOSS,
+        quantity=261.26,
+        price=1.47,
+        status=OrderStatus.FILLED,
+        strategy="F5_Carry_Neg (72h Fund)",
+    )
+    daemon.broker.db.get_trades = MagicMock(return_value=[])
+    daemon._refresh_anomaly_cooldowns([filled_sl_order])
+
+    assert "RENDERUSDT" in daemon.core_bracket_last_exit
+    exit_ts, exited_side = daemon.core_bracket_last_exit["RENDERUSDT"]
+    assert exited_side == PositionSide.SHORT
+
+    # 2. Simulate intra-cycle rebalance 20 minutes later where allocator still wants RENDERUSDT = -$410.0
+    raw_targets = {
+        "BNBUSDT": 460.8,
+        "ETHUSDT": 460.8,
+        "BTCUSDT": 281.6,
+        "FETUSDT": 228.0,
+        "RENDERUSDT": -410.0,
+        "NEARUSDT": -326.6,
+        "APTUSDT": -290.4,
+        "ARBUSDT": -404.2,
+    }
+    # Raw targets are dollar-neutral: Longs = $1,431.2, Shorts = -$1,431.2
+    adjusted = daemon._apply_core_bracket_cooldowns(raw_targets, now=exit_ts + timedelta(minutes=20))
+
+    # RENDERUSDT same-direction SHORT re-entry is blocked ($0.0)
+    assert adjusted["RENDERUSDT"] == 0.0
+    # Remaining Shorts = -(326.6 + 290.4 + 404.2) = -$1,021.2
+    # Longs are scaled down proportionally so Longs == Shorts == $1,021.2 (Net = $0.00!)
+    long_sum = sum(v for v in adjusted.values() if v > 0)
+    short_sum = sum(abs(v) for v in adjusted.values() if v < 0)
+    assert abs(long_sum - 1021.2) < 1e-6
+    assert abs(short_sum - 1021.2) < 1e-6
+    assert abs(sum(adjusted.values())) < 1e-6
+
+    # 3. If allocator flips RENDERUSDT to LONG (+$200) while SHORT is on cooldown, it is NOT blocked
+    flipped_targets = {
+        "BNBUSDT": 300.0,
+        "RENDERUSDT": 200.0,
+        "NEARUSDT": -250.0,
+        "APTUSDT": -250.0,
+    }
+    adj_flipped = daemon._apply_core_bracket_cooldowns(flipped_targets, now=exit_ts + timedelta(minutes=20))
+    assert adj_flipped["RENDERUSDT"] == 200.0
+
+    # 4. After 4 hours + 1 minute (> 14,400s), same-direction SHORT on RENDERUSDT is allowed again
+    adj_expired = daemon._apply_core_bracket_cooldowns(raw_targets, now=exit_ts + timedelta(hours=4, minutes=1))
+    assert adj_expired["RENDERUSDT"] == -410.0
+
+    # 5. Verify SQLite hydration of `core_bracket_last_exit` across daemon restarts
+    daemon.core_bracket_last_exit.clear()
+    daemon.broker.db.get_trades = MagicMock(return_value=[
+        {
+            "timestamp": (now - timedelta(minutes=15)).isoformat(),
+            "symbol": "ETH/USDT",
+            "side": "SELL",
+            "order_id": "shd_tp_9dbfd234fa",
+            "realized_pnl": 23.20,
+            "strategy": "F7_HighLiq_Size (Quality)",
+        }
+    ])
+    daemon._refresh_anomaly_cooldowns()
+    assert "ETHUSDT" in daemon.core_bracket_last_exit
+    assert daemon.core_bracket_last_exit["ETHUSDT"][1] == PositionSide.LONG
+
 
 

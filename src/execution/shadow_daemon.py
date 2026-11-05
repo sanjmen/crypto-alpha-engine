@@ -96,10 +96,10 @@ class ShadowTradingDaemon:
         profit_lock_level_pct: float = 0.015,
         trailing_trigger_pct: float = 0.045,
         trailing_distance_pct: float = 0.020,
-        anomaly_profit_lock_trigger_pct: float = 0.040,
-        anomaly_profit_lock_level_pct: float = 0.032,
-        anomaly_trailing_trigger_pct: float = 0.052,
-        anomaly_trailing_distance_pct: float = 0.015,
+        anomaly_profit_lock_trigger_pct: float = 0.045,
+        anomaly_profit_lock_level_pct: float = 0.025,
+        anomaly_trailing_trigger_pct: float = 0.060,
+        anomaly_trailing_distance_pct: float = 0.020,
         anomaly_cooldown_win_sec: float = 12.0 * 3600.0,
         anomaly_cooldown_loss_sec: float = 24.0 * 3600.0,
         anomaly_max_hold_hours: float = 48.0,
@@ -110,6 +110,7 @@ class ShadowTradingDaemon:
         intracycle_drift_threshold_pct: float = 0.25,
         intracycle_min_rebalance_age_sec: float = 1800.0,
         intracycle_post_stop_settle_sec: float = 900.0,
+        core_bracket_cooldown_sec: float = 4.0 * 3600.0,
         core_take_profit_pct: float = 0.080,
         cache_dir: str = "data/cache",
         enable_warm_start: bool = True,
@@ -149,6 +150,8 @@ class ShadowTradingDaemon:
         self.intracycle_drift_threshold_pct = intracycle_drift_threshold_pct
         self.intracycle_min_rebalance_age_sec = intracycle_min_rebalance_age_sec
         self.intracycle_post_stop_settle_sec = intracycle_post_stop_settle_sec
+        self.core_bracket_cooldown_sec = core_bracket_cooldown_sec
+        self.core_bracket_last_exit: dict[str, tuple[datetime, PositionSide]] = {}
         self.last_core_bracket_fill_time: datetime | None = None
         self.last_rest_tickers_ok: bool = True
         self._last_kline_fetch_ok: bool = True
@@ -201,19 +204,22 @@ class ShadowTradingDaemon:
 
     def _refresh_anomaly_cooldowns(self, filled_orders: list[Order] | None = None) -> None:
         """
-        Hydrates and updates per-symbol anomaly exit timestamps and win/loss state
+        Hydrates and updates per-symbol anomaly exit timestamps and win/loss state,
+        as well as Core bracket exit timestamps and exited position side (`core_bracket_last_exit`),
         from filled bracket orders and/or the SQLite trades table so cooldowns
-        (12h after Win / 24h after Stop-Loss) persist across fast cycles and restarts.
+        persist across fast cycles and daemon restarts.
         """
         now = datetime.now(timezone.utc)
         if filled_orders:
             for o in filled_orders:
                 if o.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
+                    clean_sym = o.symbol.replace("/", "")
                     if getattr(o, "strategy", None) in ANOMALY_STRATEGIES:
-                        clean_sym = o.symbol.replace("/", "")
                         self.anomaly_last_exit[clean_sym] = (now, o.order_type == OrderType.STOP_LOSS)
                     else:
                         self.last_core_bracket_fill_time = now
+                        exited_side = PositionSide.LONG if o.side == OrderSide.SELL else PositionSide.SHORT
+                        self.core_bracket_last_exit[clean_sym] = (now, exited_side)
 
         db_inst = getattr(self.broker, "db", None)
         if db_inst and hasattr(db_inst, "get_trades"):
@@ -223,23 +229,94 @@ class ShadowTradingDaemon:
                     for r in reversed(recent_trades):
                         if not isinstance(r, dict):
                             continue
-                        if r.get("strategy") not in ANOMALY_STRATEGIES:
-                            continue
+                        strat = r.get("strategy")
                         rpnl = float(r.get("realized_pnl") or 0.0)
                         oid = str(r.get("order_id") or "")
-                        if abs(rpnl) > 1e-8 or oid.startswith(("shd_tp_", "shd_sl_")):
-                            ts_raw = r.get("timestamp")
-                            if not ts_raw:
-                                continue
+                        ts_raw = r.get("timestamp")
+                        if not ts_raw:
+                            continue
+                        clean_sym = str(r.get("symbol") or "").replace("/", "")
+                        if not clean_sym:
+                            continue
+                        if strat in ANOMALY_STRATEGIES:
+                            if abs(rpnl) > 1e-8 or oid.startswith(("shd_tp_", "shd_sl_")):
+                                ts = datetime.fromisoformat(str(ts_raw))
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                was_loss = rpnl < -1e-8 if abs(rpnl) > 1e-8 else oid.startswith("shd_sl_")
+                                self.anomaly_last_exit[clean_sym] = (ts, was_loss)
+                        elif oid.startswith(("shd_tp_", "shd_sl_")):
                             ts = datetime.fromisoformat(str(ts_raw))
                             if ts.tzinfo is None:
                                 ts = ts.replace(tzinfo=timezone.utc)
-                            clean_sym = str(r.get("symbol") or "").replace("/", "")
-                            if clean_sym:
-                                was_loss = rpnl < -1e-8 if abs(rpnl) > 1e-8 else oid.startswith("shd_sl_")
-                                self.anomaly_last_exit[clean_sym] = (ts, was_loss)
+                            side_str = str(r.get("side") or "").upper()
+                            exited_side = PositionSide.LONG if side_str == "SELL" else PositionSide.SHORT
+                            self.core_bracket_last_exit[clean_sym] = (ts, exited_side)
+                            if self.last_core_bracket_fill_time is None or ts > self.last_core_bracket_fill_time:
+                                self.last_core_bracket_fill_time = ts
             except Exception:
                 pass
+
+    def _apply_core_bracket_cooldowns(
+        self,
+        target_dollars: dict[str, float],
+        now: datetime | None = None,
+    ) -> dict[str, float]:
+        """
+        Enforces a per-symbol same-direction cooldown (`core_bracket_cooldown_sec`, default 4h)
+        on Core symbols that exited mid-cycle via Take-Profit or Trailing-Stop/Profit-Lock,
+        and re-centers the remaining Long and Short legs so strict Dollar Neutrality
+        (`sum(Longs) == sum(Shorts)`) is preserved without immediately re-entering a reversing asset.
+        """
+        if not target_dollars or self.core_bracket_cooldown_sec <= 0 or not self.core_bracket_last_exit:
+            return target_dollars
+
+        now_dt = now or datetime.now(timezone.utc)
+        filtered = dict(target_dollars)
+        blocked_any = False
+
+        for sym_key, target_val in list(filtered.items()):
+            if abs(target_val) <= 1e-9:
+                continue
+            clean_sym = sym_key.replace("/", "")
+            if clean_sym not in self.core_bracket_last_exit:
+                continue
+            exit_ts, exited_side = self.core_bracket_last_exit[clean_sym]
+            elapsed_sec = (now_dt - exit_ts).total_seconds()
+            if 0.0 <= elapsed_sec < self.core_bracket_cooldown_sec:
+                same_dir = (
+                    (target_val > 0 and exited_side == PositionSide.LONG)
+                    or (target_val < 0 and exited_side == PositionSide.SHORT)
+                )
+                if same_dir:
+                    filtered[sym_key] = 0.0
+                    blocked_any = True
+                    logger.info(
+                        f"⏳ Core Bracket Cooldown active for {clean_sym} "
+                        f"({exited_side.value} exited {elapsed_sec / 60.0:.1f}m ago < "
+                        f"{self.core_bracket_cooldown_sec / 3600.0:.1f}h): blocking same-direction "
+                        f"re-entry (${target_val:+,.2f} -> $0.00)"
+                    )
+
+        if not blocked_any:
+            return filtered
+
+        long_sum = sum(v for v in filtered.values() if v > 0)
+        short_sum = sum(abs(v) for v in filtered.values() if v < 0)
+        if long_sum <= 1e-6 or short_sum <= 1e-6:
+            return {k: 0.0 for k in filtered}
+
+        balanced_side = min(long_sum, short_sum)
+        long_scale = balanced_side / long_sum if long_sum > balanced_side else 1.0
+        short_scale = balanced_side / short_sum if short_sum > balanced_side else 1.0
+
+        for sym_key, val in list(filtered.items()):
+            if val > 0 and long_scale < 1.0:
+                filtered[sym_key] = val * long_scale
+            elif val < 0 and short_scale < 1.0:
+                filtered[sym_key] = val * short_scale
+
+        return filtered
 
     def _on_ws_tick(self, tick: PriceTick) -> None:
         """Processes real-time WebSocket tick updates."""
@@ -1093,6 +1170,8 @@ class ShadowTradingDaemon:
                 volatilities=volatilities,
                 funding_data=funding_data,
             )
+
+        target_dollars = self._apply_core_bracket_cooldowns(target_dollars)
 
         executed_orders: list[Order] = []
         executed_deltas: dict[str, float] = {}
