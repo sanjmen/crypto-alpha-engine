@@ -575,4 +575,78 @@ def test_nov5_core_bracket_cooldown_and_neutrality_recentering(daemon: ShadowTra
     assert daemon.core_bracket_last_exit["ETHUSDT"][1] == PositionSide.LONG
 
 
+def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: ShadowTradingDaemon):
+    """
+    Tests Nov 9 Satellite Capsule Refinements:
+    1) Zombie Ticker Eviction: Non-Core, non-open-position symbols that drop out of the current
+       cycle's Top-10 Gainers/Losers are evicted from `self.latest_tickers` on refresh.
+    2) Kline Price & Broker Quote Synchronization: If `latest_tickers` or `broker.market_prices`
+       has a stale price ($0.2326) while fresh 1h kline close is $0.1800, `run_anomaly_scan()`
+       synchronizes execution price and SL/TP brackets to $0.1800 before order creation.
+    3) Expanded TradFi Filter: SNDK, UVXY, DELL, QCOM, RKLB, SAMSUNG, ANTHROPIC are blocked.
+    """
+    from src.strategies.extreme_anomaly import OversoldBounceStrategy
+
+    # 1. Verify expanded TradFi equity/ETF/commodity bases are blocked
+    for tradfi_sym in ["SNDK/USDT", "UVXY/USDT", "DELL/USDT", "QCOM/USDT", "RKLB/USDT", "SAMSUNG/USDT", "ANTHROPIC/USDT"]:
+        assert daemon._is_tradfi_or_gapped_symbol(tradfi_sym) is True
+
+    # 2. Seed a stale zombie ticker ("ZOMBIE/USDT") that is NOT in Core symbols and NOT an open position
+    daemon.latest_tickers["ZOMBIE/USDT"] = {
+        "price": 0.50,
+        "bid": 0.499,
+        "ask": 0.501,
+        "change_24h": -20.0,
+        "volume_24h": 30_000_000.0,
+    }
+    daemon.exchange.fetch_tickers = MagicMock(return_value={
+        "BTC/USDT:USDT": {
+            "last": 75000.0,
+            "bid": 74999.0,
+            "ask": 75001.0,
+            "high": 76000.0,
+            "low": 74000.0,
+            "percentage": -1.5,
+            "quoteVolume": 500_000_000.0,
+        }
+    })
+    refreshed = daemon.fetch_live_tickers()
+    assert "ZOMBIE/USDT" not in refreshed
+    assert "BTC/USDT" in refreshed
+
+    # 3. Verify Kline Price Synchronization in run_anomaly_scan() when broker/ticker had a stale price ($0.2326 vs $0.1800)
+    daemon.allocator.oversold_bounce_strategy = OversoldBounceStrategy(
+        dump_threshold_24h=-0.15, rsi_threshold=28.0, symbols_filter=None
+    )
+    daemon.broker.set_market_price("ARX/USDT", price=0.2326, bid=0.2325, ask=0.2327)
+    daemon.latest_tickers = {
+        "ARX/USDT": {
+            "price": 0.2326,
+            "bid": 0.2325,
+            "ask": 0.2327,
+            "change_24h": -22.0,
+            "volume_24h": 35_000_000.0,
+        }
+    }
+    closes = np.linspace(0.2800, 0.1800, 30)
+    fresh_klines = pd.DataFrame({
+        "timestamp": pd.date_range("2026-11-08", periods=30, freq="1h", tz="UTC"),
+        "open": closes * 1.01,
+        "high": closes * 1.02,
+        "low": closes * 0.99,
+        "close": closes,
+        "volume": np.full(30, 150_000.0),
+    })
+    daemon.fetch_symbol_klines = MagicMock(return_value=fresh_klines)
+    daemon.broker.db.get_trades = MagicMock(return_value=[])
+
+    orders = daemon.run_anomaly_scan()
+    assert len(orders) == 1
+    pos = daemon.broker.portfolio.positions["ARX/USDT"]
+    # Entry price and SL must be anchored to fresh kline close ($0.1800), NOT stale $0.2326!
+    assert abs(pos.entry_price - 0.1800) < 0.001
+    assert abs(pos.stop_loss - round(pos.entry_price * 0.95, 6)) < 1e-5
+
+
+
 

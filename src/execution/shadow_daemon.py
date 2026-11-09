@@ -58,14 +58,15 @@ ANOMALY_STRATEGIES: set[str] = {
 }
 
 NON_CRYPTO_TRADFI_BASES: set[str] = {
-    "AAOI", "AAPL", "AMD", "AMZN", "AXTI", "BE", "BILL", "BMNR", "CBRS",
-    "CHIP", "COIN", "CONL", "CRCL", "CRWV", "CSOPSKHYNIX2L", "CXMT", "EWZ",
-    "GOOGL", "HOOD", "INTC", "INTW", "IREN", "KORU", "LITE", "META",
-    "MINIMAX", "MRNA", "MRVL", "MSFT", "MSTR", "MSTU", "MSTZ", "MUU",
-    "MVLL", "NATGAS", "NBIS", "NFLX", "NOW", "NVDA", "NVDL", "NVDS",
-    "ORCL", "PLTR", "QQQ", "SKDD", "SKHY", "SKHYNIX", "SKUU", "SMCI",
-    "SNXX", "SOXL", "SOXS", "SPY", "SQQQ", "STXX", "TQQQ", "TSLA", "TSLL",
-    "TSLS", "UNITREE", "USDBRL", "WDC", "XAG", "XAU", "ZHIPU",
+    "AAOI", "AAPL", "AMD", "AMZN", "ANTHROPIC", "APP", "AXTI", "BE", "BILL",
+    "BMNR", "BZ", "CBRS", "CHIP", "CL", "COHR", "COIN", "CONL", "CRCL", "CRWV",
+    "CSOPSKHYNIX2L", "CXMT", "DELL", "EWZ", "FLNC", "GOOGL", "HOOD", "INTC",
+    "INTW", "IREN", "KORU", "KSTR", "LITE", "META", "MINIMAX", "MRNA", "MRVL",
+    "MSFT", "MSTR", "MSTU", "MSTZ", "MUU", "MVLL", "NATGAS", "NBIS", "NFLX",
+    "NOW", "NVDA", "NVDL", "NVDS", "ORCL", "PLTR", "QCOM", "QQQ", "RKLB",
+    "SAMSUNG", "SKDD", "SKHY", "SKHYNIX", "SKUU", "SMCI", "SNDK", "SNXX",
+    "SOXL", "SOXS", "SPY", "SQQQ", "STXX", "TQQQ", "TSLA", "TSLL", "TSLS",
+    "UNITREE", "USDBRL", "UVXY", "WDC", "XAG", "XAU", "ZHIPU", "ZHONGJI",
 }
 
 
@@ -430,7 +431,14 @@ class ShadowTradingDaemon:
             self.last_rest_tickers_ok = False
             logger.warning(f"Error fetching live tickers from Binance: {e}")
 
-        self.latest_tickers.update(ticks)
+        if ticks:
+            fresh_clean = {k.replace("/", "") for k in ticks}
+            keep_clean = fresh_clean | base_clean | open_pos_clean
+            self.latest_tickers = {
+                k: v for k, v in self.latest_tickers.items()
+                if k.replace("/", "") in keep_clean
+            }
+            self.latest_tickers.update(ticks)
         return self.latest_tickers
 
     def fetch_symbol_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
@@ -1095,7 +1103,7 @@ class ShadowTradingDaemon:
                     vol_val = parkinson_volatility(df["high"].values[-30:], df["low"].values[-30:])
                     volatilities[clean_sym] = float(vol_val) if vol_val > 0 else 0.02
                     if use_7f and self.enable_subhourly_pullback:
-                        df15 = self.fetch_warm_klines(sym, timeframe="15m", target_bars=24)
+                        df15 = self.fetch_warm_klines(sym, timeframe="15m", target_bars=64)
                         if not df15.empty:
                             bars_15m[clean_sym] = df15
 
@@ -1486,6 +1494,24 @@ class ShadowTradingDaemon:
             df = self.fetch_symbol_klines(sym, timeframe="1h", limit=30)
             if df.empty or len(df) < 26 or self._is_tradfi_or_gapped_symbol(sym, df):
                 continue
+
+            # Synchronize execution price and broker L1 quote with fresh kline close to prevent stale-ticker fills
+            kline_close = float(df["close"].iloc[-1])
+            if kline_close > 0:
+                if abs(kline_close - price) / kline_close > 0.015:
+                    price = kline_close
+                t_info = self.latest_tickers.get(sym, {})
+                bid_p = float(t_info.get("bid") or price)
+                ask_p = float(t_info.get("ask") or price)
+                if abs(bid_p - price) / price > 0.015:
+                    bid_p = price
+                if abs(ask_p - price) / price > 0.015:
+                    ask_p = price
+                self.broker.set_market_price(sym, price=price, bid=bid_p, ask=ask_p)
+                if sym in self.latest_tickers:
+                    self.latest_tickers[sym]["price"] = price
+                    self.latest_tickers[sym]["bid"] = bid_p
+                    self.latest_tickers[sym]["ask"] = ask_p
 
             # 1. Oversold Bounce (drop <= -15%, RSI <= 28)
             if pct <= -15.0 and self.allocator.oversold_bounce_strategy:
