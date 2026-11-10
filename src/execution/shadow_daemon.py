@@ -1061,6 +1061,8 @@ class ShadowTradingDaemon:
         3. Net orders through turnover deadband
         4. Route passive Maker limit orders at the touch
         """
+        if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
+            self.broker.sync_from_live_exchange(sync_positions=True)
         portfolio = self.broker.get_portfolio()
         market_data: dict[str, pd.DataFrame] = {}
         volatilities: dict[str, float] = {}
@@ -1180,6 +1182,21 @@ class ShadowTradingDaemon:
             )
 
         target_dollars = self._apply_core_bracket_cooldowns(target_dollars)
+
+        if getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None) is not None:
+            lev_snap_live = getattr(self.allocator, "last_leverage_snapshot", None)
+            eff_lev_live = float(lev_snap_live.effective_leverage) if lev_snap_live else 2.5
+            self.broker._current_live_leverage = max(2, min(5, int(eff_lev_live + 0.999)))
+            try:
+                self.broker.live_broker.kill_switch.sync_margin_and_leverage(
+                    exchange_client=self.broker.live_broker.client,
+                    symbols=list(self.symbols),
+                    effective_leverage=max(2.5, eff_lev_live),
+                    dry_run=False,
+                )
+                self.broker._configured_live_symbols.update(self.symbols)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Live margin/leverage sync note: {e}")
 
         executed_orders: list[Order] = []
         executed_deltas: dict[str, float] = {}

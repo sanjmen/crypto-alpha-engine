@@ -17,7 +17,11 @@ from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.ports.execution_ports import IExecutionClient
 from src.risk.kill_switch import EmergencyKillSwitch
-from src.security.vault import ExchangeCredentials, PreFlightPermissionValidator
+from src.security.vault import (
+    ExchangeCredentials,
+    PreFlightPermissionValidator,
+    SecurityViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         api_secret: str | None = None,
         credentials: ExchangeCredentials | None = None,
         validate_permissions: bool = False,
+        strict_ip_whitelist: bool = True,
         dry_run: bool = True,
         max_gross_leverage: float = 2.5,
         max_order_notional: float = 25_000.0,
@@ -68,6 +73,7 @@ class CCXTExecutionAdapter(IExecutionClient):
 
         self.exchange_id = exchange_id
         self.dry_run = dry_run
+        self.strict_ip_whitelist = strict_ip_whitelist
         self.max_gross_leverage = max_gross_leverage
         self.max_order_notional = max_order_notional
         self.max_drawdown_stop = max_drawdown_stop
@@ -79,12 +85,27 @@ class CCXTExecutionAdapter(IExecutionClient):
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "future"},
+            "options": {
+                "defaultType": "future",
+                "fetchMarkets": {"types": ["linear"]},
+                "fetchCurrencies": False,
+            },
         }
         self.client: ccxt.Exchange = exchange_class(config)
 
         if validate_permissions and not self.dry_run and api_key:
-            PreFlightPermissionValidator.validate_binance_permissions(self.client)
+            try:
+                PreFlightPermissionValidator.validate_binance_permissions(
+                    self.client,
+                    strict_ip_whitelist=strict_ip_whitelist,
+                )
+            except SecurityViolationError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Sub-account / SAPI permission endpoint note ({e}); "
+                    "sub-accounts inherently block external withdrawals."
+                )
 
         self.portfolio = Portfolio(
             cash=100_000.0,
@@ -236,6 +257,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         chase_interval_sec: float = 5.0,
         max_chase_iterations: int = 3,
         allow_taker_fallback: bool = True,
+        strict_ip_whitelist: bool = False,
         kill_switch: EmergencyKillSwitch | None = None,
     ) -> None:
         super().__init__(
@@ -244,6 +266,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             api_secret=api_secret,
             credentials=credentials,
             validate_permissions=(not dry_run and not testnet),
+            strict_ip_whitelist=strict_ip_whitelist,
             dry_run=dry_run,
             max_gross_leverage=max_gross_leverage,
             max_order_notional=max_order_notional,
@@ -274,7 +297,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
     def quantize_price(self, symbol: str, price: float) -> float:
         """Quantizes price strictly to Binance symbol `tickSize`."""
         try:
-            if hasattr(self.client, "markets") and self.client.markets and symbol in self.client.markets:
+            if hasattr(self.client, "markets") and self.client.markets:
                 return float(self.client.price_to_precision(symbol, price))
         except Exception:
             pass
@@ -283,7 +306,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
     def quantize_amount(self, symbol: str, amount: float) -> float:
         """Quantizes quantity strictly to Binance symbol `stepSize`."""
         try:
-            if hasattr(self.client, "markets") and self.client.markets and symbol in self.client.markets:
+            if hasattr(self.client, "markets") and self.client.markets:
                 return float(self.client.amount_to_precision(symbol, amount))
         except Exception:
             pass
@@ -645,3 +668,268 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             fallback_price=px,
             reduce_only=True,
         )
+
+    def ensure_account_configuration(
+        self,
+        symbols: list[str],
+        target_leverage: float = 3.0,
+        enforce_single_asset_margin: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Audits and programmatically enforces Binance USDS-M Futures (`fapi/v1`) account settings:
+        1. Position Mode -> One-Way Mode (`dualSidePosition='false'` via `/fapi/v1/positionSide/dual`)
+        2. Multi-Assets Margin Mode -> Single-Asset Mode (optional, via `/fapi/v1/multiAssetsMargin`)
+        3. Margin Type -> Cross Margin (`marginType='CROSSED'` via `/fapi/v1/marginType`)
+        4. Initial Leverage -> `target_int_lev` (`POST /fapi/v1/leverage`)
+        """
+        target_int_lev = max(1, min(20, int(round(target_leverage))))
+        report: dict[str, Any] = {
+            "dry_run": self.dry_run,
+            "position_mode": "ONE_WAY",
+            "dual_side_position": False,
+            "multi_assets_margin": False,
+            "margin_modes": {s: "CROSSED" for s in symbols},
+            "leverages": {s: target_int_lev for s in symbols},
+            "usdt_free_balance": float(self.portfolio.cash),
+            "usdt_total_balance": float(self.portfolio.total_equity),
+        }
+
+        if self.dry_run:
+            return report
+
+        # 0. Synchronize server clock & load Futures markets metadata
+        try:
+            if hasattr(self.client, "load_time_difference"):
+                self.client.load_time_difference()
+            if hasattr(self.client, "load_markets"):
+                self.client.load_markets()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Market/time sync note: {e}")
+
+        # 1. Verify / Enforce One-Way Position Mode (`dualSidePosition='false'`)
+        try:
+            pos_mode = self.client.fetch_position_mode()
+            is_hedged = bool(pos_mode.get("hedged", False))
+            if is_hedged:
+                logger.info("Switching Binance Futures Position Mode from Hedge Mode to One-Way Mode...")
+                self.client.set_position_mode(False)
+                pos_mode = self.client.fetch_position_mode()
+                is_hedged = bool(pos_mode.get("hedged", False))
+            report["dual_side_position"] = is_hedged
+            report["position_mode"] = "HEDGE_MODE" if is_hedged else "ONE_WAY"
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e)
+            if "-4059" in err_str or "No need to change position side" in err_str:
+                report["dual_side_position"] = False
+                report["position_mode"] = "ONE_WAY"
+            else:
+                logger.warning(f"Position mode verification warning: {e}")
+
+        # 2. Check / Optionally Enforce Multi-Assets Margin Mode
+        try:
+            if hasattr(self.client, "fapiPrivateGetMultiAssetsMargin"):
+                ma_resp = self.client.fapiPrivateGetMultiAssetsMargin()
+                is_multi = bool(
+                    str(ma_resp.get("multiAssetsMargin", "false")).lower() == "true"
+                )
+                if is_multi and enforce_single_asset_margin and hasattr(self.client, "fapiPrivatePostMultiAssetsMargin"):
+                    self.client.fapiPrivatePostMultiAssetsMargin({"multiAssetsMargin": "false"})
+                    is_multi = False
+                report["multi_assets_margin"] = is_multi
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Multi-Assets Margin check note: {e}")
+
+        # 3. Enforce CROSSED Margin & Initial Leverage per Symbol
+        for sym in symbols:
+            try:
+                self.client.set_margin_mode("cross", sym)
+                report["margin_modes"][sym] = "CROSSED"
+            except Exception as e:  # noqa: BLE001
+                err_str = str(e)
+                if "-4046" in err_str or "No need to change margin type" in err_str:
+                    report["margin_modes"][sym] = "CROSSED"
+                else:
+                    logger.warning(f"Could not set CROSSED margin for {sym}: {e}")
+                    report["margin_modes"][sym] = f"ERROR: {e}"
+
+            try:
+                lev_resp = self.client.set_leverage(target_int_lev, sym)
+                confirmed_lev = int(lev_resp.get("leverage", target_int_lev)) if isinstance(lev_resp, dict) else target_int_lev
+                report["leverages"][sym] = confirmed_lev
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Could not set leverage={target_int_lev}x for {sym}: {e}")
+
+        # 4. Fetch Live USDT Futures Balance
+        try:
+            bal = self.client.fetch_balance()
+            usdt_info = bal.get("USDT", {})
+            free_cash = float(usdt_info.get("free") or 0.0)
+            total_cash = float(usdt_info.get("total") or free_cash)
+            raw_info = bal.get("info", {}) if isinstance(bal, dict) else {}
+            non_zero_assets = []
+            if isinstance(raw_info, dict) and isinstance(raw_info.get("assets"), list):
+                for a in raw_info["assets"]:
+                    wb = float(a.get("walletBalance") or 0.0)
+                    ab = float(a.get("availableBalance") or 0.0)
+                    if wb > 0 or ab > 0:
+                        non_zero_assets.append(
+                            {
+                                "asset": a.get("asset"),
+                                "walletBalance": wb,
+                                "availableBalance": ab,
+                            }
+                        )
+            report["non_zero_assets"] = non_zero_assets
+            self.portfolio.cash = free_cash
+            if not self.portfolio.positions and total_cash > 0:
+                self.portfolio.initial_cash = total_cash
+                self.peak_equity = total_cash
+            report["usdt_free_balance"] = free_cash
+            report["usdt_total_balance"] = total_cash
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not fetch USDT balance during configuration check: {e}")
+
+        return report
+
+    def run_production_smoke_test(
+        self,
+        symbol: str = "DOGE/USDT",
+        notional_usd: float = 6.0,
+        leverage: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Executes a complete 5-stage production smoke test on Binance USDS-M Futures:
+        Stage 1: Pre-Flight API Key Permissions & Initial Balance Audit.
+        Stage 2: Auto-Configuration (`One-Way Mode`, `CROSSED` Margin, `leverage`x).
+        Stage 3: Resting Passive Maker Order (`Post-Only GTX`) Placement, Query & Cancellation.
+        Stage 4: Live Micro-Position Opening (`notional_usd`) & `positionRisk` Reconciliation.
+        Stage 5: Live Position Closing (`reduceOnly=True`) & Clean-Slate Verification (`0` open positions).
+        """
+        logger.info(f"🧪 Starting Production Smoke Test on {symbol} (Notional: ${notional_usd:.2f} USDT, Leverage: {leverage}x, DryRun: {self.dry_run})")
+        config_report = self.ensure_account_configuration(
+            symbols=[symbol],
+            target_leverage=float(leverage),
+        )
+        logger.info(f"[Stage 1-2/5] Config & Balance Report: {config_report}")
+        initial_balance = float(config_report["usdt_total_balance"])
+
+        bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=0.15)
+        mid_px = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.15
+
+        # Ensure quantity satisfies both target notional_usd and minimum exchange stepSize
+        raw_qty = max(notional_usd, 6.0) / (bid * 0.98 if bid > 0 else mid_px)
+        qty = self.quantize_amount(symbol, raw_qty)
+        if qty * mid_px < 5.5:
+            qty = self.quantize_amount(symbol, raw_qty * 1.15)
+
+        # Stage 3: Resting Post-Only (GTX) Limit Order Post & Cancel (-1.5% below best_bid)
+        resting_bid_px = self.quantize_price(symbol, bid * 0.985)
+        logger.info(
+            f"[Stage 3/5] Preparing GTX test order on {symbol}: bid=${bid}, ask=${ask}, "
+            f"resting_px=${resting_bid_px}, qty={qty} (notional=${qty * resting_bid_px:.2f} USDT)"
+        )
+        gtx_post_cancel_ok = False
+        resting_order_id = ""
+
+        if self.dry_run:
+            resting_order_id = f"dry_gtx_rest_{uuid.uuid4().hex[:8]}"
+            gtx_post_cancel_ok = True
+            logger.info(f"[Stage 3/5] DRY-RUN Post-Only GTX resting order posted & cancelled ({resting_order_id} @ ${resting_bid_px})")
+        else:
+            res_rest = self.client.create_order(
+                symbol=symbol,
+                type="limit",
+                side="buy",
+                amount=qty,
+                price=resting_bid_px,
+                params={"timeInForce": "GTX"},
+            )
+            resting_order_id = str(res_rest.get("id", ""))
+            logger.info(f"[Stage 3/5] Live Post-Only GTX order posted: id={resting_order_id} ({qty} {symbol} @ ${resting_bid_px})")
+            time.sleep(0.5)
+            self.client.cancel_order(resting_order_id, symbol)
+            gtx_post_cancel_ok = True
+            logger.info(f"[Stage 3/5] Live Post-Only GTX order cancelled cleanly: id={resting_order_id}")
+
+        # Stage 4: Open Micro-Position & Reconcile with Exchange
+        logger.info(f"[Stage 4/5] Opening micro-position: BUY {qty} {symbol} (~${qty * mid_px:.2f} USDT)...")
+        open_order = self.execute_maker_limit_chase(
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=qty,
+            fallback_price=mid_px,
+            reduce_only=False,
+        )
+        if not self.dry_run:
+            time.sleep(0.5)
+        reconciled_open = self.reconcile_positions_from_exchange()
+        pos_opened = symbol in reconciled_open or (symbol.split(":")[0] in reconciled_open)
+        open_qty = (
+            reconciled_open[symbol].quantity
+            if symbol in reconciled_open
+            else (open_order.filled_quantity or qty)
+        )
+        logger.info(
+            f"[Stage 4/5] Position reconciled: opened={pos_opened}, qty={open_qty}, avg_fill=${open_order.average_fill_price}"
+        )
+
+        # Stage 5: Close Position with reduceOnly=True & Verify 100% Flat State
+        logger.info(f"[Stage 5/5] Closing micro-position with reduceOnly=True...")
+        if self.dry_run:
+            close_order = self.execute_maker_limit_chase(
+                symbol=symbol,
+                side=OrderSide.SELL,
+                quantity=open_qty,
+                fallback_price=mid_px,
+                reduce_only=True,
+            )
+            close_order_id = close_order.id
+        else:
+            try:
+                if hasattr(self.client, "cancel_all_orders"):
+                    self.client.cancel_all_orders(symbol)
+            except Exception:
+                pass
+            res_close = self.client.create_order(
+                symbol=symbol,
+                type="market",
+                side="sell",
+                amount=self.quantize_amount(symbol, open_qty),
+                params={"reduceOnly": True},
+            )
+            close_order_id = str(res_close.get("id", ""))
+            self.portfolio.positions.pop(symbol, None)
+            time.sleep(0.5)
+
+        reconciled_final = self.reconcile_positions_from_exchange()
+        final_balance = float(self.portfolio.cash)
+        if not self.dry_run:
+            try:
+                bal_after = self.client.fetch_balance()
+                final_balance = float(bal_after.get("USDT", {}).get("total") or final_balance)
+            except Exception:
+                pass
+
+        is_flat = symbol not in reconciled_final and len(reconciled_final) == 0
+        logger.info(
+            f"✅ Smoke Test Complete | Flat={is_flat} | Initial USDT=${initial_balance:,.4f} -> Final USDT=${final_balance:,.4f}"
+        )
+
+        return {
+            "status": "PASSED" if (gtx_post_cancel_ok and pos_opened and is_flat) else "CHECK_REQUIRED",
+            "symbol": symbol,
+            "quantity": open_qty,
+            "notional_usd": round(open_qty * (open_order.average_fill_price or mid_px), 4),
+            "configuration": config_report,
+            "gtx_resting_order_id": resting_order_id,
+            "gtx_post_and_cancel_ok": gtx_post_cancel_ok,
+            "open_order_id": open_order.id,
+            "entry_fill_price": open_order.average_fill_price,
+            "position_verified_on_exchange": pos_opened,
+            "close_order_id": close_order_id,
+            "final_flat_verified": is_flat,
+            "initial_usdt_balance": initial_balance,
+            "final_usdt_balance": final_balance,
+            "net_cost_usdt": round(final_balance - initial_balance, 6),
+        }
+

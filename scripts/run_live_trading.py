@@ -11,10 +11,32 @@ Supports 3 execution stages:
 import argparse
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
+def _load_dotenv_file() -> None:
+    """Loads key=value or 'export key=value' pairs from .env into os.environ."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_dotenv_file()
 
 from src.execution.live_broker import BinanceLiveBroker
 from src.execution.shadow_daemon import DEFAULT_SHADOW_SYMBOLS, ShadowTradingDaemon
@@ -126,6 +148,10 @@ def main() -> None:
     parser.add_argument("--max-leverage", type=float, default=5.0, help="Max stepped leverage tier (default: 5.0x)")
     parser.add_argument("--rebalance-interval", type=float, default=14400.0, help="Rebalance interval in seconds (default: 14400 = 4h)")
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="Path to SQLite state DB")
+    parser.add_argument("--smoke-test", action="store_true", help="Run the 5-stage production smoke test (post GTX, open micro-position, close reduceOnly)")
+    parser.add_argument("--smoke-symbol", type=str, default="DOGE/USDT", help="Symbol for smoke test (default: DOGE/USDT, $5 minNotional)")
+    parser.add_argument("--smoke-notional", type=float, default=6.0, help="Notional in USDT for smoke test position (default: 6.0 USDT)")
+    parser.add_argument("--configure-only", action="store_true", help="Enforce One-Way Mode, Cross Margin, and Leverage across all 15 Core symbols without trading")
     args = parser.parse_args()
 
     is_dry_run = not (args.mainnet or args.testnet)
@@ -150,6 +176,27 @@ def main() -> None:
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         kill_switch=kill_switch,
     )
+
+    mode_label = "MAINNET LIVE" if args.mainnet else ("TESTNET" if args.testnet else "DRY-RUN")
+
+    if args.configure_only:
+        logger.info(f"🔧 Running Automated Account Configuration [{mode_label}] across {len(DEFAULT_SHADOW_SYMBOLS)} Core symbols...")
+        cfg = live_broker.ensure_account_configuration(
+            symbols=DEFAULT_SHADOW_SYMBOLS.copy(),
+            target_leverage=args.start_leverage,
+        )
+        logger.info(f"Account Configuration Report: {cfg}")
+        return
+
+    if args.smoke_test:
+        logger.info(f"🧪 Launching Production Smoke Test [{mode_label}] on {args.smoke_symbol}...")
+        smoke_res = live_broker.run_production_smoke_test(
+            symbol=args.smoke_symbol,
+            notional_usd=args.smoke_notional,
+            leverage=max(1, int(round(args.start_leverage))),
+        )
+        logger.info(f"Smoke Test Report: {smoke_res}")
+        return
 
     db = ShadowDatabase(db_path=args.db)
     shadow_helper = ShadowExecutionBroker(database=db, initial_cash=args.capital)

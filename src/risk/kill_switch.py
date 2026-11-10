@@ -101,13 +101,31 @@ class EmergencyKillSwitch:
         symbols: List[str],
         effective_leverage: float,
         dry_run: bool = True,
+        enforce_one_way_mode: bool = True,
     ) -> Dict[str, int]:
         """
-        Synchronizes `CROSSED` margin mode and sets per-symbol exchange leverage bracket
-        to `min(5, ceil(effective_leverage))` on Binance Futures (`fapi`).
+        Synchronizes One-Way Position Mode (`dualSidePosition='false'`), `CROSSED` margin mode,
+        and sets per-symbol exchange leverage bracket to `min(5, ceil(effective_leverage))`
+        on Binance Futures (`fapi`).
         """
         target_int_lev = max(1, min(5, int(math.ceil(effective_leverage))))
         synced: Dict[str, int] = {}
+
+        if not dry_run and enforce_one_way_mode:
+            try:
+                is_hedged = None
+                if hasattr(exchange_client, "fetch_position_mode"):
+                    mode_info = exchange_client.fetch_position_mode()
+                    if isinstance(mode_info, dict):
+                        is_hedged = mode_info.get("hedged")
+                if is_hedged is not False and hasattr(exchange_client, "set_position_mode"):
+                    exchange_client.set_position_mode(False)
+            except Exception as e:  # noqa: BLE001
+                err_str = str(e)
+                if "-4059" in err_str or "No need to change position side" in err_str:
+                    logger.debug("Position mode already set to One-Way Mode (-4059).")
+                else:
+                    logger.warning(f"Could not enforce One-Way position mode: {e}")
 
         for sym in symbols:
             synced[sym] = target_int_lev

@@ -16,19 +16,43 @@ Usage:
 import argparse
 import logging
 import os
+from pathlib import Path
 import signal
 import sys
 import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+
+def _load_dotenv_file() -> None:
+    """Loads key=value or 'export key=value' pairs from .env into os.environ."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_dotenv_file()
+
 from src.execution.database import DEFAULT_DB_PATH, ShadowDatabase
 from src.execution.execution_router import SmartExecutionRouter
+from src.execution.live_broker import BinanceLiveBroker
 from src.execution.monitor import ShadowMonitor
 from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.shadow_daemon import DEFAULT_SHADOW_SYMBOLS, ShadowTradingDaemon
 from src.execution.ws_manager import ResilientWebSocketClient
+from src.risk.kill_switch import EmergencyKillSwitch
 from src.risk.stepped_leverage import SteppedLeverageController
 from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.meta_allocator import MetaStrategyAllocator
@@ -49,6 +73,8 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Run the autonomous shadow trading daemon loop")
     parser.add_argument("--monitor", action="store_true", help="Launch the real-time Rich terminal telemetry dashboard")
     parser.add_argument("--once", action="store_true", help="Execute a single step across all cycles and print status")
+    parser.add_argument("--mainnet", action="store_true", help="Enable LIVE Mainnet execution on Binance USDS-M Futures")
+    parser.add_argument("--testnet", action="store_true", help="Enable Binance Futures Testnet execution")
     parser.add_argument("--capital", type=float, default=1000.0, help="Initial shadow portfolio capital in USDT (default: 1000.0)")
     parser.add_argument("--reset", action="store_true", help="Reset all previous database records before starting")
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})")
@@ -84,6 +110,9 @@ def main():
 
     args = parser.parse_args()
 
+    if (args.mainnet or args.testnet) and args.db == DEFAULT_DB_PATH:
+        args.db = str(Path(DEFAULT_DB_PATH).parent / "live_trading.db")
+
     symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS.copy()
     if args.enable_anomalies and args.legacy_allocator and not args.symbols:
         for extra in ["CTSI/USDT", "MAGIC/USDT", "OGN/USDT", "RLC/USDT"]:
@@ -98,16 +127,50 @@ def main():
         return
 
     # 2. Daemon Initialization
-    logger.info(f"Initializing Shadow Trading Database at {args.db}...")
+    logger.info(f"Initializing Trading Database at {args.db}...")
     db = ShadowDatabase(db_path=args.db)
     if args.reset:
         logger.info("Resetting all previous database records...")
         db.reset_all_data()
 
+    live_broker = None
+    if args.mainnet or args.testnet:
+        api_key = os.environ.get("BINANCE_API_KEY")
+        api_secret = os.environ.get("BINANCE_API_SECRET")
+        if args.mainnet and (not api_key or not api_secret):
+            logger.error("BINANCE_API_KEY and BINANCE_API_SECRET are required in .env or environment for --mainnet.")
+            sys.exit(1)
+        kill_switch = EmergencyKillSwitch(
+            max_24h_drawdown_pct=0.12,
+            max_net_exposure_pct=0.15,
+            max_margin_ratio=0.50,
+        )
+        live_broker = BinanceLiveBroker(
+            api_key=api_key,
+            api_secret=api_secret,
+            testnet=args.testnet,
+            dry_run=False,
+            initial_capital=args.capital,
+            max_gross_leverage=max(6.0, args.max_leverage * 1.25),
+            chase_interval_sec=1.5,
+            max_chase_iterations=2,
+            allow_taker_fallback=True,
+            kill_switch=kill_switch,
+        )
+        cfg = live_broker.ensure_account_configuration(
+            symbols=symbols,
+            target_leverage=max(3.0, args.start_leverage),
+        )
+        logger.info(
+            f"🟢 LIVE BINANCE FUTURES CONNECTED | Mode={cfg.get('position_mode')} | "
+            f"USDT Balance=${cfg.get('usdt_total_balance', 0.0):,.2f}"
+        )
+
     broker = ShadowExecutionBroker(
         database=db,
         initial_cash=args.capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
+        live_broker=live_broker,
     )
     router = SmartExecutionRouter(broker=broker)
     pairs_strategy = CointegratedPairsStrategy() if args.enable_pairs else None

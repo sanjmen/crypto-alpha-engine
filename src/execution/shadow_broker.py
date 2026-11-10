@@ -8,6 +8,7 @@ taker slippage, 8h funding cashflows, and local SQLite persistence.
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
@@ -46,6 +47,7 @@ class ShadowExecutionBroker(IExecutionClient):
         impact_model: NonLinearMarketImpactModel | None = None,
         capacity_ceiling: CapitalCapacityCeiling | None = None,
         enforce_capacity_ceiling: bool = False,
+        live_broker: Any | None = None,
     ):
         self.db = database or ShadowDatabase()
         self.taker_fee_pct = taker_fee_pct
@@ -58,6 +60,9 @@ class ShadowExecutionBroker(IExecutionClient):
         self.capacity_ceiling = capacity_ceiling or (impact_model.capacity_ceiling if impact_model else None)
         self.enforce_capacity_ceiling = enforce_capacity_ceiling
         self.symbol_microstructure: dict[str, dict] = {}
+        self.live_broker = live_broker
+        self._configured_live_symbols: set[str] = set()
+        self._current_live_leverage: int = 3
 
         # Restore from database or initialize fresh
         latest_acc = self.db.get_latest_account()
@@ -80,9 +85,157 @@ class ShadowExecutionBroker(IExecutionClient):
         self.market_bids: dict[str, float] = {}
         self.market_asks: dict[str, float] = {}
 
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=True)
+
         # If fresh db, record initial account snapshot
         if not latest_acc:
             self._record_account_snapshot()
+
+    @property
+    def is_live(self) -> bool:
+        """Returns True when backed by an active live Binance Futures execution broker."""
+        return bool(self.live_broker is not None and not getattr(self.live_broker, "dry_run", True))
+
+    def sync_from_live_exchange(self, sync_positions: bool = False) -> float:
+        """
+        Synchronizes local `self.portfolio.cash` (and optionally open positions) with the
+        real Binance USD-M Futures account (`walletBalance` & `positionRisk`).
+        """
+        if not self.is_live:
+            return self.portfolio.cash
+
+        try:
+            bal = self.live_broker.client.fetch_balance()
+            usdt_info = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+            wallet_bal = float(usdt_info.get("total") or usdt_info.get("free") or self.portfolio.cash)
+            raw_info = bal.get("info", {}) if isinstance(bal, dict) else {}
+            if isinstance(raw_info, dict) and isinstance(raw_info.get("assets"), list):
+                for a in raw_info["assets"]:
+                    if a.get("asset") == "USDT" and a.get("walletBalance") is not None:
+                        wallet_bal = float(a["walletBalance"])
+                        break
+            if wallet_bal > 0:
+                self.portfolio.cash = wallet_bal
+                self.live_broker.portfolio.cash = wallet_bal
+                if not self.portfolio.positions and abs(self.portfolio.initial_cash - 100_000.0) < 1e-6:
+                    self.portfolio.initial_cash = wallet_bal
+                self.peak_equity = max(self.peak_equity, self.portfolio.total_equity)
+                self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Live USDT balance sync note: {e}")
+
+        if sync_positions:
+            try:
+                ex_positions = self.live_broker.reconcile_positions_from_exchange()
+                for sym, ex_pos in ex_positions.items():
+                    local_pos = self.portfolio.positions.get(sym)
+                    if local_pos and local_pos.side == ex_pos.side and local_pos.quantity > 0:
+                        local_pos.quantity = ex_pos.quantity
+                        local_pos.entry_price = ex_pos.entry_price
+                        local_pos.current_price = ex_pos.current_price or ex_pos.entry_price
+                        self.db.save_position(local_pos)
+                    else:
+                        ex_pos.opened_at = datetime.now(timezone.utc)
+                        ex_pos.peak_price = ex_pos.entry_price
+                        ex_pos.strategy = (local_pos.strategy if local_pos and local_pos.strategy else "7-Factor Core")
+                        self.portfolio.positions[sym] = ex_pos
+                        self.db.save_position(ex_pos)
+
+                for sym, local_pos in list(self.portfolio.positions.items()):
+                    if local_pos.side != PositionSide.FLAT and local_pos.quantity > 0 and sym not in ex_positions:
+                        local_pos.quantity = 0.0
+                        local_pos.side = PositionSide.FLAT
+                        local_pos.take_profit = None
+                        local_pos.stop_loss = None
+                        local_pos.peak_price = 0.0
+                        self._cancel_bracket_orders(sym)
+                        self.db.save_position(local_pos)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Live position reconciliation note: {e}")
+
+        self._record_account_snapshot()
+        return self.portfolio.cash
+
+    def _route_to_live_exchange(
+        self,
+        order: Order,
+        fallback_price: float,
+        prefer_maker: bool,
+    ) -> tuple[float, float, bool]:
+        """
+        Routes a matched order to the real Binance USD-M Futures exchange via `self.live_broker`.
+        Returns `(filled_quantity, average_fill_price, was_maker_fill)`.
+        """
+        if not self.is_live:
+            return order.quantity, fallback_price, prefer_maker
+
+        symbol = order.symbol
+        if symbol not in self._configured_live_symbols:
+            try:
+                self.live_broker.client.set_margin_mode("cross", symbol)
+            except Exception:
+                pass
+            try:
+                self.live_broker.client.set_leverage(self._current_live_leverage, symbol)
+            except Exception:
+                pass
+            self._configured_live_symbols.add(symbol)
+
+        pos = self.portfolio.positions.get(symbol)
+        is_opposite = bool(
+            pos is not None
+            and pos.side != PositionSide.FLAT
+            and pos.quantity > 0
+            and (
+                (pos.side == PositionSide.LONG and order.side == OrderSide.SELL)
+                or (pos.side == PositionSide.SHORT and order.side == OrderSide.BUY)
+            )
+        )
+        reduce_only = bool(
+            order.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS)
+            or (is_opposite and order.quantity <= pos.quantity * 1.01)
+        )
+        target_qty = (
+            min(order.quantity, pos.quantity)
+            if (reduce_only and pos is not None and pos.quantity > 0)
+            else order.quantity
+        )
+        exec_qty = self.live_broker.quantize_amount(symbol, target_qty)
+        if exec_qty <= 0:
+            return 0.0, fallback_price, prefer_maker
+
+        self.live_broker.portfolio.cash = self.portfolio.cash
+        self.live_broker.portfolio.initial_cash = self.portfolio.initial_cash
+        self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
+        self.live_broker.max_gross_leverage = max(self.live_broker.max_gross_leverage, self.max_gross_leverage)
+
+        if prefer_maker:
+            prev_maker_cnt = self.live_broker.maker_fills_count
+            live_ord = self.live_broker.execute_maker_limit_chase(
+                symbol=symbol,
+                side=order.side,
+                quantity=exec_qty,
+                fallback_price=fallback_price,
+                reduce_only=reduce_only,
+            )
+            filled_q = float(live_ord.filled_quantity or exec_qty)
+            avg_px = float(live_ord.average_fill_price or fallback_price)
+            was_maker = self.live_broker.maker_fills_count > prev_maker_cnt
+            return filled_q, avg_px, was_maker
+
+        ccxt_side = "buy" if order.side == OrderSide.BUY else "sell"
+        params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
+        res = self.live_broker.client.create_order(
+            symbol=symbol,
+            type="market",
+            side=ccxt_side,
+            amount=exec_qty,
+            params=params,
+        )
+        filled_q = float(res.get("filled") or res.get("amount") or exec_qty)
+        avg_px = float(res.get("average") or res.get("price") or fallback_price)
+        return filled_q, avg_px, False
 
     def set_market_price(
         self,
@@ -305,6 +458,18 @@ class ShadowExecutionBroker(IExecutionClient):
     def _fill_taker_order(self, order: Order, fill_price: float) -> None:
         """Fills order as Taker and updates balance and position."""
         symbol = order.symbol
+        if self.is_live:
+            exec_qty, fill_price, _ = self._route_to_live_exchange(
+                order=order,
+                fallback_price=fill_price,
+                prefer_maker=False,
+            )
+            if exec_qty <= 0:
+                order.status = OrderStatus.CANCELED
+                self.db.update_order_status(order.id, OrderStatus.CANCELED)
+                return
+            order.quantity = exec_qty
+
         fee = fill_price * order.quantity * self.taker_fee_pct
 
         trade = Trade(
@@ -335,33 +500,52 @@ class ShadowExecutionBroker(IExecutionClient):
         )
         realized_pnl = self._update_portfolio_position(trade)
         self.db.save_trade(trade, is_maker=False, realized_pnl=realized_pnl, strategy=getattr(order, "strategy", None))
-        self._record_account_snapshot()
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=False)
+        else:
+            self._record_account_snapshot()
 
     def _evaluate_limit_order(self, order: Order) -> None:
         """
         Evaluates a passive Maker limit order against current book touch.
-        If current market already touches or crosses limit, fill immediately as Maker.
-        Otherwise leaves as PENDING in database to be filled on subsequent ticks.
+        If current market already touches or crosses limit (or live limit-chase is active),
+        fills via `_fill_maker_order`. Otherwise leaves as PENDING in database.
         """
         symbol = order.symbol
         limit_price = order.price or self.market_prices.get(symbol, 100.0)
 
-        should_fill = False
-        if order.side == OrderSide.BUY:
-            current_ask = self.market_asks.get(symbol, self.market_prices.get(symbol))
-            if current_ask is not None and current_ask <= limit_price:
-                should_fill = True
-        else:
-            current_bid = self.market_bids.get(symbol, self.market_prices.get(symbol))
-            if current_bid is not None and current_bid >= limit_price:
-                should_fill = True
+        should_fill = self.is_live
+        if not should_fill:
+            if order.side == OrderSide.BUY:
+                current_ask = self.market_asks.get(symbol, self.market_prices.get(symbol))
+                if current_ask is not None and current_ask <= limit_price:
+                    should_fill = True
+            else:
+                current_bid = self.market_bids.get(symbol, self.market_prices.get(symbol))
+                if current_bid is not None and current_bid >= limit_price:
+                    should_fill = True
 
         if should_fill:
             self._fill_maker_order(order, fill_price=limit_price)
 
     def _fill_maker_order(self, order: Order, fill_price: float) -> None:
         """Executes a passive Maker limit order with zero slippage and 0.02% fee."""
-        fee = fill_price * order.quantity * self.maker_fee_pct
+        is_maker_fill = True
+        if self.is_live:
+            exec_qty, fill_price, is_maker_fill = self._route_to_live_exchange(
+                order=order,
+                fallback_price=fill_price,
+                prefer_maker=True,
+            )
+            if exec_qty <= 0:
+                order.status = OrderStatus.CANCELED
+                self.db.update_order_status(order.id, OrderStatus.CANCELED)
+                return
+            order.quantity = exec_qty
+
+        fee_rate = self.maker_fee_pct if is_maker_fill else self.taker_fee_pct
+        role_label = "MAKER" if is_maker_fill else "TAKER"
+        fee = fill_price * order.quantity * fee_rate
 
         trade = Trade(
             id=f"shd_trd_{uuid.uuid4().hex[:10]}",
@@ -385,11 +569,19 @@ class ShadowExecutionBroker(IExecutionClient):
             filled_quantity=order.quantity,
             average_fill_price=fill_price,
             fee=fee,
-            role="MAKER",
+            role=role_label,
         )
         realized_pnl = self._update_portfolio_position(trade)
-        self.db.save_trade(trade, is_maker=True, realized_pnl=realized_pnl, strategy=getattr(order, "strategy", None))
-        self._record_account_snapshot()
+        self.db.save_trade(
+            trade,
+            is_maker=is_maker_fill,
+            realized_pnl=realized_pnl,
+            strategy=getattr(order, "strategy", None),
+        )
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=False)
+        else:
+            self._record_account_snapshot()
 
     def create_bracket_orders(
         self,
@@ -563,6 +755,18 @@ class ShadowExecutionBroker(IExecutionClient):
         else:
             cashflow = notional * funding_rate
             side_str = "SHORT"
+
+        if self.is_live:
+            self.db.record_funding_settlement(
+                symbol=symbol,
+                funding_rate=funding_rate,
+                position_side=side_str,
+                position_notional=notional,
+                cashflow_credited=cashflow,
+                timestamp=timestamp,
+            )
+            self.sync_from_live_exchange(sync_positions=False)
+            return cashflow
 
         self.portfolio.cash += cashflow
 

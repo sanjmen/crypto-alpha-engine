@@ -652,6 +652,116 @@ def test_m13_wave3_issue_48_and_49_true_taker_cvd_and_basis_alpha():
     assert sum(abs(v) for v in res_combo.unit_weights.values()) > 0.0
 
 
+def test_binance_live_broker_account_config_and_smoke_test():
+    """Tests Binance Futures API auto-configuration (One-Way Mode, CROSSED Margin, Leverage) and 5-stage Smoke Test."""
+    broker = BinanceLiveBroker(
+        dry_run=False,
+        testnet=True,
+        initial_capital=1000.0,
+        chase_interval_sec=0.0,
+    )
+    mock_client = MagicMock()
+    # Simulate account initially in Hedge Mode -> auto-switched to One-Way Mode
+    mock_client.fetch_position_mode.side_effect = [
+        {"hedged": True},
+        {"hedged": False},
+    ]
+    mock_client.fapiPrivateGetMultiAssetsMargin.return_value = {"multiAssetsMargin": False}
+    mock_client.set_margin_mode.return_value = {"code": 200, "msg": "success"}
+    mock_client.set_leverage.return_value = {"leverage": 3, "maxNotionalValue": "1000000", "symbol": "DOGEUSDT"}
+    mock_client.fetch_balance.return_value = {"USDT": {"free": 999.99, "total": 999.99}}
+    mock_client.fetch_ticker.return_value = {"last": 0.20, "bid": 0.1999, "ask": 0.2001}
+
+    # Stage 3 resting GTX order -> Stage 4 open GTX order -> Stage 5 reduceOnly market close
+    mock_client.create_order.side_effect = [
+        {"id": "ord_rest_101", "status": "open"},
+        {"id": "ord_open_102", "status": "closed", "filled": 35.0, "average": 0.1999},
+        {"id": "ord_close_103", "status": "closed", "filled": 35.0, "average": 0.2000},
+    ]
+    mock_client.fetch_order.return_value = {"id": "ord_open_102", "status": "closed", "filled": 35.0, "average": 0.1999}
+    mock_client.fetch_positions.side_effect = [
+        [{"symbol": "DOGE/USDT:USDT", "contracts": 35.0, "side": "long", "entryPrice": 0.1999, "markPrice": 0.2000}],
+        [],
+    ]
+    broker.client = mock_client
+
+    res = broker.run_production_smoke_test(symbol="DOGE/USDT", notional_usd=6.0, leverage=3)
+
+    assert res["status"] == "PASSED"
+    assert res["configuration"]["position_mode"] == "ONE_WAY"
+    assert res["configuration"]["dual_side_position"] is False
+    assert res["configuration"]["margin_modes"]["DOGE/USDT"] == "CROSSED"
+    assert res["configuration"]["leverages"]["DOGE/USDT"] == 3
+    assert res["gtx_post_and_cancel_ok"] is True
+    assert res["position_verified_on_exchange"] is True
+    assert res["final_flat_verified"] is True
+    mock_client.set_position_mode.assert_called_once_with(False)
+    mock_client.set_margin_mode.assert_called_once_with("cross", "DOGE/USDT")
+    mock_client.set_leverage.assert_called_once_with(3, "DOGE/USDT")
+    mock_client.cancel_order.assert_called_once_with("ord_rest_101", "DOGE/USDT")
+
+
+def test_shadow_broker_live_mainnet_bridge():
+    """Tests ShadowExecutionBroker(live_broker=...) routing orders to live Binance Futures & syncing DB."""
+    from src.domain.enums import OrderSide, OrderType
+
+    live_broker = BinanceLiveBroker(
+        dry_run=False,
+        testnet=True,
+        initial_capital=1000.0,
+        chase_interval_sec=0.0,
+    )
+    mock_client = MagicMock()
+    mock_client.fetch_balance.return_value = {
+        "USDT": {"free": 1000.0, "total": 1000.0},
+        "info": {"assets": [{"asset": "USDT", "walletBalance": "1000.0", "availableBalance": "1000.0"}]},
+    }
+    mock_client.fetch_positions.return_value = []
+    mock_client.fetch_ticker.return_value = {"last": 150.0, "bid": 149.9, "ask": 150.1}
+    mock_client.create_order.side_effect = [
+        {"id": "live_buy_1", "status": "closed", "filled": 1.0, "average": 149.9},
+        {"id": "live_sl_2", "status": "closed", "filled": 1.0, "average": 145.0},
+    ]
+    mock_client.fetch_order.return_value = {"id": "live_buy_1", "status": "closed", "filled": 1.0, "average": 149.9}
+    live_broker.client = mock_client
+
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(
+        database=db,
+        initial_cash=1000.0,
+        max_gross_leverage=6.0,
+        live_broker=live_broker,
+    )
+    assert broker.is_live is True
+    broker.set_market_price("SOL/USDT", price=150.0, bid=149.9, ask=150.1)
+
+    # 1. Submit LIMIT BUY order -> routed via live execute_maker_limit_chase
+    ord_open = broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=1.0,
+        price=149.9,
+        strategy="7-Factor Core",
+    )
+    assert ord_open.filled_quantity == 1.0
+    assert ord_open.average_fill_price == 149.9
+    assert "SOL/USDT" in broker.portfolio.positions
+    assert broker.portfolio.positions["SOL/USDT"].quantity == 1.0
+
+    # 2. Attach Stop-Loss bracket & trigger it via check_pending_orders -> routed with reduceOnly=True
+    broker.create_bracket_orders("SOL/USDT", take_profit=162.0, stop_loss=145.0)
+    filled = broker.check_pending_orders({"SOL/USDT": {"price": 144.5, "bid": 144.4, "ask": 144.6}})
+    assert len(filled) == 1
+    assert broker.portfolio.positions["SOL/USDT"].quantity == 0.0
+    assert mock_client.create_order.call_count == 2
+    _, kwargs_close = mock_client.create_order.call_args
+    assert kwargs_close["params"].get("reduceOnly") is True
+    db.close()
+
+
+
+
 
 
 
