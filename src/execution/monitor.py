@@ -155,13 +155,19 @@ class ShadowMonitor:
         regime_color = "green" if regime_str == "TRENDING" else ("yellow" if regime_str == "RANGING" else "red")
 
         header_text = Text()
-        is_live_prod = "live_trading" in str(getattr(self, "db_path", ""))
+        db_path_str = str(getattr(self, "db_path", ""))
+        is_live_prod = "live_trading" in db_path_str
+        is_testnet = "testnet_trading" in db_path_str
         # Row 1: Market & Engine Status
-        header_text.append(" MERCADO: ", style="bold white on green" if is_live_prod else "bold white on blue")
         if is_live_prod:
+            header_text.append(" MERCADO: ", style="bold white on green")
             header_text.append(" 🟢 PRODUCCIÓN EN VIVO — Binance USDS-M Futures (Capital Real)  |  ", style="bold green")
+        elif is_testnet:
+            header_text.append(" MERCADO: ", style="bold black on yellow")
+            header_text.append(" 🟡 BINANCE FUTURES TESTNET — Entorno de Pruebas API  |  ", style="bold yellow")
         else:
-            header_text.append(" Binance Futures Mainnet (Solo Lectura - 0 Riesgo de Capital)  |  ", style="cyan")
+            header_text.append(" MERCADO: ", style="bold white on blue")
+            header_text.append(" 🔵 SHADOW LAB — Binance Futures Mainnet (Solo Lectura - 0 Riesgo de Capital)  |  ", style="cyan")
 
         if heartbeat:
             ws_state = heartbeat.get("ws_state", "CONNECTED")
@@ -245,11 +251,12 @@ class ShadowMonitor:
             header_text.append(f"HWM: ${hwm_val:,.2f} → Meta {nxt_tier:.1f}x: ${nxt_hwm:,.2f} [{prog_pct:.1f}%]  |  ", style="bold yellow")
             header_text.append(f"Net $: ${net_usd:+,.2f}  |  Beta BTC: {p_beta:+.3f}", style="bold green")
 
-        panel_title = (
-            "[bold green]CRYPTO-ALPHA-ENGINE: LIVE PRODUCTION TRADING (7-FACTOR CAUSAL ENGINE)[/bold green]"
-            if is_live_prod
-            else "[bold cyan]CRYPTO-ALPHA-ENGINE: LIVE SHADOW TRADING (7-FACTOR CAUSAL ENGINE)[/bold cyan]"
-        )
+        if is_live_prod:
+            panel_title = "[bold green]CRYPTO-ALPHA-ENGINE: LIVE PRODUCTION TRADING (7-FACTOR CAUSAL ENGINE)[/bold green]"
+        elif is_testnet:
+            panel_title = "[bold yellow]CRYPTO-ALPHA-ENGINE: TESTNET TRADING LAB (7-FACTOR CAUSAL ENGINE)[/bold yellow]"
+        else:
+            panel_title = "[bold cyan]CRYPTO-ALPHA-ENGINE: LIVE SHADOW TRADING (7-FACTOR CAUSAL ENGINE)[/bold cyan]"
         layout["header"].update(Panel(header_text, title=panel_title))
 
         # 2. Left Column: Positions Table

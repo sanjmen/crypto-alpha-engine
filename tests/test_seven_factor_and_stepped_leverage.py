@@ -760,6 +760,49 @@ def test_shadow_broker_live_mainnet_bridge():
     db.close()
 
 
+def test_unified_trading_launcher_mode_and_db_isolation():
+    """Tests Issue #51 (Issue-0): Multi-mode resolution & DB isolation across Shadow, Testnet, and Mainnet."""
+    from scripts.run_trading import build_parser, resolve_mode_config
+
+    parser = build_parser()
+    fake_env = {
+        "BINANCE_API_KEY": "prod_key",
+        "BINANCE_API_SECRET": "prod_secret",
+        "BINANCE_TESTNET_API_KEY": "test_key",
+        "BINANCE_TESTNET_API_SECRET": "test_secret",
+    }
+
+    # 1. Default / --shadow mode -> shadow_trading.db, no live keys
+    args_shd = parser.parse_args(["--daemon", "--shadow"])
+    cfg_shd = resolve_mode_config(args_shd, environ=fake_env)
+    assert cfg_shd["mode"] == "shadow"
+    assert cfg_shd["db_path"].endswith("shadow_trading.db")
+    assert cfg_shd["is_live"] is False
+    assert cfg_shd["api_key"] is None
+
+    # 2. --testnet mode -> testnet_trading.db, testnet keys
+    args_tst = parser.parse_args(["--daemon", "--testnet"])
+    cfg_tst = resolve_mode_config(args_tst, environ=fake_env)
+    assert cfg_tst["mode"] == "testnet"
+    assert cfg_tst["db_path"].endswith("testnet_trading.db")
+    assert cfg_tst["is_live"] is True
+    assert cfg_tst["is_testnet"] is True
+    assert cfg_tst["api_key"] == "test_key"
+
+    # 3. --mainnet mode -> live_trading.db, prod keys
+    args_mn = parser.parse_args(["--daemon", "--mainnet"])
+    cfg_mn = resolve_mode_config(args_mn, environ=fake_env)
+    assert cfg_mn["mode"] == "mainnet"
+    assert cfg_mn["db_path"].endswith("live_trading.db")
+    assert cfg_mn["is_live"] is True
+    assert cfg_mn["is_testnet"] is False
+    assert cfg_mn["api_key"] == "prod_key"
+
+    # Ensure all three DB paths are strictly distinct for parallel execution
+    assert len({cfg_shd["db_path"], cfg_tst["db_path"], cfg_mn["db_path"]}) == 3
+
+
+
 
 
 

@@ -73,8 +73,9 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Run the autonomous shadow trading daemon loop")
     parser.add_argument("--monitor", action="store_true", help="Launch the real-time Rich terminal telemetry dashboard")
     parser.add_argument("--once", action="store_true", help="Execute a single step across all cycles and print status")
-    parser.add_argument("--mainnet", action="store_true", help="Enable LIVE Mainnet execution on Binance USDS-M Futures")
-    parser.add_argument("--testnet", action="store_true", help="Enable Binance Futures Testnet execution")
+    parser.add_argument("--shadow", action="store_true", help="Run in local Shadow Lab mode (data/shadow_trading.db, 0 capital risk)")
+    parser.add_argument("--mainnet", action="store_true", help="Enable LIVE Mainnet execution on Binance USDS-M Futures (data/live_trading.db)")
+    parser.add_argument("--testnet", action="store_true", help="Enable Binance Futures Testnet execution (data/testnet_trading.db)")
     parser.add_argument("--capital", type=float, default=1000.0, help="Initial shadow portfolio capital in USDT (default: 1000.0)")
     parser.add_argument("--reset", action="store_true", help="Reset all previous database records before starting")
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})")
@@ -110,8 +111,10 @@ def main():
 
     args = parser.parse_args()
 
-    if (args.mainnet or args.testnet) and args.db == DEFAULT_DB_PATH:
+    if args.mainnet and args.db == DEFAULT_DB_PATH:
         args.db = str(Path(DEFAULT_DB_PATH).parent / "live_trading.db")
+    elif args.testnet and args.db == DEFAULT_DB_PATH:
+        args.db = str(Path(DEFAULT_DB_PATH).parent / "testnet_trading.db")
 
     symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS.copy()
     if args.enable_anomalies and args.legacy_allocator and not args.symbols:
