@@ -974,10 +974,10 @@ class ShadowDatabase:
                     next_tier_leverage = excluded.next_tier_leverage,
                     next_tier_hwm_target = excluded.next_tier_hwm_target,
                     progress_to_next_tier_pct = excluded.progress_to_next_tier_pct,
-                    portfolio_beta = excluded.portfolio_beta,
-                    conviction = excluded.conviction,
-                    factor_weights_json = excluded.factor_weights_json,
-                    factor_tstats_json = excluded.factor_tstats_json;
+                    portfolio_beta = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.portfolio_beta ELSE excluded.portfolio_beta END,
+                    conviction = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.conviction ELSE excluded.conviction END,
+                    factor_weights_json = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.factor_weights_json ELSE excluded.factor_weights_json END,
+                    factor_tstats_json = CASE WHEN excluded.factor_tstats_json = '{}' THEN seven_factor_telemetry.factor_tstats_json ELSE excluded.factor_tstats_json END;
                 """,
                 (
                     ts,

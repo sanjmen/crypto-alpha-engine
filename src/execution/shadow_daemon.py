@@ -854,7 +854,12 @@ class ShadowTradingDaemon:
             lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
             sf_res = getattr(self.allocator, "last_seven_factor_result", None)
             if lev_ctrl and hasattr(db, "save_seven_factor_telemetry"):
-                v_sc = sf_res.vol_scalar if sf_res else 1.0
+                prev_tel = (
+                    db.get_latest_seven_factor_telemetry()
+                    if (sf_res is None and hasattr(db, "get_latest_seven_factor_telemetry"))
+                    else None
+                ) or {}
+                v_sc = sf_res.vol_scalar if sf_res else float(prev_tel.get("vol_scalar", 1.0))
                 snap = lev_ctrl.update_state(current_equity=portfolio.total_equity, vol_scalar=v_sc)
                 self.allocator.last_leverage_snapshot = snap
                 db.save_seven_factor_telemetry(
@@ -869,10 +874,10 @@ class ShadowTradingDaemon:
                     next_tier_leverage=snap.next_tier_leverage,
                     next_tier_hwm_target=snap.next_tier_hwm_target,
                     progress_to_next_tier_pct=snap.progress_to_next_tier_pct,
-                    portfolio_beta=sf_res.portfolio_beta if sf_res else 0.0,
-                    conviction=sf_res.conviction if sf_res else 1.0,
-                    factor_weights=sf_res.factor_weights if sf_res else {},
-                    factor_tstats=sf_res.factor_tstats if sf_res else {},
+                    portfolio_beta=sf_res.portfolio_beta if sf_res else float(prev_tel.get("portfolio_beta", 0.0)),
+                    conviction=sf_res.conviction if sf_res else float(prev_tel.get("conviction", 1.0)),
+                    factor_weights=sf_res.factor_weights if sf_res else dict(prev_tel.get("factor_weights") or {}),
+                    factor_tstats=sf_res.factor_tstats if sf_res else dict(prev_tel.get("factor_tstats") or {}),
                 )
 
         return portfolio, filled_orders
