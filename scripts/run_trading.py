@@ -153,6 +153,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-leverage", type=float, default=5.0, help="Maximum stepped gross leverage tier (default: 5.0x)")
     parser.add_argument("--step-leverage", type=float, default=0.5, help="Leverage increment per HWM milestone (default: 0.5x)")
     parser.add_argument("--milestone-gain", type=float, default=0.15, help="HWM compound gain required per +0.5x step (default: 0.15 = +15%%)")
+    parser.add_argument("--dd-bracket", type=float, default=0.10, help="Drawdown bracket for SteppedLeverageController de-stepping (default: 0.10)")
+    parser.add_argument(
+        "--market-neutral-3x",
+        action="store_true",
+        help="Lever #3 preset: Start at 3.0x Market-Neutral base leverage with tighter 6%% DD de-step bracket",
+    )
+    parser.add_argument("--f6-min-tstat", type=float, default=0.75, help="Lever #1: Minimum t-stat required to activate F6_Liq_Surge (default: 0.75)")
+    parser.add_argument("--anomaly-pct-equity", type=float, default=0.045, help="Lever #2: Max anomaly notional as fraction of total equity (default: 0.045 = 4.5%%)")
+    parser.add_argument(
+        "--anomaly-prefer-maker",
+        dest="anomaly_prefer_maker",
+        action="store_true",
+        default=True,
+        help="Lever #2: Execute Anomaly entries via Post-Only (GTX) Maker Limit-Chase (ENABLED by default)",
+    )
+    parser.add_argument(
+        "--anomaly-taker-only",
+        dest="anomaly_prefer_maker",
+        action="store_false",
+        help="Disable Maker Limit-Chase on Anomaly entries and use Market orders",
+    )
+    parser.add_argument("--max-single-clip-usd", type=float, default=10000.0, help="Lever #4: Max single child clip USD before automatic order chunking (default: 10000.0)")
     parser.add_argument("--legacy-allocator", action="store_true", help="Use legacy 3-strategy allocator instead of the 7-Factor Causal Online Engine")
     parser.add_argument(
         "--enable-anomalies",
@@ -257,24 +279,35 @@ def main() -> None:
         logger.info(f"Resetting database records in {db_path}...")
         db.reset_all_data()
 
+    start_lev = 3.0 if getattr(args, "market_neutral_3x", False) and args.start_leverage == 2.5 else args.start_leverage
+    dd_bracket_val = 0.06 if getattr(args, "market_neutral_3x", False) and args.dd_bracket == 0.10 else args.dd_bracket
+
     broker = ShadowExecutionBroker(
         database=db,
         initial_cash=args.capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         live_broker=live_broker,
     )
-    router = SmartExecutionRouter(broker=broker)
+    router = SmartExecutionRouter(
+        broker=broker,
+        enable_auto_chunking=True,
+        max_single_clip_usd=args.max_single_clip_usd,
+    )
     pairs_strategy = CointegratedPairsStrategy() if args.enable_pairs else None
     use_seven_factor = not args.legacy_allocator
-    seven_factor_engine = SevenFactorOnlineEngine() if use_seven_factor else None
+    seven_factor_engine = (
+        SevenFactorOnlineEngine(f6_min_tstat=args.f6_min_tstat)
+        if use_seven_factor
+        else None
+    )
     stepped_leverage_ctrl = (
         SteppedLeverageController(
             initial_capital=args.capital,
-            start_leverage=args.start_leverage,
+            start_leverage=start_lev,
             max_leverage=args.max_leverage,
             step_leverage=args.step_leverage,
             gain_per_step=args.milestone_gain,
-            dd_bracket=0.10,
+            dd_bracket=dd_bracket_val,
         )
         if use_seven_factor
         else None
@@ -283,8 +316,9 @@ def main() -> None:
     if use_seven_factor:
         logger.info(
             f"7-Factor Causal Online Engine ENABLED [{mode.upper()}] | Stepped Leverage: "
-            f"{args.start_leverage:.1f}x -> {args.max_leverage:.1f}x "
-            f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM)"
+            f"{start_lev:.1f}x -> {args.max_leverage:.1f}x "
+            f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM | "
+            f"F6 Gate t>={args.f6_min_tstat:.2f})"
         )
 
     if args.enable_anomalies:
@@ -337,6 +371,8 @@ def main() -> None:
         enable_market_scan=True,
         enable_anomalies=args.enable_anomalies,
         anomaly_size=args.anomaly_size,
+        anomaly_pct_equity=args.anomaly_pct_equity,
+        anomaly_prefer_maker=args.anomaly_prefer_maker,
         profit_lock_trigger_pct=args.profit_lock_trigger,
         profit_lock_level_pct=args.profit_lock_level,
         trailing_trigger_pct=args.trailing_trigger,

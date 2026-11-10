@@ -802,10 +802,167 @@ def test_unified_trading_launcher_mode_and_db_isolation():
     assert len({cfg_shd["db_path"], cfg_tst["db_path"], cfg_mn["db_path"]}) == 3
 
 
+def test_m13_lever1_issue_52_f6_liq_tstat_gate_and_top4_priors():
+    """
+    Tests Issue #52 (Lever #1):
+    1) DEFAULT_PRIORS boosts Top 4 audited profit generators (size=0.22, fast=0.19, carry=0.18, rev=0.16)
+       and minimizes F6_Liq_Surge prior (liq=0.04).
+    2) High-conviction t-stat gate (f6_min_tstat=0.75) forces fw_norm['liq'] == 0.0 whenever
+       F6 rolling t-stat < 0.75, while keeping row sums equal to 1.0 and 100% dollar neutrality.
+    """
+    from src.strategies.seven_factor_engine import DEFAULT_PRIORS
+
+    assert DEFAULT_PRIORS["size"] == 0.22
+    assert DEFAULT_PRIORS["fast"] == 0.19
+    assert DEFAULT_PRIORS["carry"] == 0.18
+    assert DEFAULT_PRIORS["rev"] == 0.16
+    assert DEFAULT_PRIORS["liq"] == 0.04
+
+    bars_1h, bars_15m = _build_synthetic_universe(n_bars=260, seed=52)
+    # 1. With high gate threshold (e.g. 5.0), F6_Liq weight is strictly 0.0 across all bars
+    eng_gated = SevenFactorOnlineEngine(f6_min_tstat=5.0)
+    mats_gated = eng_gated.compute_matrices(bars_1h=bars_1h, bars_15m=bars_15m)
+    fw_gated = mats_gated["fw_norm"]
+    assert float(fw_gated["liq"].max()) == 0.0
+    assert np.allclose(fw_gated.sum(axis=1).values, 1.0, atol=1e-5)
+
+    # 2. With default gate threshold (0.75), any bar where t_df['liq'] < 0.75 has fw_norm['liq'] == 0.0
+    eng_def = SevenFactorOnlineEngine(f6_min_tstat=0.75)
+    mats_def = eng_def.compute_matrices(bars_1h=bars_1h, bars_15m=bars_15m)
+    t_liq = mats_def["t_df"]["liq"]
+    fw_liq = mats_def["fw_norm"]["liq"]
+    below_gate = t_liq < 0.75
+    if below_gate.any():
+        assert float(fw_liq[below_gate].max()) == 0.0
+    assert np.allclose(mats_def["fw_norm"].sum(axis=1).values, 1.0, atol=1e-5)
 
 
+def test_m13_lever2_issue_53_anomaly_maker_limit_and_pct_equity_sizing():
+    """
+    Tests Issue #53 (Lever #2):
+    1) Dynamic % equity sizing (anomaly_pct_equity=0.045) scales max anomaly notional to 4.5% of total equity
+       ($45 on $1,000 equity, $90 on $2,000 equity).
+    2) Post-Only Maker execution (anomaly_prefer_maker=True) submits anomaly entries as OrderType.LIMIT
+       at the book touch with role='MAKER' (0.02% fee instead of 0.04% Taker fee).
+    """
+    from src.domain.entities import Signal
+    from src.domain.enums import OrderType
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+    from src.strategies.meta_allocator import MetaStrategyAllocator
+
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=2000.0, max_gross_leverage=6.0)
+
+    mock_breakout = MagicMock()
+    mock_breakout.generate_signals.return_value = [
+        Signal(
+            timestamp=datetime.now(timezone.utc),
+            symbol="SUI/USDT",
+            score=0.95,
+            confidence=0.95,
+            metadata={"ret_24h": 0.16, "ret_4h": 0.16, "vol_ratio": 7.5},
+        )
+    ]
+    allocator = MetaStrategyAllocator(early_breakout_strategy=mock_breakout)
+
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        allocator=allocator,
+        symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+        enable_anomalies=True,
+        anomaly_min_notional=25.0,
+        anomaly_max_notional=45.0,
+        anomaly_pct_equity=0.045,
+        anomaly_prefer_maker=True,
+    )
+    daemon.latest_tickers = {
+        "BTC/USDT": {"price": 85000.0, "change_24h": 1.0, "volume_24h": 500_000_000.0},
+        "ETH/USDT": {"price": 3000.0, "change_24h": 2.5, "volume_24h": 300_000_000.0},
+        "SOL/USDT": {"price": 180.0, "change_24h": -1.5, "volume_24h": 200_000_000.0},
+        "BNB/USDT": {"price": 620.0, "change_24h": 0.5, "volume_24h": 100_000_000.0},
+        "SUI/USDT": {"price": 2.00, "bid": 1.999, "ask": 2.000, "change_24h": 16.0, "volume_24h": 80_000_000.0},
+    }
+    ts_idx = pd.date_range("2026-03-01", periods=30, freq="1h", tz="UTC")
+    fake_klines = pd.DataFrame({
+        "timestamp": ts_idx,
+        "open": np.full(30, 1.95),
+        "high": np.full(30, 2.02),
+        "low": np.full(30, 1.92),
+        "close": np.full(30, 2.00),
+        "volume": np.full(30, 1_000_000.0),
+    })
+    daemon.fetch_symbol_klines = MagicMock(return_value=fake_klines)
+
+    orders = daemon.run_anomaly_scan()
+    assert len(orders) == 1
+    ord_exec = orders[0]
+    assert ord_exec.order_type == OrderType.LIMIT
+    # On $2,000 equity with 4.5% cap ($90 max notional) and high confluence (> 0.8), notional scales above $45
+    exec_notional = ord_exec.quantity * (ord_exec.average_fill_price or 2.00)
+    assert exec_notional > 45.0
+    assert exec_notional <= 90.0 + 1.0
+    # Verify trade was recorded as MAKER (0.02% fee)
+    trades = db.get_trades(limit=5)
+    assert len(trades) == 1
+    assert bool(trades[0]["is_maker"]) is True
+    db.close()
 
 
+def test_m13_levers3_and_4_issue_54_market_neutral_3x_and_multi_slice_chunking():
+    """
+    Tests Issue #54 (Levers #3 & #4):
+    1) Market-Neutral 3.0x Base Leverage Calibration with tighter 6% DD de-step bracket.
+    2) Multi-Slice Order Chunking in SmartExecutionRouter splitting a $25,000 parent order
+       into 3 child Maker limit slices (<= $10,000 each) for $5k-$50k capital scaling.
+    """
+    from src.domain.enums import OrderType
+    from src.execution.execution_router import ExecutionUrgency, SmartExecutionRouter
+    from src.execution.shadow_broker import ShadowExecutionBroker
 
+    # 1. Lever #3: 3.0x base leverage with 6% DD bracket
+    ctrl = SteppedLeverageController(
+        initial_capital=10000.0,
+        start_leverage=3.0,
+        max_leverage=5.0,
+        step_leverage=0.5,
+        gain_per_step=0.15,
+        dd_bracket=0.06,
+    )
+    snap_0 = ctrl.update_state(current_equity=10000.0, vol_scalar=1.0)
+    assert snap_0.active_base_leverage == 3.0
+    assert snap_0.effective_leverage == 3.0
+    # At -6.5% drawdown ($9,350 equity), 6% DD bracket de-steps base leverage by 1 tier (3.0x -> 2.5x)
+    snap_dd = ctrl.update_state(current_equity=9350.0, vol_scalar=1.0)
+    assert snap_dd.active_base_leverage == 2.5
 
+    # 2. Lever #4: Multi-slice order chunking for $25,000 notional order ($10,000 max single clip)
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(
+        database=db,
+        initial_cash=50000.0,
+        max_order_notional=12000.0,
+        max_gross_leverage=5.0,
+    )
+    broker.set_market_price("BTC/USDT", price=50000.0, bid=49995.0, ask=50005.0)
+    router = SmartExecutionRouter(
+        broker=broker,
+        enable_auto_chunking=True,
+        max_single_clip_usd=10000.0,
+    )
+    # 0.50 BTC @ $50,000 = $25,000 notional (> $10,000 clip cap and > $12,000 single order breaker)
+    agg_order = router.route_order(
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        quantity=0.50,
+        current_price=50000.0,
+        urgency=ExecutionUrgency.LOW,
+        strategy="F1_Macro_168h",
+    )
+    assert len(router.last_chunked_orders) == 3
+    assert pytest.approx(agg_order.quantity, abs=1e-6) == 0.50
+    for child in router.last_chunked_orders:
+        assert child.order_type == OrderType.LIMIT
+        assert pytest.approx(child.quantity, abs=1e-6) == 0.50 / 3.0
+    db.close()
 

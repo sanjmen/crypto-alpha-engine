@@ -44,13 +44,13 @@ FACTOR_LABELS: Dict[str, str] = {
 }
 
 DEFAULT_PRIORS: Dict[str, float] = {
-    "macro": 0.30,
-    "med": 0.15,
-    "fast": 0.15,
-    "rev": 0.10,
-    "carry": 0.15,
-    "liq": 0.10,
-    "size": 0.15,
+    "macro": 0.25,
+    "med": 0.14,
+    "fast": 0.19,
+    "rev": 0.16,
+    "carry": 0.18,
+    "liq": 0.04,
+    "size": 0.22,
 }
 
 ALT_SECTOR_CLUSTERS: Dict[str, Tuple[str, ...]] = {
@@ -221,6 +221,8 @@ class SevenFactorOnlineEngine:
         trend_waterfill_cap: Optional[float] = 0.30,
         trend_waterfill_threshold: float = 0.20,
         alt_cluster_cap: Optional[float] = 0.48,
+        f6_min_tstat: Optional[float] = 0.75,
+        min_tstat_by_factor: Optional[Dict[str, float]] = None,
     ) -> None:
         self.lookbacks = lookbacks
         self.priors = pd.Series(priors or DEFAULT_PRIORS)
@@ -233,6 +235,10 @@ class SevenFactorOnlineEngine:
         self.trend_waterfill_cap = trend_waterfill_cap
         self.trend_waterfill_threshold = trend_waterfill_threshold
         self.alt_cluster_cap = alt_cluster_cap
+        self.f6_min_tstat = f6_min_tstat
+        self.min_tstat_by_factor: Dict[str, float] = dict(min_tstat_by_factor or {})
+        if f6_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
+            self.min_tstat_by_factor["liq"] = float(f6_min_tstat)
 
     @staticmethod
     def _find_btc_column(columns: List[str]) -> Optional[str]:
@@ -696,12 +702,44 @@ class SevenFactorOnlineEngine:
 
         priors_aligned = self.priors.reindex(t_df.columns).fillna(0.10)
         raw_fw = np.maximum(0.0, t_df.add(priors_aligned, axis=1)) ** 2.0
+
+        # Lever #1 (Issue #52): High-Conviction t-stat Activation Gate on F6_Liq_Surge (t_stat >= +0.75)
+        for f_name, min_t in self.min_tstat_by_factor.items():
+            if f_name in raw_fw.columns and min_t is not None:
+                gate_mask = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
+                raw_fw[f_name] = raw_fw[f_name].where(gate_mask, 0.0)
+
         if "rev" in raw_fw.columns:
             raw_fw["rev"] = raw_fw["rev"].ewm(span=12, min_periods=1).mean()
         if "liq" in raw_fw.columns:
             raw_fw["liq"] = raw_fw["liq"].ewm(span=16, min_periods=1).mean()
         if "size" in raw_fw.columns:
             raw_fw["size"] = raw_fw["size"].ewm(span=6, min_periods=1).mean()
+
+        for f_name, min_t in self.min_tstat_by_factor.items():
+            if f_name in raw_fw.columns and min_t is not None:
+                gate_mask = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
+                raw_fw[f_name] = raw_fw[f_name].where(gate_mask, 0.0)
+
+        # Fallback to un-gated priors if all factors are simultaneously gated to 0 on a bar
+        zero_rows = raw_fw.sum(axis=1) <= 1e-12
+        if zero_rows.any():
+            fallback_fw = pd.DataFrame(
+                np.tile((priors_aligned.values ** 2.0), (int(zero_rows.sum()), 1)),
+                index=raw_fw.index[zero_rows],
+                columns=raw_fw.columns,
+            )
+            for f_name, min_t in self.min_tstat_by_factor.items():
+                if f_name in fallback_fw.columns and min_t is not None:
+                    fallback_fw[f_name] = 0.0
+            if (fallback_fw.sum(axis=1) <= 1e-12).any():
+                fallback_fw = pd.DataFrame(
+                    np.tile((priors_aligned.values ** 2.0), (int(zero_rows.sum()), 1)),
+                    index=raw_fw.index[zero_rows],
+                    columns=raw_fw.columns,
+                )
+            raw_fw.loc[zero_rows] = fallback_fw
+
         fw_sum = raw_fw.sum(axis=1).replace(0, 1e-8)
         fw_norm = raw_fw.div(fw_sum, axis=0)
 

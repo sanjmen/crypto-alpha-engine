@@ -36,12 +36,17 @@ class SmartExecutionRouter:
         maker_fee_pct: float = 0.0002,     # 0.02% maker
         taker_fee_pct: float = 0.0004,     # 0.04% taker
         tick_offset_bps: float = 0.5,      # 0.5 bp offset into book
+        enable_auto_chunking: bool = True,
+        max_single_clip_usd: float = 10_000.0,
     ):
         self.broker = broker
         self.default_urgency = default_urgency
         self.maker_fee_pct = maker_fee_pct
         self.taker_fee_pct = taker_fee_pct
         self.tick_offset = tick_offset_bps / 10_000.0
+        self.enable_auto_chunking = enable_auto_chunking
+        self.max_single_clip_usd = max_single_clip_usd
+        self.last_chunked_orders: list[Order] = []
 
     @staticmethod
     def compute_order_book_imbalance(
@@ -66,6 +71,105 @@ class SmartExecutionRouter:
             return 0.0
         return float(np.clip((v_bid - v_ask) / tot, -1.0, 1.0))
 
+    def _compute_recommended_chunks(
+        self,
+        symbol: str,
+        quantity: float,
+        current_price: float,
+    ) -> int:
+        if not self.enable_auto_chunking or current_price <= 0 or quantity <= 0:
+            return 1
+        order_notional = quantity * current_price
+        n_chunks = 1
+
+        cap_ceiling = getattr(self.broker, "capacity_ceiling", None)
+        if cap_ceiling is not None and hasattr(cap_ceiling, "evaluate_capacity"):
+            micro = (
+                self.broker.symbol_microstructure.get(symbol, {})
+                if hasattr(self.broker, "symbol_microstructure") and isinstance(self.broker.symbol_microstructure, dict)
+                else {}
+            )
+            try:
+                cap_rep = cap_ceiling.evaluate_capacity(
+                    symbol=symbol,
+                    order_size_usd=order_notional,
+                    depth_1pct_usd=micro.get("depth_1pct_usd"),
+                    bar_volume_usd=micro.get("volume"),
+                )
+                n_chunks = max(n_chunks, int(getattr(cap_rep, "recommended_chunks", 1) or 1))
+            except Exception:
+                pass
+
+        if self.max_single_clip_usd > 0 and order_notional > self.max_single_clip_usd:
+            n_chunks = max(n_chunks, int(np.ceil(order_notional / self.max_single_clip_usd)))
+
+        broker_max_notional = getattr(self.broker, "max_order_notional", None)
+        if (
+            isinstance(broker_max_notional, (int, float))
+            and broker_max_notional > 0
+            and order_notional > broker_max_notional * 0.95
+        ):
+            n_chunks = max(n_chunks, int(np.ceil(order_notional / (broker_max_notional * 0.90))))
+
+        return max(1, n_chunks)
+
+    def _submit_single_slice(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        current_price: float,
+        urgency: ExecutionUrgency,
+        bid_ask_spread_bps: float,
+        extra_kwargs: Dict,
+        order_book: Optional[Dict] = None,
+        obi: Optional[float] = None,
+    ) -> Order:
+        if urgency == ExecutionUrgency.HIGH:
+            return self.broker.create_order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=quantity,
+                price=current_price,
+                **extra_kwargs,
+            )
+
+        spread = (bid_ask_spread_bps / 10_000.0) * current_price
+        half_spread = spread / 2.0
+
+        obi_val: Optional[float] = None
+        if obi is not None:
+            obi_val = float(np.clip(obi, -1.0, 1.0))
+        elif order_book is not None:
+            obi_val = self.compute_order_book_imbalance(order_book, levels=5)
+
+        if obi_val is not None:
+            order_sign = 1.0 if side == OrderSide.BUY else -1.0
+            flow_align = order_sign * obi_val
+            if flow_align <= -0.25:
+                offset = 2.5 * half_spread
+            elif flow_align >= 0.30:
+                offset = 0.0
+            else:
+                offset = half_spread
+        else:
+            offset = half_spread
+
+        if side == OrderSide.BUY:
+            limit_price = current_price - offset
+        else:
+            limit_price = current_price + offset
+
+        return self.broker.create_order(
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=quantity,
+            price=limit_price,
+            **extra_kwargs,
+        )
+
     def route_order(
         self,
         symbol: str,
@@ -79,59 +183,58 @@ class SmartExecutionRouter:
         obi: Optional[float] = None,
     ) -> Order:
         """
-        Routes order according to execution urgency and Level-2 Order Book Imbalance (Issue #47).
+        Routes order according to execution urgency, Level-2 Order Book Imbalance (Issue #47),
+        and Multi-Slice Order Chunking for Capital Scaling (Issue #54).
         """
         urgency = urgency or self.default_urgency
         extra_kwargs = {"strategy": strategy} if strategy is not None else {}
 
-        if urgency == ExecutionUrgency.HIGH:
-            # Aggressive market order
-            return self.broker.create_order(
+        n_chunks = self._compute_recommended_chunks(symbol, quantity, current_price)
+        if n_chunks <= 1:
+            order = self._submit_single_slice(
                 symbol=symbol,
                 side=side,
-                order_type=OrderType.MARKET,
                 quantity=quantity,
-                price=current_price,
-                **extra_kwargs,
+                current_price=current_price,
+                urgency=urgency,
+                bid_ask_spread_bps=bid_ask_spread_bps,
+                extra_kwargs=extra_kwargs,
+                order_book=order_book,
+                obi=obi,
             )
-        else:
-            # Passive maker limit order with optional Level-2 OBI adaptive offset (Issue #47)
-            spread = (bid_ask_spread_bps / 10_000.0) * current_price
-            half_spread = spread / 2.0
+            self.last_chunked_orders = [order]
+            return order
 
-            obi_val: Optional[float] = None
-            if obi is not None:
-                obi_val = float(np.clip(obi, -1.0, 1.0))
-            elif order_book is not None:
-                obi_val = self.compute_order_book_imbalance(order_book, levels=5)
-
-            if obi_val is not None:
-                order_sign = 1.0 if side == OrderSide.BUY else -1.0
-                flow_align = order_sign * obi_val
-                if flow_align <= -0.25:
-                    # Adverse flow pushing into our passive limit: post 2.5x half-spread (2.5 bps) deeper
-                    offset = 2.5 * half_spread
-                elif flow_align >= 0.30:
-                    # Strong favorable flow / breakout: join inside mid-touch (0.0 bps offset) for immediate fill
-                    offset = 0.0
-                else:
-                    offset = half_spread
-            else:
-                offset = half_spread
-
-            if side == OrderSide.BUY:
-                limit_price = current_price - offset
-            else:
-                limit_price = current_price + offset
-
-            return self.broker.create_order(
+        child_qty = quantity / float(n_chunks)
+        child_orders: list[Order] = []
+        for _ in range(n_chunks):
+            child = self._submit_single_slice(
                 symbol=symbol,
                 side=side,
-                order_type=OrderType.LIMIT,
-                quantity=quantity,
-                price=limit_price,
-                **extra_kwargs,
+                quantity=child_qty,
+                current_price=current_price,
+                urgency=urgency,
+                bid_ask_spread_bps=bid_ask_spread_bps,
+                extra_kwargs=extra_kwargs,
+                order_book=order_book,
+                obi=obi,
             )
+            child_orders.append(child)
+
+        from copy import copy
+
+        self.last_chunked_orders = child_orders
+        agg_ord = copy(child_orders[-1])
+        total_filled = sum(float(c.filled_quantity or 0.0) for c in child_orders)
+        if total_filled > 0:
+            weighted_px = (
+                sum(float(c.filled_quantity or 0.0) * float(c.average_fill_price or current_price) for c in child_orders)
+                / total_filled
+            )
+            agg_ord.filled_quantity = total_filled
+            agg_ord.average_fill_price = weighted_px
+        agg_ord.quantity = quantity
+        return agg_ord
 
     @staticmethod
     def estimate_maker_fill_probability(

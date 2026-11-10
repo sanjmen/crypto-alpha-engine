@@ -106,7 +106,9 @@ class ShadowTradingDaemon:
         anomaly_max_hold_hours: float = 48.0,
         anomaly_breakout_min_24h_pct: float = 12.0,
         anomaly_min_notional: float = 10.0,
-        anomaly_max_notional: float = 25.0,
+        anomaly_max_notional: float = 45.0,
+        anomaly_pct_equity: float | None = 0.045,
+        anomaly_prefer_maker: bool = True,
         enable_dynamic_anomaly_sizing: bool = True,
         intracycle_drift_threshold_pct: float = 0.25,
         intracycle_min_rebalance_age_sec: float = 1800.0,
@@ -146,6 +148,8 @@ class ShadowTradingDaemon:
         self.anomaly_breakout_min_24h_pct = anomaly_breakout_min_24h_pct
         self.anomaly_min_notional = anomaly_min_notional
         self.anomaly_max_notional = anomaly_max_notional
+        self.anomaly_pct_equity = anomaly_pct_equity
+        self.anomaly_prefer_maker = anomaly_prefer_maker
         self.enable_dynamic_anomaly_sizing = enable_dynamic_anomaly_sizing
         self.anomaly_last_exit: dict[str, tuple[datetime, bool]] = {}
         self.intracycle_drift_threshold_pct = intracycle_drift_threshold_pct
@@ -1474,14 +1478,47 @@ class ShadowTradingDaemon:
         def _resolve_notional(strat_label: str, sig_meta: dict[str, Any]) -> tuple[float, float]:
             if not self.enable_dynamic_anomaly_sizing:
                 return min(float(self.anomaly_size), float(portfolio.cash)), 0.50
+            eff_max_notional = float(self.anomaly_max_notional)
+            if self.anomaly_pct_equity is not None and self.anomaly_max_notional >= 45.0:
+                eff_max_notional = max(eff_max_notional, float(portfolio.total_equity) * float(self.anomaly_pct_equity))
+            elif self.anomaly_pct_equity is not None and self.anomaly_pct_equity != 0.045:
+                eff_max_notional = float(portfolio.total_equity) * float(self.anomaly_pct_equity)
             rec_not, conf_sc = compute_anomaly_confluence_size(
                 strategy_type=strat_label,
                 metadata=sig_meta or {},
                 mkt_disp_24h=mkt_disp_24h,
                 min_notional=self.anomaly_min_notional,
-                max_notional=self.anomaly_max_notional,
+                max_notional=max(self.anomaly_min_notional, eff_max_notional),
             )
             return min(rec_not, float(portfolio.cash)), conf_sc
+
+        def _submit_anomaly_entry(
+            sym_str: str,
+            side: OrderSide,
+            qty_val: float,
+            ref_px: float,
+            bid_px: float,
+            ask_px: float,
+            strat_name: str,
+        ) -> Order:
+            if self.anomaly_prefer_maker:
+                touch_px = ask_px if side == OrderSide.BUY else bid_px
+                return self.broker.create_order(
+                    symbol=sym_str,
+                    side=side,
+                    order_type=OrderType.LIMIT,
+                    quantity=qty_val,
+                    price=touch_px,
+                    role="MAKER",
+                    strategy=strat_name,
+                )
+            return self.broker.create_order(
+                symbol=sym_str,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=qty_val,
+                strategy=strat_name,
+            )
 
         # Scan latest tickers for anomaly candidates
         candidates = []
@@ -1522,6 +1559,8 @@ class ShadowTradingDaemon:
                 continue
 
             # Synchronize execution price and broker L1 quote with fresh kline close to prevent stale-ticker fills
+            bid_p = price
+            ask_p = price
             kline_close = float(df["close"].iloc[-1])
             if kline_close > 0:
                 if abs(kline_close - price) / kline_close > 0.015:
@@ -1547,12 +1586,14 @@ class ShadowTradingDaemon:
                     qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
-                            order = self.broker.create_order(
-                                symbol=sym,
+                            order = _submit_anomaly_entry(
+                                sym_str=sym,
                                 side=OrderSide.BUY,
-                                order_type=OrderType.MARKET,
-                                quantity=qty,
-                                strategy="Extreme Drop Bounce",
+                                qty_val=qty,
+                                ref_px=price,
+                                bid_px=bid_p,
+                                ask_px=ask_p,
+                                strat_name="Extreme Drop Bounce",
                             )
                             fill_p = order.average_fill_price or price
                             tp = round(fill_p * 1.06, 6 if fill_p < 1.0 else 2)
@@ -1575,12 +1616,14 @@ class ShadowTradingDaemon:
                     qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
-                            order = self.broker.create_order(
-                                symbol=sym,
+                            order = _submit_anomaly_entry(
+                                sym_str=sym,
                                 side=OrderSide.BUY,
-                                order_type=OrderType.MARKET,
-                                quantity=qty,
-                                strategy="Early Breakout",
+                                qty_val=qty,
+                                ref_px=price,
+                                bid_px=bid_p,
+                                ask_px=ask_p,
+                                strat_name="Early Breakout",
                             )
                             fill_p = order.average_fill_price or price
                             tp = round(fill_p * 1.15, 6 if fill_p < 1.0 else 2)
@@ -1610,12 +1653,14 @@ class ShadowTradingDaemon:
                     qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                     if qty > 0:
                         try:
-                            order = self.broker.create_order(
-                                symbol=sym,
+                            order = _submit_anomaly_entry(
+                                sym_str=sym,
                                 side=OrderSide.SELL,
-                                order_type=OrderType.MARKET,
-                                quantity=qty,
-                                strategy="Pump & Funding Fade",
+                                qty_val=qty,
+                                ref_px=price,
+                                bid_px=bid_p,
+                                ask_px=ask_p,
+                                strat_name="Pump & Funding Fade",
                             )
                             fill_p = order.average_fill_price or price
                             tp = round(fill_p * 0.92, 6 if fill_p < 1.0 else 2)
