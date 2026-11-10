@@ -326,19 +326,88 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         except Exception:
             return fallback_price * 0.9999, fallback_price * 1.0001
 
+    @staticmethod
+    def compute_effective_margin_collateral(bal: dict[str, Any]) -> dict[str, Any]:
+        """
+        Tier 1C (Issue #57): Computes unified USDS-M Cross-Margin collateral across
+        `USDT` (100% weight) and yield-bearing margin assets `BFUSD` (99.9% weight) and
+        `LDUSDT` (99.9% weight).
+        """
+        haircuts = {"USDT": 1.000, "BFUSD": 0.999, "LDUSDT": 0.999}
+        wallet_by_asset: dict[str, float] = {"USDT": 0.0, "BFUSD": 0.0, "LDUSDT": 0.0}
+        free_by_asset: dict[str, float] = {"USDT": 0.0, "BFUSD": 0.0, "LDUSDT": 0.0}
+        non_zero_assets: list[dict[str, Any]] = []
+
+        if not isinstance(bal, dict):
+            return {
+                "usdt_wallet": 0.0,
+                "bfusd_wallet": 0.0,
+                "ldusdt_wallet": 0.0,
+                "yield_collateral_usd": 0.0,
+                "effective_wallet_usd": 0.0,
+                "effective_free_usd": 0.0,
+                "yield_collateral_share": 0.0,
+                "non_zero_assets": non_zero_assets,
+            }
+
+        for asset_code in ("USDT", "BFUSD", "LDUSDT"):
+            info_obj = bal.get(asset_code)
+            if isinstance(info_obj, dict):
+                f_val = float(info_obj.get("free") or 0.0)
+                t_val = float(info_obj.get("total") or f_val)
+                wallet_by_asset[asset_code] = max(wallet_by_asset[asset_code], t_val)
+                free_by_asset[asset_code] = max(free_by_asset[asset_code], f_val)
+
+        raw_info = bal.get("info", {})
+        if isinstance(raw_info, dict) and isinstance(raw_info.get("assets"), list):
+            for a in raw_info["assets"]:
+                if not isinstance(a, dict):
+                    continue
+                code = str(a.get("asset") or "").upper()
+                wb = float(a.get("walletBalance") or 0.0)
+                ab = float(a.get("availableBalance") or wb)
+                if wb > 0 or ab > 0:
+                    non_zero_assets.append(
+                        {
+                            "asset": code,
+                            "walletBalance": wb,
+                            "availableBalance": ab,
+                        }
+                    )
+                if code in wallet_by_asset:
+                    wallet_by_asset[code] = wb
+                    free_by_asset[code] = ab
+
+        eff_wallet = sum(wallet_by_asset[k] * haircuts[k] for k in haircuts)
+        eff_free = sum(free_by_asset[k] * haircuts[k] for k in haircuts)
+        yield_usd = wallet_by_asset["BFUSD"] * haircuts["BFUSD"] + wallet_by_asset["LDUSDT"] * haircuts["LDUSDT"]
+        yield_share = (yield_usd / eff_wallet) if eff_wallet > 0 else 0.0
+
+        return {
+            "usdt_wallet": wallet_by_asset["USDT"],
+            "bfusd_wallet": wallet_by_asset["BFUSD"],
+            "ldusdt_wallet": wallet_by_asset["LDUSDT"],
+            "yield_collateral_usd": yield_usd,
+            "effective_wallet_usd": eff_wallet,
+            "effective_free_usd": eff_free if eff_free > 0 else eff_wallet,
+            "yield_collateral_share": yield_share,
+            "non_zero_assets": non_zero_assets,
+        }
+
     def reconcile_positions_from_exchange(self) -> dict[str, Position]:
         """
         Synchronizes local `self.portfolio.positions` and cash balance with actual
-        Binance USD-M Futures account state (`GET /fapi/v2/positionRisk` & `fetch_balance`).
+        Binance USD-M Futures account state (`GET /fapi/v2/positionRisk` & `fetch_balance`),
+        including yield-bearing collateral (`BFUSD` & `LDUSDT`).
         """
         if self.dry_run:
             return self.portfolio.positions
 
         try:
             bal = self.client.fetch_balance()
-            usdt_info = bal.get("USDT", {})
-            free_cash = float(usdt_info.get("free") or usdt_info.get("total") or self.portfolio.cash)
-            self.portfolio.cash = free_cash
+            col = self.compute_effective_margin_collateral(bal)
+            if col["effective_wallet_usd"] > 0:
+                self.portfolio.cash = float(col["effective_free_usd"])
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not fetch live balance during reconciliation: {e}")
 
@@ -785,27 +854,24 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Could not set leverage={target_int_lev}x for {sym}: {e}")
 
-        # 4. Fetch Live USDT Futures Balance
+        # 4. Fetch Live Futures Balance (USDT + Yield-Bearing Collateral BFUSD & LDUSDT)
         try:
             bal = self.client.fetch_balance()
-            usdt_info = bal.get("USDT", {})
-            free_cash = float(usdt_info.get("free") or 0.0)
-            total_cash = float(usdt_info.get("total") or free_cash)
-            raw_info = bal.get("info", {}) if isinstance(bal, dict) else {}
-            non_zero_assets = []
-            if isinstance(raw_info, dict) and isinstance(raw_info.get("assets"), list):
-                for a in raw_info["assets"]:
-                    wb = float(a.get("walletBalance") or 0.0)
-                    ab = float(a.get("availableBalance") or 0.0)
-                    if wb > 0 or ab > 0:
-                        non_zero_assets.append(
-                            {
-                                "asset": a.get("asset"),
-                                "walletBalance": wb,
-                                "availableBalance": ab,
-                            }
-                        )
-            report["non_zero_assets"] = non_zero_assets
+            col = self.compute_effective_margin_collateral(bal)
+            free_cash = float(col["effective_free_usd"])
+            total_cash = float(col["effective_wallet_usd"])
+            report["non_zero_assets"] = col["non_zero_assets"]
+            report["bfusd_balance"] = col["bfusd_wallet"]
+            report["ldusdt_balance"] = col["ldusdt_wallet"]
+            report["yield_collateral_usd"] = col["yield_collateral_usd"]
+            report["yield_collateral_share"] = col["yield_collateral_share"]
+            if col["yield_collateral_usd"] > 0 and not report.get("multi_assets_margin") and not enforce_single_asset_margin:
+                try:
+                    if hasattr(self.client, "fapiPrivatePostMultiAssetsMargin"):
+                        self.client.fapiPrivatePostMultiAssetsMargin({"multiAssetsMargin": "true"})
+                        report["multi_assets_margin"] = True
+                except Exception:
+                    pass
             self.portfolio.cash = free_cash
             if not self.portfolio.positions and total_cash > 0:
                 self.portfolio.initial_cash = total_cash

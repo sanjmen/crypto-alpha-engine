@@ -1169,4 +1169,55 @@ def test_m13_tier1b_issue_56_extreme_funding_harvester_and_beta_neutral_hedge(tm
     db.close()
 
 
+def test_m13_tier1c_issue_57_yield_bearing_collateral_bfusd_ldusdt_accounting(tmp_path):
+    """
+    Tests Issue #57 (Tier 1C: Yield-Bearing Futures Collateral Integration — BFUSD & LDUSDT):
+    1) Verifies BinanceLiveBroker.compute_effective_margin_collateral() aggregates USDT (100%),
+       BFUSD (99.9% haircut), and LDUSDT (99.9% haircut) in Cross-Margin accounts.
+    2) Verifies ShadowExecutionBroker.settle_collateral_yield() and ShadowTradingDaemon.run_funding_cycle()
+       accrue passive 8h yield on margin collateral (default 5.5% APY) and record BFUSD/USDT settlements.
+    """
+    from src.execution.live_broker import BinanceLiveBroker
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+
+    # 1. Mixed Cross-Margin Balance: $500 USDT + $1,500 BFUSD + $1,000 LDUSDT
+    sample_bal = {
+        "USDT": {"free": 500.0, "total": 500.0},
+        "BFUSD": {"free": 1500.0, "total": 1500.0},
+        "LDUSDT": {"free": 1000.0, "total": 1000.0},
+        "info": {
+            "assets": [
+                {"asset": "USDT", "walletBalance": "500.0", "availableBalance": "500.0"},
+                {"asset": "BFUSD", "walletBalance": "1500.0", "availableBalance": "1500.0"},
+                {"asset": "LDUSDT", "walletBalance": "1000.0", "availableBalance": "1000.0"},
+            ]
+        },
+    }
+    col = BinanceLiveBroker.compute_effective_margin_collateral(sample_bal)
+    expected_yield_usd = 1500.0 * 0.999 + 1000.0 * 0.999
+    expected_total_usd = 500.0 + expected_yield_usd
+    assert pytest.approx(col["yield_collateral_usd"], abs=1e-4) == expected_yield_usd
+    assert pytest.approx(col["effective_wallet_usd"], abs=1e-4) == expected_total_usd
+    assert pytest.approx(col["yield_collateral_share"], abs=1e-6) == expected_yield_usd / expected_total_usd
+
+    # 2. 8h Collateral Yield Accrual in ShadowExecutionBroker & ShadowTradingDaemon
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(
+        database=db,
+        initial_cash=3000.0,
+        enable_yield_collateral=True,
+        collateral_yield_apy=0.055,
+        collateral_haircut=0.999,
+    )
+    daemon = ShadowTradingDaemon(broker=broker, cache_dir=str(tmp_path), enable_warm_start=False)
+    settled = daemon.run_funding_cycle()
+    assert "BFUSD/USDT" in settled
+    expected_8h_cf = (3000.0 * 0.999) * (0.055 * (8.0 / 8760.0))
+    assert pytest.approx(settled["BFUSD/USDT"], abs=1e-6) == expected_8h_cf
+    assert pytest.approx(broker.portfolio.cash, abs=1e-6) == 3000.0 + expected_8h_cf
+    db.close()
+
+
+
 

@@ -14,6 +14,7 @@ from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.execution.database import ShadowDatabase
 from src.execution.live_broker import (
+    BinanceLiveBroker,
     MarketCapacityExceededError,
     MaxDrawdownStopError,
     MaxLeverageExceededError,
@@ -48,6 +49,9 @@ class ShadowExecutionBroker(IExecutionClient):
         capacity_ceiling: CapitalCapacityCeiling | None = None,
         enforce_capacity_ceiling: bool = False,
         live_broker: Any | None = None,
+        enable_yield_collateral: bool = True,
+        collateral_yield_apy: float = 0.055,
+        collateral_haircut: float = 0.999,
     ):
         self.db = database or ShadowDatabase()
         self.taker_fee_pct = taker_fee_pct
@@ -61,6 +65,10 @@ class ShadowExecutionBroker(IExecutionClient):
         self.enforce_capacity_ceiling = enforce_capacity_ceiling
         self.symbol_microstructure: dict[str, dict] = {}
         self.live_broker = live_broker
+        self.enable_yield_collateral = bool(enable_yield_collateral)
+        self.collateral_yield_apy = float(collateral_yield_apy)
+        self.collateral_haircut = float(collateral_haircut)
+        self.last_collateral_breakdown: dict[str, Any] = {}
         self._configured_live_symbols: set[str] = set()
         self._current_live_leverage: int = 3
 
@@ -142,14 +150,12 @@ class ShadowExecutionBroker(IExecutionClient):
 
         try:
             bal = self.live_broker.client.fetch_balance()
-            usdt_info = bal.get("USDT", {}) if isinstance(bal, dict) else {}
-            wallet_bal = float(usdt_info.get("total") or usdt_info.get("free") or self.portfolio.cash)
-            raw_info = bal.get("info", {}) if isinstance(bal, dict) else {}
-            if isinstance(raw_info, dict) and isinstance(raw_info.get("assets"), list):
-                for a in raw_info["assets"]:
-                    if a.get("asset") == "USDT" and a.get("walletBalance") is not None:
-                        wallet_bal = float(a["walletBalance"])
-                        break
+            col = BinanceLiveBroker.compute_effective_margin_collateral(bal)
+            self.last_collateral_breakdown = col
+            wallet_bal = float(col.get("effective_wallet_usd") or 0.0)
+            if wallet_bal <= 0 and isinstance(bal, dict):
+                usdt_info = bal.get("USDT", {})
+                wallet_bal = float(usdt_info.get("total") or usdt_info.get("free") or self.portfolio.cash)
             if wallet_bal > 0:
                 self.portfolio.cash = wallet_bal
                 self.live_broker.portfolio.cash = wallet_bal
@@ -158,7 +164,7 @@ class ShadowExecutionBroker(IExecutionClient):
                 self.peak_equity = max(self.peak_equity, self.portfolio.total_equity)
                 self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Live USDT balance sync note: {e}")
+            logger.warning(f"Live USDT/BFUSD/LDUSDT balance sync note: {e}")
 
         if sync_positions:
             try:
@@ -810,6 +816,58 @@ class ShadowExecutionBroker(IExecutionClient):
             funding_rate=funding_rate,
             position_side=side_str,
             position_notional=notional,
+            cashflow_credited=cashflow,
+            timestamp=timestamp,
+        )
+        self._record_account_snapshot(timestamp)
+        return cashflow
+
+    def settle_collateral_yield(
+        self,
+        apy: float | None = None,
+        interval_hours: float = 8.0,
+        timestamp: datetime | None = None,
+    ) -> float:
+        """
+        Tier 1C (Issue #57): Accrues passive yield on Futures Cross-Margin collateral
+        (`BFUSD` / `LDUSDT`, default 5.5% APY == ~0.0151%/day == ~0.00502% per 8h funding interval)
+        applying the 99.9% margin value haircut (`collateral_haircut = 0.999`).
+        """
+        if not self.enable_yield_collateral:
+            return 0.0
+
+        eff_apy = float(self.collateral_yield_apy if apy is None else apy)
+        if eff_apy <= 0.0 or interval_hours <= 0.0:
+            return 0.0
+
+        period_rate = eff_apy * (float(interval_hours) / 8760.0)
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=False)
+            yield_base = float(self.last_collateral_breakdown.get("yield_collateral_usd") or 0.0)
+            if yield_base <= 0.0:
+                return 0.0
+            cashflow = yield_base * period_rate
+            self.db.record_funding_settlement(
+                symbol="BFUSD/USDT",
+                funding_rate=-period_rate,
+                position_side="LONG",
+                position_notional=yield_base,
+                cashflow_credited=cashflow,
+                timestamp=timestamp,
+            )
+            return cashflow
+
+        collateral_base = max(0.0, float(self.portfolio.cash) * float(self.collateral_haircut))
+        if collateral_base <= 0.0:
+            return 0.0
+
+        cashflow = collateral_base * period_rate
+        self.portfolio.cash += cashflow
+        self.db.record_funding_settlement(
+            symbol="BFUSD/USDT",
+            funding_rate=-period_rate,
+            position_side="LONG",
+            position_notional=collateral_base,
             cashflow_credited=cashflow,
             timestamp=timestamp,
         )

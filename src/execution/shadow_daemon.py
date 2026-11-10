@@ -1465,6 +1465,16 @@ class ShadowTradingDaemon:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error settling funding for {sym}: {e}")
 
+        if getattr(self.broker, "enable_yield_collateral", False) and hasattr(
+            self.broker, "settle_collateral_yield"
+        ):
+            try:
+                y_cf = self.broker.settle_collateral_yield()
+                if y_cf > 0:
+                    settled_cashflows["BFUSD/USDT"] = y_cf
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Error settling yield-bearing collateral (BFUSD/LDUSDT): {e}")
+
         self.last_funding_check_time = datetime.now(timezone.utc)
         return settled_cashflows
 
