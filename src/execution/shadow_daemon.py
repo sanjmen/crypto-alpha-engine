@@ -194,10 +194,17 @@ class ShadowTradingDaemon:
                 sf_tel = db_inst.get_latest_seven_factor_telemetry()
                 lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
                 if sf_tel and lev_ctrl and sf_tel.get("high_water_mark"):
+                    tel_init = float(sf_tel.get("initial_capital") or lev_ctrl.initial_capital)
+                    saved_hwm = float(sf_tel["high_water_mark"])
+                    if abs(lev_ctrl.initial_capital - tel_init) > 1.0 and tel_init > 0:
+                        saved_hwm = saved_hwm * (lev_ctrl.initial_capital / tel_init)
+                        self.last_rebalance_time = None
                     lev_ctrl.high_water_mark = max(
                         lev_ctrl.high_water_mark,
-                        float(sf_tel["high_water_mark"]),
+                        saved_hwm,
                     )
+            if getattr(self.broker, "capital_rescaled_ratio", None) is not None:
+                self.last_rebalance_time = None
         self._refresh_anomaly_cooldowns()
         self.last_funding_check_time: datetime | None = None
         self.anomaly_scan_interval_sec: float = 30.0

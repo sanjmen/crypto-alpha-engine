@@ -80,6 +80,7 @@ class ShadowExecutionBroker(IExecutionClient):
             initial_cash=init_cash,
             positions=open_positions,
         )
+        self.capital_rescaled_ratio: float | None = None
         self.peak_equity = max(self.portfolio.total_equity, init_cash)
         self.market_prices: dict[str, float] = {}
         self.market_bids: dict[str, float] = {}
@@ -91,6 +92,40 @@ class ShadowExecutionBroker(IExecutionClient):
         # If fresh db, record initial account snapshot
         if not latest_acc:
             self._record_account_snapshot()
+
+    def scale_capital(self, target_initial_capital: float) -> dict[str, float]:
+        """
+        Rescales `initial_cash` and `cash` by injecting/withdrawing the capital delta
+        while preserving historical realized PnL (`cash - initial_cash`).
+        """
+        target_init = float(target_initial_capital)
+        old_init = float(self.portfolio.initial_cash)
+        old_cash = float(self.portfolio.cash)
+        if target_init <= 0 or abs(target_init - old_init) <= 1.0:
+            return {
+                "old_initial_capital": old_init,
+                "new_initial_capital": old_init,
+                "delta_capital": 0.0,
+                "new_cash_balance": old_cash,
+            }
+
+        delta_cap = target_init - old_init
+        self.portfolio.initial_cash = target_init
+        self.portfolio.cash = max(0.0, old_cash + delta_cap)
+        self.capital_rescaled_ratio = target_init / max(old_init, 1.0)
+        self.peak_equity = max(self.portfolio.total_equity, target_init)
+        self._record_account_snapshot()
+        logger.info(
+            f"💰 Capital scaled in Shadow Broker: Initial ${old_init:,.2f} -> ${target_init:,.2f} "
+            f"(Delta: {delta_cap:+,.2f} USDT | Cash: ${self.portfolio.cash:,.2f} | "
+            f"Realized PnL preserved: ${self.portfolio.cash - target_init:+,.2f})"
+        )
+        return {
+            "old_initial_capital": old_init,
+            "new_initial_capital": target_init,
+            "delta_capital": delta_cap,
+            "new_cash_balance": self.portfolio.cash,
+        }
 
     @property
     def is_live(self) -> bool:

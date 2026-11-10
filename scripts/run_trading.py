@@ -113,6 +113,10 @@ def resolve_mode_config(
         api_key = None
         api_secret = None
 
+    raw_cap = getattr(args, "capital", None)
+    default_cap = 3000.0 if mode == "shadow" else 1000.0
+    effective_capital = float(raw_cap) if raw_cap is not None else default_cap
+
     return {
         "mode": mode,
         "db_path": db_path,
@@ -120,6 +124,7 @@ def resolve_mode_config(
         "api_secret": api_secret,
         "is_live": mode in ("mainnet", "testnet"),
         "is_testnet": mode == "testnet",
+        "capital": effective_capital,
     }
 
 
@@ -143,7 +148,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke-symbol", type=str, default="DOGE/USDT", help="Symbol for --smoke-test (default: DOGE/USDT)")
     parser.add_argument("--smoke-notional", type=float, default=6.0, help="Target USD notional for --smoke-test (default: 6.0)")
     parser.add_argument("--configure-only", action="store_true", help="Configure One-Way mode, Cross Margin & Leverage on exchange and exit")
-    parser.add_argument("--capital", type=float, default=1000.0, help="Initial portfolio capital in USDT (default: 1000.0)")
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=None,
+        help="Initial portfolio capital in USDT (default: 3000.0 in --shadow, 1000.0 in --mainnet)",
+    )
+    parser.add_argument("--rebalance-now", action="store_true", help="Force an immediate 7-Factor rebalance cycle on daemon startup")
     parser.add_argument("--reset", action="store_true", help="Reset all previous database records in the selected mode DB before starting")
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="Override path to SQLite database")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (e.g. 'BTC/USDT,ETH/USDT')")
@@ -206,6 +217,7 @@ def main() -> None:
     cfg = resolve_mode_config(args)
     mode = cfg["mode"]
     db_path = cfg["db_path"]
+    effective_capital = float(cfg["capital"])
 
     symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS.copy()
     if args.enable_anomalies and args.legacy_allocator and not args.symbols:
@@ -238,7 +250,7 @@ def main() -> None:
             api_secret=api_secret,
             testnet=cfg["is_testnet"],
             dry_run=False,
-            initial_capital=args.capital,
+            initial_capital=effective_capital,
             max_gross_leverage=max(6.0, args.max_leverage * 1.25),
             chase_interval_sec=1.5,
             max_chase_iterations=2,
@@ -284,10 +296,13 @@ def main() -> None:
 
     broker = ShadowExecutionBroker(
         database=db,
-        initial_cash=args.capital,
+        initial_cash=effective_capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         live_broker=live_broker,
     )
+    if not cfg["is_live"]:
+        broker.scale_capital(effective_capital)
+
     router = SmartExecutionRouter(
         broker=broker,
         enable_auto_chunking=True,
@@ -302,7 +317,7 @@ def main() -> None:
     )
     stepped_leverage_ctrl = (
         SteppedLeverageController(
-            initial_capital=args.capital,
+            initial_capital=effective_capital,
             start_leverage=start_lev,
             max_leverage=args.max_leverage,
             step_leverage=args.step_leverage,
@@ -315,8 +330,8 @@ def main() -> None:
 
     if use_seven_factor:
         logger.info(
-            f"7-Factor Causal Online Engine ENABLED [{mode.upper()}] | Stepped Leverage: "
-            f"{start_lev:.1f}x -> {args.max_leverage:.1f}x "
+            f"7-Factor Causal Online Engine ENABLED [{mode.upper()}] | Capital: ${effective_capital:,.2f} | "
+            f"Stepped Leverage: {start_lev:.1f}x -> {args.max_leverage:.1f}x "
             f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM | "
             f"F6 Gate t>={args.f6_min_tstat:.2f})"
         )
@@ -381,9 +396,11 @@ def main() -> None:
         min_rebalance_notional=(
             min(10.0, args.anomaly_size)
             if args.enable_anomalies
-            else max(10.0, min(50.0, args.capital * 0.01))
+            else max(10.0, min(50.0, effective_capital * 0.01))
         ),
     )
+    if getattr(args, "rebalance_now", False):
+        daemon.last_rebalance_time = None
 
     if args.once:
         logger.info(f"Executing single synchronous step [{mode.upper()}]...")

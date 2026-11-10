@@ -772,13 +772,14 @@ def test_unified_trading_launcher_mode_and_db_isolation():
         "BINANCE_TESTNET_API_SECRET": "test_secret",
     }
 
-    # 1. Default / --shadow mode -> shadow_trading.db, no live keys
+    # 1. Default / --shadow mode -> shadow_trading.db, no live keys, $3,000 default capital
     args_shd = parser.parse_args(["--daemon", "--shadow"])
     cfg_shd = resolve_mode_config(args_shd, environ=fake_env)
     assert cfg_shd["mode"] == "shadow"
     assert cfg_shd["db_path"].endswith("shadow_trading.db")
     assert cfg_shd["is_live"] is False
     assert cfg_shd["api_key"] is None
+    assert cfg_shd["capital"] == 3000.0
 
     # 2. --testnet mode -> testnet_trading.db, testnet keys
     args_tst = parser.parse_args(["--daemon", "--testnet"])
@@ -789,7 +790,7 @@ def test_unified_trading_launcher_mode_and_db_isolation():
     assert cfg_tst["is_testnet"] is True
     assert cfg_tst["api_key"] == "test_key"
 
-    # 3. --mainnet mode -> live_trading.db, prod keys
+    # 3. --mainnet mode -> live_trading.db, prod keys, $1,000 default capital
     args_mn = parser.parse_args(["--daemon", "--mainnet"])
     cfg_mn = resolve_mode_config(args_mn, environ=fake_env)
     assert cfg_mn["mode"] == "mainnet"
@@ -797,9 +798,30 @@ def test_unified_trading_launcher_mode_and_db_isolation():
     assert cfg_mn["is_live"] is True
     assert cfg_mn["is_testnet"] is False
     assert cfg_mn["api_key"] == "prod_key"
+    assert cfg_mn["capital"] == 1000.0
 
     # Ensure all three DB paths are strictly distinct for parallel execution
     assert len({cfg_shd["db_path"], cfg_tst["db_path"], cfg_mn["db_path"]}) == 3
+
+    # Verify ShadowExecutionBroker.scale_capital($1,000 -> $3,000) preserves realized PnL
+    db = ShadowDatabase(db_path=":memory:")
+    db.save_account_snapshot(
+        initial_capital=1000.0,
+        cash_balance=1120.0,
+        unrealized_pnl=0.0,
+        realized_pnl=120.0,
+        total_equity=1120.0,
+        margin_used=0.0,
+        free_margin=1120.0,
+        leverage=0.0,
+    )
+    broker = ShadowExecutionBroker(database=db, initial_cash=1000.0)
+    res_scale = broker.scale_capital(3000.0)
+    assert res_scale["new_initial_capital"] == 3000.0
+    assert res_scale["new_cash_balance"] == 3120.0
+    assert broker.portfolio.initial_cash == 3000.0
+    assert broker.portfolio.cash == 3120.0
+    db.close()
 
 
 def test_m13_lever1_issue_52_f6_liq_tstat_gate_and_top4_priors():
