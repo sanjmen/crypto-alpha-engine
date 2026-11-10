@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import ccxt
+import numpy as np
 import pandas as pd
 
 from src.domain.entities import Order, Portfolio
@@ -784,6 +785,88 @@ class ShadowTradingDaemon:
         )
         return merged.tail(limit).reset_index(drop=True)
 
+    def fetch_smart_money_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+        """
+        Fetches trailing hourly Binance Institutional Smart-Money Positioning (`top_pos_ls_ratio`,
+        `global_acc_ls_ratio`, and `smart_money_div = ln(top_pos_ls_ratio / global_acc_ls_ratio)`)
+        for `symbol` (Issue #55 / Tier 1A), combining local cache
+        (`data/cache/smart_money/1h/{CLEAN_SYM}.parquet`) with live Binance Futures
+        `/futures/data/topLongShortPositionRatio` and `/futures/data/globalLongShortAccountRatio`.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        sm_path = self.cache_dir / "smart_money" / "1h" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+
+        if self.enable_warm_start and sm_path.exists():
+            try:
+                raw_sm = pd.read_parquet(sm_path).tail(max(limit, 240))
+                if not raw_sm.empty and "timestamp" in raw_sm.columns:
+                    cached_df = raw_sm.copy()
+                    cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
+                    if "smart_money_div" not in cached_df.columns and (
+                        "top_pos_ls_ratio" in cached_df.columns and "global_acc_ls_ratio" in cached_df.columns
+                    ):
+                        w_r = cached_df["top_pos_ls_ratio"].astype(float).clip(0.05, 20.0)
+                        r_r = cached_df["global_acc_ls_ratio"].astype(float).clip(0.05, 20.0)
+                        cached_df["smart_money_div"] = np.log(w_r / r_r)
+            except Exception:
+                pass
+
+        live_records: list[dict[str, Any]] = []
+        try:
+            fn_top = getattr(self.exchange, "fapiDataGetTopLongShortPositionRatio", None)
+            fn_glob = getattr(self.exchange, "fapiDataGetGlobalLongShortAccountRatio", None)
+            if (
+                callable(fn_top)
+                and callable(fn_glob)
+                and not isinstance(fn_top, MagicMock)
+                and not isinstance(fn_glob, MagicMock)
+            ):
+                top_rows = fn_top({"symbol": clean_sym, "period": "1h", "limit": min(limit, 36)})
+                glob_rows = fn_glob({"symbol": clean_sym, "period": "1h", "limit": min(limit, 36)})
+                top_map: dict[int, float] = {}
+                if isinstance(top_rows, list):
+                    for r in top_rows:
+                        if isinstance(r, dict):
+                            ts_ms = int(r.get("timestamp") or 0)
+                            ratio_val = float(r.get("longShortRatio") or 0.0)
+                            if ts_ms > 0 and ratio_val > 0:
+                                top_map[ts_ms] = ratio_val
+                if isinstance(glob_rows, list):
+                    for r in glob_rows:
+                        if isinstance(r, dict):
+                            ts_ms = int(r.get("timestamp") or 0)
+                            g_val = float(r.get("longShortRatio") or 0.0)
+                            w_val = top_map.get(ts_ms)
+                            if ts_ms > 0 and g_val > 0 and w_val and w_val > 0:
+                                w_clip = float(np.clip(w_val, 0.05, 20.0))
+                                g_clip = float(np.clip(g_val, 0.05, 20.0))
+                                live_records.append({
+                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                    "top_pos_ls_ratio": w_clip,
+                                    "global_acc_ls_ratio": g_clip,
+                                    "smart_money_div": float(np.log(w_clip / g_clip)),
+                                })
+        except Exception:
+            pass
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged.tail(limit).reset_index(drop=True)
+
     def fetch_symbol_obi(self, symbol: str, levels: int = 5) -> float | None:
         """
         Fetches Top-N Level-2 Order Book depth from Binance Futures and returns
@@ -1132,11 +1215,12 @@ class ShadowTradingDaemon:
             )
             return []
 
-        # Fetch live funding rates (or 72h history for 7-Factor Engine), Open Interest (#46), Taker Flow (#48) & Premium Index (#49)
+        # Fetch live funding rates (or 72h history for 7-Factor Engine), Open Interest (#46), Taker Flow (#48), Premium Index (#49) & Smart Money (#55)
         funding_data: dict[str, pd.DataFrame] = {}
         open_interest_data: dict[str, pd.DataFrame] = {}
         taker_flow_data: dict[str, pd.DataFrame] = {}
         premium_index_data: dict[str, pd.DataFrame] = {}
+        smart_money_data: dict[str, pd.DataFrame] = {}
         for sym in self.symbols:
             clean_sym = sym.replace("/", "")
             if clean_sym not in market_data:
@@ -1154,6 +1238,9 @@ class ShadowTradingDaemon:
                 df_pr = self.fetch_premium_index_history(sym)
                 if not df_pr.empty:
                     premium_index_data[clean_sym] = df_pr
+                df_sm = self.fetch_smart_money_history(sym)
+                if not df_sm.empty:
+                    smart_money_data[clean_sym] = df_sm
             else:
                 try:
                     fr = self.exchange.fetch_funding_rate(sym)
@@ -1188,6 +1275,7 @@ class ShadowTradingDaemon:
                 open_interest_data=open_interest_data if open_interest_data else None,
                 taker_flow_data=taker_flow_data if taker_flow_data else None,
                 premium_index_data=premium_index_data if premium_index_data else None,
+                smart_money_data=smart_money_data if smart_money_data else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(

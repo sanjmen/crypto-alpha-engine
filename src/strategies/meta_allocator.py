@@ -195,6 +195,7 @@ class MetaStrategyAllocator:
         open_interest_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         taker_flow_data: dict[str, pd.DataFrame] | None = None,
         premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
+        smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Runs the 7-Factor Causal Online Alpha Engine + Stepped Leverage Controller (2.5x -> 5.0x)
@@ -213,6 +214,7 @@ class MetaStrategyAllocator:
             open_interest=open_interest_data,
             taker_flow=taker_flow_data,
             premium_index=premium_index_data,
+            smart_money=smart_money_data,
         )
         self.last_seven_factor_result = sf_res
 
@@ -263,6 +265,7 @@ class MetaStrategyAllocator:
         open_interest_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         taker_flow_data: dict[str, pd.DataFrame] | None = None,
         premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
+        smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Executes end-to-end multi-strategy signal generation, regime/HRP adaptation,
@@ -279,6 +282,7 @@ class MetaStrategyAllocator:
                 open_interest_data=open_interest_data,
                 taker_flow_data=taker_flow_data,
                 premium_index_data=premium_index_data,
+                smart_money_data=smart_money_data,
             )
 
         # 1. Detect market regime

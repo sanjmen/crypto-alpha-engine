@@ -78,6 +78,8 @@ class SevenFactorAllocationResult:
     asset_composite_scores: Dict[str, float] = field(default_factory=dict)
     cmf_tstat: float = 0.0
     cmf_blend_weight: float = 0.0
+    smart_money_tstat: float = 0.0
+    smart_money_blend_weight: float = 0.0
 
 
 def make_continuous_neutral_weights(
@@ -517,6 +519,77 @@ class SevenFactorOnlineEngine:
             prem_df[sym] = s_re.ffill().fillna(0.0)
         return prem_df
 
+    @staticmethod
+    def _extract_smart_money(
+        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        close: pd.DataFrame,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Aligns hourly Binance Institutional Smart-Money divergence
+        `ln(top_pos_ls_ratio / global_acc_ls_ratio)` onto `close.index`
+        for Issue #55 (Tier 1A: Factor F8_Smart_Money_Flow via fapiData).
+        """
+        if not smart_money:
+            return None
+        sm_dict: Dict[str, pd.Series] = {}
+        for sym in close.columns:
+            sm_val = smart_money.get(sym)
+            if sm_val is None:
+                continue
+            if isinstance(sm_val, pd.Series):
+                s = sm_val.copy()
+                if not isinstance(s.index, pd.DatetimeIndex):
+                    s.index = pd.to_datetime(s.index, utc=True)
+                elif s.index.tz is None:
+                    s.index = s.index.tz_localize("UTC")
+                s = s[~s.index.duplicated(keep="last")].sort_index()
+                sm_dict[sym] = s.astype(float)
+            elif isinstance(sm_val, pd.DataFrame) and not sm_val.empty:
+                d_s = sm_val.copy()
+                if "timestamp" in d_s.columns:
+                    ts = d_s["timestamp"]
+                    if pd.api.types.is_numeric_dtype(ts):
+                        unit = "ms" if float(ts.dropna().max()) > 1e11 else "s"
+                        d_s = d_s.set_index(pd.to_datetime(ts, unit=unit, utc=True))
+                    else:
+                        d_s = d_s.set_index(pd.to_datetime(ts, utc=True))
+                elif not isinstance(d_s.index, pd.DatetimeIndex):
+                    d_s.index = pd.to_datetime(d_s.index, utc=True)
+                elif d_s.index.tz is None:
+                    d_s.index = d_s.index.tz_localize("UTC")
+                d_s.index = d_s.index.round("1h")
+                d_s = d_s[~d_s.index.duplicated(keep="last")].sort_index()
+
+                if "smart_money_div" in d_s.columns:
+                    sm_dict[sym] = d_s["smart_money_div"].astype(float)
+                else:
+                    w_col = next(
+                        (c for c in ("top_pos_ls_ratio", "topLongShortPositionRatio", "whale_ls_ratio") if c in d_s.columns),
+                        None,
+                    )
+                    r_col = next(
+                        (c for c in ("global_acc_ls_ratio", "globalLongShortAccountRatio", "retail_ls_ratio") if c in d_s.columns),
+                        None,
+                    )
+                    if w_col and r_col:
+                        w_r = d_s[w_col].astype(float).clip(0.05, 20.0)
+                        r_r = d_s[r_col].astype(float).clip(0.05, 20.0)
+                        sm_dict[sym] = np.log(w_r / r_r)
+                    else:
+                        col = d_s.columns[0]
+                        sm_dict[sym] = d_s[col].astype(float)
+        if not sm_dict:
+            return None
+        sm_df = pd.DataFrame(0.0, index=close.index, columns=close.columns, dtype=float)
+        for sym, s in sm_dict.items():
+            s_re = s.reindex(close.index)
+            if s_re.notna().sum() == 0:
+                s_shift = s.copy()
+                s_shift.index = s_shift.index + pd.Timedelta(hours=1)
+                s_re = s_shift.reindex(close.index)
+            sm_df[sym] = s_re.ffill().fillna(0.0)
+        return sm_df
+
     def _compute_subhourly_pullback_adjustment(
         self,
         bars_15m: Optional[Dict[str, pd.DataFrame]],
@@ -556,6 +629,7 @@ class SevenFactorOnlineEngine:
         open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
         taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
         premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> Dict[str, Union[pd.DataFrame, pd.Series]]:
         """
         Computes full historical matrices for the 7 factors, online factor weights,
@@ -568,6 +642,7 @@ class SevenFactorOnlineEngine:
         oi_contracts = self._extract_open_interest(open_interest, close)
         taker_pair = self._extract_taker_flow(taker_flow, bars_1h, close)
         prem_close = self._extract_premium_index(premium_index, close)
+        sm_div = self._extract_smart_money(smart_money, close)
         idx = close.index
         cols = list(close.columns)
 
@@ -913,6 +988,64 @@ class SevenFactorOnlineEngine:
                 )
             )
 
+        # Issue #55 (M13 Tier 1A): Institutional Positioning Factor (F8_Smart_Money_Flow via fapiData)
+        t_sm = pd.Series(0.0, index=idx)
+        alpha_sm_dyn = pd.Series(0.0, index=idx)
+        if sm_div is not None:
+            sm_level = sm_div.rolling(4, min_periods=1).mean().fillna(0.0)
+            sm_chg_12h = sm_div.diff(12).fillna(0.0)
+            sm_chg_24h = sm_div.diff(24).fillna(0.0)
+
+            def _z_cs_df(m_df: pd.DataFrame) -> pd.DataFrame:
+                mu = m_df.mean(axis=1)
+                sd = m_df.std(axis=1).replace(0, 1.0).fillna(1.0)
+                return m_df.sub(mu, axis=0).div(sd, axis=0).clip(-3.5, 3.5).fillna(0.0)
+
+            f_sm_score = (
+                0.50 * _z_cs_df(sm_level)
+                + 0.30 * _z_cs_df(sm_chg_12h)
+                + 0.20 * _z_cs_df(sm_chg_24h)
+            )
+            w_sm = make_continuous_neutral_weights(
+                f_sm_score, inv_vol, gross_leverage=1.0, power=self.factor_power
+            )
+            w_sm_exec = w_sm.shift(1).fillna(0.0)
+            sm_turn = w_sm_exec.diff().abs().sum(axis=1).fillna(0.0)
+            sm_ret = (
+                (w_sm_exec * rets_1h).sum(axis=1)
+                - (w_sm_exec * funding).sum(axis=1)
+                - sm_turn * self.factor_turnover_penalty
+            )
+            for lb in self.lookbacks:
+                min_p = max(6, lb // 4)
+                m_sm = sm_ret.rolling(lb, min_periods=min_p).mean()
+                s_sm = sm_ret.rolling(lb, min_periods=min_p).std().replace(0, 1e-8)
+                t_sm += (m_sm / s_sm * np.sqrt(lb)).fillna(0.0) / float(len(self.lookbacks))
+
+            has_valid_sm = (sm_div.abs().max(axis=1) > 1e-6).astype(float)
+            alpha_sm_dyn = (
+                (0.04 + ((t_sm - 0.30).clip(lower=0.0) * 0.10)).clip(upper=0.14) * has_valid_sm
+            )
+            comb_w = comb_w.mul(1.0 - alpha_sm_dyn, axis=0) + w_sm.mul(alpha_sm_dyn, axis=0)
+
+            whale_accum_squeeze = (
+                (sm_level >= 0.20)
+                & (sm_chg_12h >= 0.04)
+                & (zi[12] >= -0.25)
+            )
+            retail_long_trap = (
+                (sm_level <= -0.25)
+                & (sm_chg_12h <= -0.04)
+                & (zi[12] <= 0.25)
+            )
+            comb_w = (
+                comb_w
+                .where(~((comb_w < 0.0) & whale_accum_squeeze), 0.55 * comb_w)
+                .where(~((comb_w > 0.0) & whale_accum_squeeze), 1.10 * comb_w)
+                .where(~((comb_w > 0.0) & retail_long_trap), 0.55 * comb_w)
+                .where(~((comb_w < 0.0) & retail_long_trap), 1.10 * comb_w)
+            )
+
         # Retoque 1C (Nov 1): Causal Cross-Sectional Composite Score Smoothing (EMA span=3h)
         # Prevents single-bar 24h return oscillations from flipping individual coins Long <-> Short
         # across consecutive 4h rebalances while preserving factor conviction.
@@ -990,6 +1123,9 @@ class SevenFactorOnlineEngine:
             "cmf_24": cmf_24,
             "t_cmf": t_cmf,
             "alpha_cmf_dyn": alpha_cmf_dyn,
+            "sm_div": sm_div if sm_div is not None else pd.DataFrame(0.0, index=idx, columns=cols),
+            "t_sm": t_sm,
+            "alpha_sm_dyn": alpha_sm_dyn,
         }
 
     def allocate_latest(
@@ -1000,6 +1136,7 @@ class SevenFactorOnlineEngine:
         open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
         taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
         premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
     ) -> SevenFactorAllocationResult:
         """
         Evaluates the 7-Factor Causal Online Engine on the latest bar and returns
@@ -1012,6 +1149,7 @@ class SevenFactorOnlineEngine:
             open_interest=open_interest,
             taker_flow=taker_flow,
             premium_index=premium_index,
+            smart_money=smart_money,
         )
 
         w_latest = mats["w_base_1x"].iloc[-1].copy()
@@ -1061,4 +1199,6 @@ class SevenFactorOnlineEngine:
             asset_composite_scores=asset_scores,
             cmf_tstat=float(mats["t_cmf"].iloc[-1]),
             cmf_blend_weight=float(mats["alpha_cmf_dyn"].iloc[-1]),
+            smart_money_tstat=float(mats["t_sm"].iloc[-1]),
+            smart_money_blend_weight=float(mats["alpha_sm_dyn"].iloc[-1]),
         )

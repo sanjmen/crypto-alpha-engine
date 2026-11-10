@@ -988,3 +988,71 @@ def test_m13_levers3_and_4_issue_54_market_neutral_3x_and_multi_slice_chunking()
         assert pytest.approx(child.quantity, abs=1e-6) == 0.50 / 3.0
     db.close()
 
+
+def test_m13_tier1a_issue_55_smart_money_institutional_positioning_factor(tmp_path):
+    """
+    Tests Issue #55 (Tier 1A: Factor F8_Smart_Money_Flow via fapiData Whale vs. Retail Ratios):
+    1) Verifies SevenFactorOnlineEngine computes `sm_div = ln(top_pos_ls_ratio / global_acc_ls_ratio)`,
+       evaluates causal online t-statistics `t_sm`, applies Whale Accumulation Squeeze & Retail Bull Trap
+       guards, and preserves strict 100% dollar neutrality.
+    2) Verifies ShadowTradingDaemon.fetch_smart_money_history ingests and merges fapiData endpoints.
+    """
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+
+    bars_1h, bars_15m = _build_synthetic_universe(n_bars=220, seed=55)
+    smart_money = {}
+    for i, (sym, df) in enumerate(bars_1h.items()):
+        # Alternate Whale accumulation (top_pos=1.80 vs retail=0.95) vs Retail bull trap (top_pos=0.90 vs retail=2.20)
+        if i % 2 == 0:
+            w_ratio = np.linspace(1.30, 1.85, len(df))
+            r_ratio = np.linspace(1.10, 0.92, len(df))
+        else:
+            w_ratio = np.linspace(1.15, 0.88, len(df))
+            r_ratio = np.linspace(1.40, 2.25, len(df))
+        smart_money[sym] = pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "top_pos_ls_ratio": w_ratio,
+            "global_acc_ls_ratio": r_ratio,
+        })
+
+    engine = SevenFactorOnlineEngine()
+    mats = engine.compute_matrices(bars_1h=bars_1h, bars_15m=bars_15m, smart_money=smart_money)
+    assert "sm_div" in mats
+    assert "t_sm" in mats
+    assert "alpha_sm_dyn" in mats
+    assert float(mats["alpha_sm_dyn"].iloc[-1]) >= 0.04 - 1e-6
+    assert float(mats["alpha_sm_dyn"].max()) <= 0.14 + 1e-6
+
+    res = engine.allocate_latest(bars_1h=bars_1h, bars_15m=bars_15m, smart_money=smart_money)
+    assert pytest.approx(sum(res.unit_weights.values()), abs=1e-6) == 0.0
+    assert sum(abs(v) for v in res.unit_weights.values()) > 0.0
+    assert res.smart_money_blend_weight >= 0.04 - 1e-6
+
+    # Test ShadowTradingDaemon.fetch_smart_money_history with live fapiData callbacks
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    daemon = ShadowTradingDaemon(broker=broker, cache_dir=str(tmp_path), enable_warm_start=False)
+
+    class DummyExchange:
+        @staticmethod
+        def fapiDataGetTopLongShortPositionRatio(params):
+            return [
+                {"symbol": params["symbol"], "longShortRatio": "1.80", "timestamp": 1710000000000},
+                {"symbol": params["symbol"], "longShortRatio": "2.00", "timestamp": 1710003600000},
+            ]
+
+        @staticmethod
+        def fapiDataGetGlobalLongShortAccountRatio(params):
+            return [
+                {"symbol": params["symbol"], "longShortRatio": "0.90", "timestamp": 1710000000000},
+                {"symbol": params["symbol"], "longShortRatio": "1.00", "timestamp": 1710003600000},
+            ]
+
+    daemon.exchange = DummyExchange()
+    df_sm = daemon.fetch_smart_money_history("BTC/USDT", limit=24)
+    assert len(df_sm) == 2
+    assert pytest.approx(float(df_sm["smart_money_div"].iloc[-1]), abs=1e-6) == float(np.log(2.00 / 1.00))
+    db.close()
+
+
