@@ -1313,6 +1313,10 @@ class ShadowTradingDaemon:
                 factor_tstats=sf_res.factor_tstats,
             )
 
+        if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
+            self.broker.sync_from_live_exchange(sync_positions=True)
+        self.ensure_position_brackets()
+
         self.last_rebalance_time = datetime.now(timezone.utc)
         if hasattr(self.broker, "db") and self.broker.db:
             ws_state = self.ws_client.state.value if self.ws_client else "POLLING_REST"

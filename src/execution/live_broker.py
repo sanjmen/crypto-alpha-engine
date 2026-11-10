@@ -462,9 +462,35 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
                 # Cancel unfilled portion to re-post at new top of book
                 try:
-                    self.client.cancel_order(live_id, symbol)
+                    cancel_res = self.client.cancel_order(live_id, symbol)
+                    if isinstance(cancel_res, dict):
+                        filled_after = float(cancel_res.get("filled") or 0.0)
+                        avg_after = float(cancel_res.get("average") or chase_px)
+                        delta_fill = max(0.0, filled_after - filled_this)
+                        if delta_fill > 0:
+                            filled_total += delta_fill
+                            cost_total += delta_fill * avg_after
+                            remaining = max(0.0, q_amt - filled_total)
+                            if filled_this <= 0:
+                                self.maker_fills_count += 1
+                        if remaining <= 1e-8:
+                            break
                 except Exception:
-                    pass
+                    try:
+                        chk_after = self.client.fetch_order(live_id, symbol)
+                        filled_after = float(chk_after.get("filled") or 0.0)
+                        avg_after = float(chk_after.get("average") or chase_px)
+                        delta_fill = max(0.0, filled_after - filled_this)
+                        if delta_fill > 0:
+                            filled_total += delta_fill
+                            cost_total += delta_fill * avg_after
+                            remaining = max(0.0, q_amt - filled_total)
+                            if filled_this <= 0:
+                                self.maker_fills_count += 1
+                        if str(chk_after.get("status", "")).lower() in ("closed", "filled") or remaining <= 1e-8:
+                            break
+                    except Exception:
+                        pass
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"GTX attempt {attempt+1} on {symbol} rejected/repricing: {e}")
 
