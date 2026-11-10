@@ -291,8 +291,10 @@ def main() -> None:
         logger.info(f"Resetting database records in {db_path}...")
         db.reset_all_data()
 
-    start_lev = 3.0 if getattr(args, "market_neutral_3x", False) and args.start_leverage == 2.5 else args.start_leverage
-    dd_bracket_val = 0.06 if getattr(args, "market_neutral_3x", False) and args.dd_bracket == 0.10 else args.dd_bracket
+    # In --shadow mode, automatically enable M13 3.0x Market-Neutral preset by default
+    use_mn_3x = getattr(args, "market_neutral_3x", False) or (mode == "shadow")
+    start_lev = 3.0 if use_mn_3x and args.start_leverage == 2.5 else args.start_leverage
+    dd_bracket_val = 0.06 if use_mn_3x and args.dd_bracket == 0.10 else args.dd_bracket
 
     broker = ShadowExecutionBroker(
         database=db,
@@ -338,26 +340,32 @@ def main() -> None:
 
     if args.enable_anomalies:
         from src.strategies.extreme_anomaly import (
+            create_extreme_funding_harvester,
             create_illiquid_early_breakout,
             create_illiquid_funding_fade,
             create_illiquid_oversold_bounce,
         )
 
-        bounce_strat = create_illiquid_oversold_bounce(test_mode=(args.anomaly_size <= 25.0))
+        is_small_test = (args.anomaly_size <= 25.0 and effective_capital <= 1000.0)
+        bounce_strat = create_illiquid_oversold_bounce(test_mode=is_small_test)
         bounce_strat.symbols_filter = None
         bounce_strat.max_position_usd = args.anomaly_size
-        breakout_strat = create_illiquid_early_breakout(test_mode=(args.anomaly_size <= 25.0))
+        breakout_strat = create_illiquid_early_breakout(test_mode=is_small_test)
         breakout_strat.symbols_filter = None
         breakout_strat.max_position_usd = args.anomaly_size
-        fade_strat = create_illiquid_funding_fade(test_mode=(args.anomaly_size <= 25.0))
+        fade_strat = create_illiquid_funding_fade(test_mode=is_small_test)
         fade_strat.symbols_filter = None
         fade_strat.max_position_usd = args.anomaly_size
+        harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
+        harvester_strat.symbols_filter = None
+        harvester_strat.max_position_usd = args.anomaly_size
 
         allocator = MetaStrategyAllocator(
             pairs_strategy=pairs_strategy,
             oversold_bounce_strategy=bounce_strat,
             early_breakout_strategy=breakout_strat,
             funding_fade_strategy=fade_strat,
+            funding_harvester_strategy=harvester_strat,
             seven_factor_engine=seven_factor_engine,
             stepped_leverage_controller=stepped_leverage_ctrl,
             use_seven_factor_engine=use_seven_factor,
@@ -399,7 +407,8 @@ def main() -> None:
             else max(10.0, min(50.0, effective_capital * 0.01))
         ),
     )
-    if getattr(args, "rebalance_now", False):
+    # In --shadow mode, automatically trigger an immediate rebalance on startup so new M13 changes apply right away
+    if getattr(args, "rebalance_now", False) or (mode == "shadow"):
         daemon.last_rebalance_time = None
 
     if args.once:

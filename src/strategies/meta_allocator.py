@@ -18,6 +18,7 @@ from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
 from src.strategies.extreme_anomaly import (
     EarlyBreakoutStrategy,
+    ExtremeFundingHarvesterStrategy,
     OversoldBounceStrategy,
     PumpFundingFadeStrategy,
 )
@@ -47,6 +48,7 @@ class MetaStrategyAllocator:
         oversold_bounce_strategy: OversoldBounceStrategy | None = None,
         early_breakout_strategy: EarlyBreakoutStrategy | None = None,
         funding_fade_strategy: PumpFundingFadeStrategy | None = None,
+        funding_harvester_strategy: ExtremeFundingHarvesterStrategy | None = None,
         regime_classifier: MarketRegimeClassifier | None = None,
         hrp_allocator: HierarchicalRiskParity | None = None,
         base_weights: dict[str, float] | None = None,
@@ -61,6 +63,7 @@ class MetaStrategyAllocator:
         self.oversold_bounce_strategy = oversold_bounce_strategy
         self.early_breakout_strategy = early_breakout_strategy
         self.funding_fade_strategy = funding_fade_strategy
+        self.funding_harvester_strategy = funding_harvester_strategy
         self.regime_classifier = regime_classifier or MarketRegimeClassifier()
         self.hrp_allocator = hrp_allocator or HierarchicalRiskParity(linkage_method="single")
         self.seven_factor_engine = seven_factor_engine or (

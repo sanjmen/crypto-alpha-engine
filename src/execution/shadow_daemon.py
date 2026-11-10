@@ -56,6 +56,8 @@ ANOMALY_STRATEGIES: set[str] = {
     "Extreme Drop Bounce",
     "Early Breakout",
     "Pump & Funding Fade",
+    "Extreme Funding Harvester",
+    "Funding Harvester Hedge",
 }
 
 NON_CRYPTO_TRADFI_BASES: set[str] = {
@@ -111,6 +113,8 @@ class ShadowTradingDaemon:
         anomaly_pct_equity: float | None = 0.045,
         anomaly_prefer_maker: bool = True,
         enable_dynamic_anomaly_sizing: bool = True,
+        harvester_min_abs_funding: float = 0.0015,
+        enable_harvester_beta_hedge: bool = True,
         intracycle_drift_threshold_pct: float = 0.25,
         intracycle_min_rebalance_age_sec: float = 1800.0,
         intracycle_post_stop_settle_sec: float = 900.0,
@@ -152,6 +156,10 @@ class ShadowTradingDaemon:
         self.anomaly_pct_equity = anomaly_pct_equity
         self.anomaly_prefer_maker = anomaly_prefer_maker
         self.enable_dynamic_anomaly_sizing = enable_dynamic_anomaly_sizing
+        self.harvester_min_abs_funding = harvester_min_abs_funding
+        self.enable_harvester_beta_hedge = enable_harvester_beta_hedge
+        self._cached_universe_funding: dict[str, float] = {}
+        self._last_universe_funding_ts: float = 0.0
         self.anomaly_last_exit: dict[str, tuple[datetime, bool]] = {}
         self.intracycle_drift_threshold_pct = intracycle_drift_threshold_pct
         self.intracycle_min_rebalance_age_sec = intracycle_min_rebalance_age_sec
@@ -984,7 +992,7 @@ class ShadowTradingDaemon:
           dynamic Stop-Profit / Trailing Stop armed via manage_trailing_and_profit_locks().
         """
         portfolio = self.broker.get_portfolio()
-        anomaly_strats = {"Extreme Drop Bounce", "Early Breakout", "Pump & Funding Fade"}
+        anomaly_strats = ANOMALY_STRATEGIES
         for sym, pos in portfolio.positions.items():
             if pos.side == PositionSide.FLAT or pos.quantity <= 0:
                 continue
@@ -1525,6 +1533,37 @@ class ShadowTradingDaemon:
             return True
         return False
 
+    def fetch_universe_funding_rates(self, ttl_sec: float = 60.0) -> dict[str, float]:
+        """
+        Fetches real-time funding rates across all 300+ USDS-M perpetuals in a single
+        batch REST call (`/fapi/v1/premiumIndex`), cached for `ttl_sec` seconds.
+        """
+        now_ts = time.time()
+        if self._cached_universe_funding and (now_ts - self._last_universe_funding_ts) < ttl_sec:
+            return self._cached_universe_funding
+
+        f_map: dict[str, float] = {}
+        try:
+            fn = getattr(self.exchange, "fapiPublicGetPremiumIndex", None)
+            if callable(fn) and not isinstance(fn, MagicMock):
+                rows = fn()
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, dict):
+                            raw_sym = str(r.get("symbol") or "")
+                            raw_rate = r.get("lastFundingRate")
+                            if raw_sym.endswith("USDT") and raw_rate is not None:
+                                rate_f = float(raw_rate)
+                                f_map[raw_sym] = rate_f
+                                f_map[f"{raw_sym[:-4]}/USDT"] = rate_f
+        except Exception:
+            pass
+
+        if f_map:
+            self._cached_universe_funding = f_map
+            self._last_universe_funding_ts = now_ts
+        return self._cached_universe_funding
+
     def run_anomaly_scan(self) -> list[Order]:
         """
         Continuously evaluates extreme gainers and losers in real-time for anomaly alpha:
@@ -1615,7 +1654,11 @@ class ShadowTradingDaemon:
                 strategy=strat_name,
             )
 
-        # Scan latest tickers for anomaly candidates
+        # Scan latest tickers for anomaly & extreme funding harvester candidates
+        universe_funding: dict[str, float] = {}
+        if getattr(self.allocator, "funding_harvester_strategy", None):
+            universe_funding = self.fetch_universe_funding_rates()
+
         candidates = []
         open_clean_syms = {s.replace("/", "") for s in all_open_positions}
         for sym, t in self.latest_tickers.items():
@@ -1640,7 +1683,14 @@ class ShadowTradingDaemon:
                 continue
 
             pct = float(t.get("change_24h", 0.0))
-            if pct <= -15.0 or (self.anomaly_breakout_min_24h_pct <= pct <= 22.0) or pct >= 25.0:
+            f_uni = float(universe_funding.get(clean_sym, universe_funding.get(sym, 0.0)))
+            is_price_anomaly = (
+                pct <= -15.0
+                or (self.anomaly_breakout_min_24h_pct <= pct <= 22.0)
+                or pct >= 25.0
+            )
+            is_extreme_funding = abs(f_uni) >= self.harvester_min_abs_funding
+            if is_price_anomaly or is_extreme_funding:
                 candidates.append((sym, pct, float(t.get("price", 0.0))))
 
         for sym, pct, price in candidates:
@@ -1769,6 +1819,94 @@ class ShadowTradingDaemon:
                             continue
                         except Exception as e:
                             logger.warning(f"Error executing Pump & Funding Fade for {sym}: {e}")
+
+            # 4. Extreme Funding Rate Harvester with Beta-Neutral Hedge (Issue #56 / Tier 1B)
+            harvester_strat = getattr(self.allocator, "funding_harvester_strategy", None)
+            if harvester_strat:
+                clean_s = sym.replace("/", "")
+                f_harv = float(universe_funding.get(clean_s, universe_funding.get(sym, 0.0)))
+                if abs(f_harv) >= self.harvester_min_abs_funding:
+                    df_fh = pd.DataFrame([{"funding_rate": f_harv}])
+                    sigs = harvester_strat.generate_signals({sym: df}, funding_data={sym: df_fh})
+                    if sigs:
+                        sig_h = sigs[0]
+                        notional_usd, conf_sc = _resolve_notional(
+                            "Extreme Funding Harvester", sig_h.metadata or {}
+                        )
+                        qty = round(notional_usd / price, 6 if price < 1.0 else 4)
+                        if qty > 0:
+                            side_h = OrderSide.BUY if sig_h.score >= 0 else OrderSide.SELL
+                            try:
+                                order = _submit_anomaly_entry(
+                                    sym_str=sym,
+                                    side=side_h,
+                                    qty_val=qty,
+                                    ref_px=price,
+                                    bid_px=bid_p,
+                                    ask_px=ask_p,
+                                    strat_name="Extreme Funding Harvester",
+                                )
+                                fill_p = order.average_fill_price or price
+                                if side_h == OrderSide.BUY:
+                                    tp = round(fill_p * 1.075, 6 if fill_p < 1.0 else 2)
+                                    sl = round(fill_p * 0.960, 6 if fill_p < 1.0 else 2)
+                                else:
+                                    tp = round(fill_p * 0.925, 6 if fill_p < 1.0 else 2)
+                                    sl = round(fill_p * 1.040, 6 if fill_p < 1.0 else 2)
+                                self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
+                                executed_orders.append(order)
+                                open_clean_syms.add(clean_s)
+
+                                # Optional Beta-Neutral Hedge Leg on an unheld liquid major
+                                if self.enable_harvester_beta_hedge:
+                                    beta_est = float((sig_h.metadata or {}).get("beta_est", 1.0))
+                                    hedge_notional = notional_usd * float(np.clip(beta_est, 0.50, 1.25))
+                                    for h_sym in ("BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"):
+                                        h_clean = h_sym.replace("/", "")
+                                        if (
+                                            h_sym != sym
+                                            and h_sym not in all_open_positions
+                                            and h_clean not in open_clean_syms
+                                            and h_sym in self.latest_tickers
+                                        ):
+                                            h_t = self.latest_tickers[h_sym]
+                                            h_px = float(h_t.get("price") or 0.0)
+                                            h_bid = float(h_t.get("bid") or h_px)
+                                            h_ask = float(h_t.get("ask") or h_px)
+                                            if h_px > 0:
+                                                self.broker.set_market_price(h_sym, price=h_px, bid=h_bid, ask=h_ask)
+                                                h_qty = round(hedge_notional / h_px, 6 if h_px < 1.0 else 4)
+                                                h_side = OrderSide.SELL if side_h == OrderSide.BUY else OrderSide.BUY
+                                                if h_qty > 0:
+                                                    h_ord = _submit_anomaly_entry(
+                                                        sym_str=h_sym,
+                                                        side=h_side,
+                                                        qty_val=h_qty,
+                                                        ref_px=h_px,
+                                                        bid_px=h_bid,
+                                                        ask_px=h_ask,
+                                                        strat_name="Funding Harvester Hedge",
+                                                    )
+                                                    h_fill = h_ord.average_fill_price or h_px
+                                                    if h_side == OrderSide.BUY:
+                                                        h_tp = round(h_fill * 1.075, 6 if h_fill < 1.0 else 2)
+                                                        h_sl = round(h_fill * 0.960, 6 if h_fill < 1.0 else 2)
+                                                    else:
+                                                        h_tp = round(h_fill * 0.925, 6 if h_fill < 1.0 else 2)
+                                                        h_sl = round(h_fill * 1.040, 6 if h_fill < 1.0 else 2)
+                                                    self.broker.create_bracket_orders(
+                                                        symbol=h_sym, take_profit=h_tp, stop_loss=h_sl
+                                                    )
+                                                    executed_orders.append(h_ord)
+                                                    open_clean_syms.add(h_clean)
+                                                    break
+                                logger.info(
+                                    f"Harvester Executed: {side_h.value} on {sym} @ ${fill_p:,.4f} "
+                                    f"[Funding: {f_harv*100:+.3f}% | Size: ${notional_usd:.2f}] (TP: ${tp}, SL: ${sl})"
+                                )
+                                continue
+                            except Exception as e:
+                                logger.warning(f"Error executing Extreme Funding Harvester for {sym}: {e}")
 
         self.last_anomaly_scan_time = now
         return executed_orders

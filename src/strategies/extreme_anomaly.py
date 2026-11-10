@@ -79,6 +79,15 @@ def compute_anomaly_confluence_size(
         s_vol = float(np.clip((vol_ratio - 3.5) / 4.5, 0.0, 1.0))
         s_sweet = float(1.0 - np.clip(abs(ret_24h - 0.16) / 0.06, 0.0, 1.0))
         conf = float(np.clip(0.35 * s_imp + 0.30 * s_vol + 0.20 * s_sweet + 0.15 * s_disp, 0.0, 1.0))
+    elif "harvester" in stype:
+        abs_f = abs(funding_rate)
+        s_fund = float(np.clip((abs_f - 0.0012) / 0.0035, 0.0, 1.0))
+        s_vol = float(np.clip((vol_ratio - 1.0) / 3.0, 0.0, 1.0))
+        if funding_rate < 0:
+            s_mom = float(np.clip((ret_4h + 0.03) / 0.08, 0.0, 1.0))
+        else:
+            s_mom = float(np.clip((rsi - 58.0) / 22.0, 0.0, 1.0))
+        conf = float(np.clip(0.50 * s_fund + 0.20 * s_vol + 0.15 * s_mom + 0.15 * s_disp, 0.0, 1.0))
     else:  # Pump & Funding Fade
         s_pump = float(np.clip((ret_24h - 0.25) / 0.20, 0.0, 1.0))
         s_fund = float(np.clip((funding_rate - 0.0005) / 0.0015, 0.0, 1.0))
@@ -427,4 +436,150 @@ def create_illiquid_funding_fade(test_mode: bool = True) -> PumpFundingFadeStrat
         max_position_usd=15.0 if test_mode else 100.0,
         symbols_filter=ILLIQUID_TAIL_SYMBOLS,
         name="IlliquidFundingFade",
+    )
+
+
+class ExtremeFundingHarvesterStrategy(IStrategy):
+    """
+    Tier 1B (Issue #56): Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals
+    with Beta-Neutral Hedge metadata.
+    - Deep Negative Funding Squeeze (funding_rate <= -0.15% per interval): LONG entry when
+      price is stabilizing (ret_4h >= -4%, RSI >= 32) to harvest negative funding + short squeeze.
+    - Extreme Positive Funding Blow-Off (funding_rate >= +0.15% per interval): SHORT entry when
+      momentum is stalling (ret_4h <= +6%, RSI >= 60) to harvest positive funding + post-settlement fade.
+    """
+
+    def __init__(
+        self,
+        neg_funding_threshold: float = -0.0015,
+        pos_funding_threshold: float = 0.0015,
+        max_position_usd: float = 45.0,
+        max_portfolio_allocation: float = 0.045,
+        symbols_filter: Optional[List[str]] = None,
+        name: str = "ExtremeFundingHarvester",
+    ):
+        self.neg_funding_threshold = neg_funding_threshold
+        self.pos_funding_threshold = pos_funding_threshold
+        self.max_position_usd = max_position_usd
+        self.max_portfolio_allocation = max_portfolio_allocation
+        self.symbols_filter = set(symbols_filter) if symbols_filter else None
+        self.name = name
+
+    def generate_signals(
+        self,
+        market_data: Dict[str, pd.DataFrame],
+        funding_data: Optional[Dict[str, pd.DataFrame]] = None,
+        benchmark_returns_1h: Optional[pd.Series] = None,
+    ) -> List[Signal]:
+        signals: List[Signal] = []
+        now = datetime.now(timezone.utc)
+
+        for sym, df in market_data.items():
+            if self.symbols_filter and sym not in self.symbols_filter:
+                continue
+            if len(df) < 25:
+                continue
+
+            current_funding = 0.0
+            if funding_data and sym in funding_data and not funding_data[sym].empty:
+                f_df = funding_data[sym]
+                col = "rate" if "rate" in f_df.columns else (
+                    "funding_rate" if "funding_rate" in f_df.columns else f_df.columns[0]
+                )
+                current_funding = float(f_df[col].iloc[-1])
+
+            if self.neg_funding_threshold < current_funding < self.pos_funding_threshold:
+                continue
+
+            closes = df["close"].astype(float)
+            vols = df["volume"].astype(float)
+            ret_24h = (closes.iloc[-1] / max(closes.iloc[-25], 1e-12)) - 1.0
+            ret_4h = (closes.iloc[-1] / max(closes.iloc[-5], 1e-12)) - 1.0
+            rsi_val = float(calculate_rsi(closes, period=14).iloc[-1])
+            avg_vol_20h = float(vols.iloc[-24:-4].mean()) if len(vols) >= 24 else 1.0
+            recent_vol = float(vols.iloc[-4:].mean())
+            vol_ratio = recent_vol / (avg_vol_20h + 1e-8)
+
+            # Estimate rolling beta against benchmark if available, else default 1.0
+            beta_est = 1.0
+            if benchmark_returns_1h is not None and len(benchmark_returns_1h) >= 12:
+                asset_rets = closes.pct_change().dropna().tail(24)
+                bench_rets = benchmark_returns_1h.dropna().tail(len(asset_rets))
+                if len(asset_rets) >= 10 and len(bench_rets) == len(asset_rets):
+                    b_var = float(np.var(bench_rets.values))
+                    if b_var > 1e-8:
+                        cov = float(np.cov(asset_rets.values, bench_rets.values)[0, 1])
+                        beta_est = float(np.clip(cov / b_var, 0.50, 1.50))
+
+            # Case 1: Deep Negative Funding Squeeze -> LONG
+            if current_funding <= self.neg_funding_threshold and ret_4h >= -0.04 and rsi_val >= 32.0:
+                raw_score = min(abs(current_funding) / abs(self.neg_funding_threshold) * 0.65, 1.0)
+                signals.append(
+                    Signal(
+                        timestamp=now,
+                        symbol=sym,
+                        score=float(np.clip(raw_score, 0.25, 1.0)),
+                        confidence=0.88,
+                        horizon_minutes=480,
+                        metadata={
+                            "direction": "LONG",
+                            "ret_24h": float(ret_24h),
+                            "ret_4h": float(ret_4h),
+                            "rsi": float(rsi_val),
+                            "vol_ratio": float(vol_ratio),
+                            "funding_rate": float(current_funding),
+                            "beta_est": float(beta_est),
+                        },
+                    )
+                )
+            # Case 2: Extreme Positive Funding Blow-Off -> SHORT
+            elif current_funding >= self.pos_funding_threshold and ret_4h <= 0.06 and rsi_val >= 60.0:
+                raw_score = -min(current_funding / self.pos_funding_threshold * 0.65, 1.0)
+                signals.append(
+                    Signal(
+                        timestamp=now,
+                        symbol=sym,
+                        score=float(np.clip(raw_score, -1.0, -0.25)),
+                        confidence=0.88,
+                        horizon_minutes=480,
+                        metadata={
+                            "direction": "SHORT",
+                            "ret_24h": float(ret_24h),
+                            "ret_4h": float(ret_4h),
+                            "rsi": float(rsi_val),
+                            "vol_ratio": float(vol_ratio),
+                            "funding_rate": float(current_funding),
+                            "beta_est": float(beta_est),
+                        },
+                    )
+                )
+
+        return signals
+
+    def allocate_weights(
+        self,
+        signals: List[Signal],
+        portfolio: Portfolio,
+        volatilities: Dict[str, float],
+    ) -> Dict[str, float]:
+        allocations: Dict[str, float] = {}
+        if not signals:
+            return allocations
+        total_equity = max(portfolio.total_equity, 100.0)
+        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
+        for sig in signals:
+            sign = 1.0 if sig.score >= 0 else -1.0
+            allocations[sig.symbol] = round(sign * cap_usd * abs(sig.score), 2)
+        return allocations
+
+
+def create_extreme_funding_harvester(test_mode: bool = False) -> ExtremeFundingHarvesterStrategy:
+    """Factory preset for Tier 1B Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals."""
+    return ExtremeFundingHarvesterStrategy(
+        neg_funding_threshold=-0.0015,
+        pos_funding_threshold=0.0015,
+        max_position_usd=25.0 if test_mode else 135.0,
+        max_portfolio_allocation=0.045,
+        symbols_filter=None,
+        name="ExtremeFundingHarvester",
     )

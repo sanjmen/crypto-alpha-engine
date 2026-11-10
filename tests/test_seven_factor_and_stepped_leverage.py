@@ -1056,3 +1056,117 @@ def test_m13_tier1a_issue_55_smart_money_institutional_positioning_factor(tmp_pa
     db.close()
 
 
+def test_m13_tier1b_issue_56_extreme_funding_harvester_and_beta_neutral_hedge(tmp_path):
+    """
+    Tests Issue #56 (Tier 1B: Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals
+    with Beta-Neutral Hedge):
+    1) Verifies ExtremeFundingHarvesterStrategy generates LONG signals on deep negative funding
+       (<= -0.15% / 8h) and SHORT signals on extreme positive funding (>= +0.18% / 8h) while
+       filtering out runaway blow-offs against the carry leg.
+    2) Verifies ShadowTradingDaemon.run_anomaly_scan() executes both the Extreme Funding Harvester
+       Maker limit entry on the extreme-funding perpetual AND the opposing Beta-Neutral Hedge leg
+       (`Funding Harvester Hedge`) on an unheld liquid major (`BTC/USDT`).
+    """
+    from src.domain.enums import OrderType, PositionSide
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+    from src.strategies.extreme_anomaly import create_extreme_funding_harvester
+    from src.strategies.meta_allocator import MetaStrategyAllocator
+
+    harvester = create_extreme_funding_harvester()
+    ts = pd.date_range("2026-03-01", periods=30, freq="1h", tz="UTC")
+    # Controlled price series (+2% over 24h, +0.5% over 4h)
+    closes = np.linspace(10.0, 10.20, 30)
+    df_kline = pd.DataFrame({
+        "timestamp": ts,
+        "open": closes * 0.998,
+        "high": closes * 1.005,
+        "low": closes * 0.995,
+        "close": closes,
+        "volume": np.full(30, 500_000.0),
+    })
+
+    # 1a. Deep negative funding (-0.35% / 8h == -383% APR) -> LONG carry + short squeeze harvest
+    sigs_long = harvester.generate_signals(
+        market_data={"KAVA/USDT": df_kline},
+        funding_data={"KAVA/USDT": pd.DataFrame([{"funding_rate": -0.0035}])},
+    )
+    assert len(sigs_long) == 1
+    assert sigs_long[0].score > 0.0
+    assert sigs_long[0].metadata["direction"] == "LONG"
+
+    # 1b. Extreme positive funding (+0.30% / 8h == +328% APR) -> SHORT carry + long unwind harvest
+    sigs_short = harvester.generate_signals(
+        market_data={"KAVA/USDT": df_kline},
+        funding_data={"KAVA/USDT": pd.DataFrame([{"funding_rate": 0.0030}])},
+    )
+    assert len(sigs_short) == 1
+    assert sigs_short[0].score < 0.0
+    assert sigs_short[0].metadata["direction"] == "SHORT"
+
+    # 2. Full ShadowTradingDaemon.run_anomaly_scan() with Beta-Neutral Hedge on BTC/USDT
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    broker.set_market_price("KAVA/USDT", price=10.20, bid=10.19, ask=10.21)
+    broker.set_market_price("BTC/USDT", price=60000.0, bid=59995.0, ask=60005.0)
+
+    allocator = MetaStrategyAllocator(
+        funding_harvester_strategy=harvester,
+        use_seven_factor_engine=True,
+    )
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        allocator=allocator,
+        cache_dir=str(tmp_path),
+        enable_warm_start=False,
+        enable_anomalies=True,
+        anomaly_pct_equity=0.045,
+        anomaly_prefer_maker=True,
+        enable_harvester_beta_hedge=True,
+    )
+
+    class DummyPremiumExchange:
+        @staticmethod
+        def fapiPublicGetPremiumIndex():
+            return [
+                {"symbol": "KAVAUSDT", "lastFundingRate": "-0.0035"},
+                {"symbol": "BTCUSDT", "lastFundingRate": "0.0001"},
+            ]
+
+    daemon.exchange = DummyPremiumExchange()
+    daemon.latest_tickers = {
+        "KAVA/USDT": {
+            "price": 10.20,
+            "bid": 10.19,
+            "ask": 10.21,
+            "change_24h": 2.0,
+            "volume_24h": 25_000_000.0,
+        },
+        "BTC/USDT": {
+            "price": 60000.0,
+            "bid": 59995.0,
+            "ask": 60005.0,
+            "change_24h": 1.0,
+            "volume_24h": 900_000_000.0,
+        },
+    }
+    daemon.fetch_symbol_klines = lambda sym, timeframe="1h", limit=30: df_kline
+
+    orders = daemon.run_anomaly_scan()
+    assert len(orders) == 2
+    harv_ord, hedge_ord = orders[0], orders[1]
+    assert harv_ord.symbol == "KAVA/USDT"
+    assert harv_ord.strategy == "Extreme Funding Harvester"
+    assert harv_ord.order_type == OrderType.LIMIT
+
+    assert hedge_ord.symbol == "BTC/USDT"
+    assert hedge_ord.strategy == "Funding Harvester Hedge"
+    assert hedge_ord.order_type == OrderType.LIMIT
+
+    port = broker.get_portfolio()
+    assert port.positions["KAVA/USDT"].side == PositionSide.LONG
+    assert port.positions["BTC/USDT"].side == PositionSide.SHORT
+    db.close()
+
+
+
