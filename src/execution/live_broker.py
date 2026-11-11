@@ -304,12 +304,18 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         return round(float(price), 6 if price < 1.0 else (4 if price < 100.0 else 2))
 
     def quantize_amount(self, symbol: str, amount: float) -> float:
-        """Quantizes quantity strictly to Binance symbol `stepSize`."""
+        """Quantizes quantity strictly to Binance symbol `stepSize`, returning 0.0 if below min lot."""
         try:
             if hasattr(self.client, "markets") and self.client.markets:
+                mkt = self.client.markets.get(symbol) or self.client.markets.get(f"{symbol}:USDT")
+                if isinstance(mkt, dict):
+                    min_amt = float((mkt.get("limits", {}).get("amount", {}) or {}).get("min") or 0.0)
+                    if min_amt > 0 and float(amount) < min_amt:
+                        return 0.0
                 return float(self.client.amount_to_precision(symbol, amount))
         except Exception:
-            pass
+            if hasattr(self.client, "markets") and self.client.markets:
+                return 0.0
         return round(float(amount), 4 if amount < 10.0 else 2)
 
     def fetch_best_bid_ask(self, symbol: str, fallback_price: float = 100.0) -> tuple[float, float]:

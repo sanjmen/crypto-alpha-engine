@@ -764,18 +764,26 @@ class ShadowExecutionBroker(IExecutionClient):
                     should_fill = True
 
             if should_fill:
-                if order.order_type == OrderType.STOP_LOSS:
-                    self._fill_taker_order(order, fill_price=limit_price)
-                else:
-                    self._fill_maker_order(order, fill_price=limit_price)
-                filled_orders.append(order)
+                try:
+                    if order.order_type == OrderType.STOP_LOSS:
+                        self._fill_taker_order(order, fill_price=limit_price)
+                    else:
+                        self._fill_maker_order(order, fill_price=limit_price)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Failed to fill pending order {order.id} ({symbol}): {exc}")
+                    if self.is_live and order.order_type == OrderType.LIMIT:
+                        order.status = OrderStatus.CANCELED
+                        self.db.update_order_status(order.id, OrderStatus.CANCELED)
+                    continue
+                if order.status == OrderStatus.FILLED:
+                    filled_orders.append(order)
 
-                # OCO bracket logic: Cancel opposing bracket order if TP or SL triggered
-                if order.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
-                    opposing = OrderType.STOP_LOSS if order.order_type == OrderType.TAKE_PROFIT else OrderType.TAKE_PROFIT
-                    for other in self.db.get_pending_orders():
-                        if other.symbol == symbol and other.order_type == opposing:
-                            self.db.update_order_status(other.id, OrderStatus.CANCELED)
+                    # OCO bracket logic: Cancel opposing bracket order if TP or SL triggered
+                    if order.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
+                        opposing = OrderType.STOP_LOSS if order.order_type == OrderType.TAKE_PROFIT else OrderType.TAKE_PROFIT
+                        for other in self.db.get_pending_orders():
+                            if other.symbol == symbol and other.order_type == opposing:
+                                self.db.update_order_status(other.id, OrderStatus.CANCELED)
 
         return filled_orders
 
