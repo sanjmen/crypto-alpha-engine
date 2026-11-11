@@ -313,18 +313,43 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         return round(float(amount), 4 if amount < 10.0 else 2)
 
     def fetch_best_bid_ask(self, symbol: str, fallback_price: float = 100.0) -> tuple[float, float]:
-        """Fetches L1 top-of-book `(best_bid, best_ask)` for Post-Only limit placement."""
+        """
+        Fetches true L1 top-of-book `(best_bid, best_ask)` for Post-Only (`GTX`) limit placement.
+        Queries L1 `fetch_order_book(symbol, limit=5)` first (since Binance Futures `/fapi/v1/ticker/24hr`
+        omits `bid`/`ask`), falling back to `fetch_ticker` with tick-safe spread separation.
+        """
+        try:
+            if hasattr(self.client, "fetch_order_book"):
+                ob = self.client.fetch_order_book(symbol, limit=5)
+                if isinstance(ob, dict):
+                    bids = ob.get("bids") or []
+                    asks = ob.get("asks") or []
+                    if len(bids) > 0 and len(asks) > 0:
+                        b_px = float(bids[0][0])
+                        a_px = float(asks[0][0])
+                        if 0 < b_px < a_px:
+                            return b_px, a_px
+        except Exception:
+            pass
+
         try:
             ticker = self.client.fetch_ticker(symbol)
             last = float(ticker.get("last") or ticker.get("close") or fallback_price)
-            bid = float(ticker.get("bid") or (last * 0.9999))
-            ask = float(ticker.get("ask") or (last * 1.0001))
+            raw_bid = ticker.get("bid")
+            raw_ask = ticker.get("ask")
+            bid = float(raw_bid) if (raw_bid is not None and float(raw_bid) > 0) else (last * 0.9995)
+            ask = float(raw_ask) if (raw_ask is not None and float(raw_ask) > 0) else (last * 1.0005)
             if bid >= ask:
-                bid = last * 0.9999
-                ask = last * 1.0001
-            return bid, ask
+                bid = last * 0.9995
+                ask = last * 1.0005
+            q_bid = self.quantize_price(symbol, bid)
+            q_ask = self.quantize_price(symbol, ask)
+            if q_ask <= q_bid:
+                step = max(last * 0.001, 1e-6)
+                q_ask = self.quantize_price(symbol, q_bid + step)
+            return q_bid, max(q_ask, q_bid * 1.0002)
         except Exception:
-            return fallback_price * 0.9999, fallback_price * 1.0001
+            return fallback_price * 0.9995, fallback_price * 1.0005
 
     @staticmethod
     def compute_effective_margin_collateral(bal: dict[str, Any]) -> dict[str, Any]:
@@ -494,9 +519,17 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         filled_total = 0.0
         cost_total = 0.0
 
+        last_gtx_rejected = False
         for attempt in range(self.max_chase_iterations):
             bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=limit_px)
-            chase_px = self.quantize_price(symbol, bid if side == OrderSide.BUY else ask)
+            spread = max(ask - bid, bid * 0.0005, 1e-6)
+            if side == OrderSide.BUY:
+                raw_target = (bid - spread * 0.5) if last_gtx_rejected else bid
+            else:
+                raw_target = (ask + spread * 1.2) if last_gtx_rejected else ask
+            chase_px = self.quantize_price(symbol, raw_target)
+            if side == OrderSide.SELL and chase_px <= bid:
+                chase_px = self.quantize_price(symbol, ask + max(spread, ask * 0.001))
             params: dict[str, Any] = {"timeInForce": "GTX"}
             if reduce_only:
                 params["reduceOnly"] = True
@@ -510,6 +543,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                     price=chase_px,
                     params=params,
                 )
+                last_gtx_rejected = False
                 live_id = str(res.get("id", order_id))
                 last_order_id = live_id
                 if self.chase_interval_sec > 0:
@@ -561,7 +595,10 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                     except Exception:
                         pass
             except Exception as e:  # noqa: BLE001
+                last_gtx_rejected = True
                 logger.debug(f"GTX attempt {attempt+1} on {symbol} rejected/repricing: {e}")
+                if self.chase_interval_sec > 0:
+                    time.sleep(min(0.25, self.chase_interval_sec * 0.2))
 
         # Fallback for any remaining quantity
         if remaining > 1e-8 and self.allow_taker_fallback:

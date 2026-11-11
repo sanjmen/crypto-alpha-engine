@@ -155,8 +155,8 @@ def main():
             dry_run=False,
             initial_capital=args.capital,
             max_gross_leverage=max(6.0, args.max_leverage * 1.25),
-            chase_interval_sec=1.5,
-            max_chase_iterations=2,
+            chase_interval_sec=3.0,
+            max_chase_iterations=4,
             allow_taker_fallback=True,
             kill_switch=kill_switch,
         )
