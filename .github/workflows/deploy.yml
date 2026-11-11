@@ -1,0 +1,114 @@
+name: CI/CD — Test & Deploy to GCP Tokyo (Docker + Zero-Trust IAP)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: my-project-alpha-514420
+  GCP_ZONE: asia-northeast1-a
+  GCP_INSTANCE: crypto-alpha-engine
+
+jobs:
+  test:
+    name: Run Pytest Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Suite
+        run: pytest -q tests/
+
+  deploy:
+    name: Deploy Docker Stack to Tokyo VM via IAP Tunnel
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-tokyo-deploy
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check GCP_SA_KEY secret configured
+        id: check_secret
+        env:
+          HAS_KEY: ${{ secrets.GCP_SA_KEY != '' }}
+        run: |
+          echo "configured=$HAS_KEY" >> $GITHUB_OUTPUT
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::notice::GCP_SA_KEY secret not yet set in GitHub. Run './scripts/deploy_to_gcp.sh --bootstrap' once locally to configure IAM & GitHub Secrets."
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: steps.check_secret.outputs.configured == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        if: steps.check_secret.outputs.configured == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Package release bundle
+        if: steps.check_secret.outputs.configured == 'true'
+        run: |
+          tar --exclude='.git' \
+              --exclude='.github' \
+              --exclude='reports' \
+              --exclude='data' \
+              --exclude='logs' \
+              -czf /tmp/release.tar.gz .
+
+      - name: Upload & Rebuild Docker Containers via IAP Zero-Trust Tunnel
+        if: steps.check_secret.outputs.configured == 'true'
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          gcloud compute scp /tmp/release.tar.gz \
+            "santim@${GCP_INSTANCE}:/tmp/release.tar.gz" \
+            --zone="${GCP_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --tunnel-through-iap \
+            --quiet
+
+          gcloud compute ssh "santim@${GCP_INSTANCE}" \
+            --zone="${GCP_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --tunnel-through-iap \
+            --quiet \
+            --command="
+              set -euo pipefail
+              mkdir -p ~/crypto-alpha-engine/data ~/crypto-alpha-engine/logs
+              tar -xzf /tmp/release.tar.gz -C ~/crypto-alpha-engine
+              rm -f /tmp/release.tar.gz
+              cd ~/crypto-alpha-engine
+
+              if [ -n '${BINANCE_API_KEY}' ] && [ -n '${BINANCE_API_SECRET}' ]; then
+                printf 'BINANCE_API_KEY=%s\nBINANCE_API_SECRET=%s\nCLOUDFLARE_TUNNEL_TOKEN=%s\n' \
+                  '${BINANCE_API_KEY}' '${BINANCE_API_SECRET}' '${CLOUDFLARE_TUNNEL_TOKEN}' > .env
+                chmod 600 .env
+              fi
+
+              if [ -n '${CLOUDFLARE_TUNNEL_TOKEN}' ]; then
+                docker compose --profile cloudflare up -d --build --remove-orphans
+              else
+                docker compose up -d --build --remove-orphans
+              fi
+              docker compose ps
+            "

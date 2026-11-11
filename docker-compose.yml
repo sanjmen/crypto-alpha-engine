@@ -1,0 +1,52 @@
+services:
+  crypto-mainnet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: crypto-alpha-engine:latest
+    container_name: crypto-mainnet
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "1000"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  crypto-shadow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: crypto-alpha-engine:latest
+    container_name: crypto-shadow
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "scripts/run_trading.py", "--daemon", "--shadow", "--capital", "3000"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # Opcional: Túnel Zero-Trust saliente con Cloudflare (0 puertos entrantes abiertos)
+  # Se activa automáticamente con: docker compose --profile cloudflare up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: crypto-cloudflared
+    restart: unless-stopped
+    profiles: ["cloudflare"]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
