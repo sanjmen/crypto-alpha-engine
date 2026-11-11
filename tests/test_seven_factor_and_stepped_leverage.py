@@ -1219,5 +1219,99 @@ def test_m13_tier1c_issue_57_yield_bearing_collateral_bfusd_ldusdt_accounting(tm
     db.close()
 
 
+def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_path):
+    """
+    Tests Issue #58 (Tier 2: Quarterly Delivery Basis Regime Indicator `fapiDataGetBasis`
+    & Ecosystem Guardrails):
+    1) Verifies SevenFactorOnlineEngine computes `basis_regime_scalar` across Institutional Contango
+       (+10% APR -> 1.05x), Backwardation Stress (-4% APR -> 0.88x), and Retail Overheating (+30% APR -> 0.90x)
+       while preserving strict 100% dollar neutrality.
+    2) Verifies ShadowTradingDaemon.fetch_quarterly_basis_history ingests `fapiDataGetBasis` (`CURRENT_QUARTER`).
+    3) Verifies Ecosystem Guardrails strictly block negative-EV retail Options (`-C`/`-P`), leveraged decay
+       tokens (`BTCUPUSDT`/`ETHDOWNUSDT`), and non-24/7 TradFi symbols (`TSLAUSDT`/`XAUUSDT`).
+    """
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+
+    bars_1h, bars_15m = _build_synthetic_universe(n_bars=180, seed=58)
+    ts_col = next(iter(bars_1h.values()))["timestamp"]
+    engine = SevenFactorOnlineEngine()
+
+    # 1a. Healthy Institutional Contango (+10% APR) -> scalar = 1.05
+    df_contango = pd.DataFrame({
+        "timestamp": ts_col,
+        "basisRate": np.full(len(ts_col), 0.025),
+        "annualizedBasisRate": np.full(len(ts_col), 0.10),
+    })
+    res_contango = engine.allocate_latest(
+        bars_1h=bars_1h,
+        bars_15m=bars_15m,
+        quarterly_basis={"BTCUSDT": df_contango, "ETHUSDT": df_contango},
+    )
+    assert pytest.approx(res_contango.basis_regime_scalar, abs=1e-6) == 1.05
+    assert res_contango.basis_regime_label == "INSTITUTIONAL_CONTANGO"
+    assert pytest.approx(sum(res_contango.unit_weights.values()), abs=1e-6) == 0.0
+
+    # 1b. Severe Backwardation Stress (-4% APR) -> scalar = 0.88
+    df_back = pd.DataFrame({
+        "timestamp": ts_col,
+        "basisRate": np.full(len(ts_col), -0.010),
+        "annualizedBasisRate": np.full(len(ts_col), -0.04),
+    })
+    res_back = engine.allocate_latest(
+        bars_1h=bars_1h,
+        bars_15m=bars_15m,
+        quarterly_basis={"BTCUSDT": df_back},
+    )
+    assert pytest.approx(res_back.basis_regime_scalar, abs=1e-6) == 0.88
+    assert res_back.basis_regime_label == "BACKWARDATION_STRESS"
+    assert res_contango.conviction >= res_back.conviction
+
+    # 1c. Overheated Retail Blow-Off (+30% APR) -> scalar = 0.90
+    df_hot = pd.DataFrame({
+        "timestamp": ts_col,
+        "basisRate": np.full(len(ts_col), 0.075),
+        "annualizedBasisRate": np.full(len(ts_col), 0.30),
+    })
+    res_hot = engine.allocate_latest(
+        bars_1h=bars_1h,
+        bars_15m=bars_15m,
+        quarterly_basis={"BTCUSDT": df_hot},
+    )
+    assert pytest.approx(res_hot.basis_regime_scalar, abs=1e-6) == 0.90
+    assert res_hot.basis_regime_label == "OVERHEATED_CONTANGO"
+
+    # 2. ShadowTradingDaemon.fetch_quarterly_basis_history & Ecosystem Guardrails
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    daemon = ShadowTradingDaemon(broker=broker, cache_dir=str(tmp_path), enable_warm_start=False)
+
+    class DummyBasisExchange:
+        @staticmethod
+        def fapiDataGetBasis(params):
+            assert params["contractType"] == "CURRENT_QUARTER"
+            return [
+                {"pair": params["pair"], "basisRate": "0.022", "annualizedBasisRate": "0.095", "timestamp": 1710000000000},
+                {"pair": params["pair"], "basisRate": "0.025", "annualizedBasisRate": "", "timestamp": 1710003600000},
+            ]
+
+    daemon.exchange = DummyBasisExchange()
+    df_qb = daemon.fetch_quarterly_basis_history("BTC/USDT", limit=24)
+    assert len(df_qb) == 2
+    assert pytest.approx(float(df_qb["annualizedBasisRate"].iloc[0]), abs=1e-6) == 0.095
+    assert pytest.approx(float(df_qb["annualizedBasisRate"].iloc[1]), abs=1e-6) == 0.025 * 4.0
+
+    # 3. Ecosystem Guardrails
+    assert daemon._is_tradfi_or_gapped_symbol("BTC-260327-90000-C") is True
+    assert daemon._is_tradfi_or_gapped_symbol("ETH-260327-3000-P") is True
+    assert daemon._is_tradfi_or_gapped_symbol("BTCUP/USDT") is True
+    assert daemon._is_tradfi_or_gapped_symbol("ETHDOWNUSDT") is True
+    assert daemon._is_tradfi_or_gapped_symbol("TSLA/USDT") is True
+    assert daemon._is_tradfi_or_gapped_symbol("BTC/USDT") is False
+    assert daemon._is_tradfi_or_gapped_symbol("SOL/USDT") is False
+    db.close()
+
+
+
 
 

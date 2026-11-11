@@ -875,6 +875,82 @@ class ShadowTradingDaemon:
         )
         return merged.tail(limit).reset_index(drop=True)
 
+    def fetch_quarterly_basis_history(
+        self,
+        pair: str = "BTCUSDT",
+        contract_type: str = "CURRENT_QUARTER",
+        limit: int = 72,
+    ) -> pd.DataFrame:
+        """
+        Tier 2 (Issue #58): Fetches trailing hourly Quarterly Delivery Basis (`fapiDataGetBasis`,
+        `contractType='CURRENT_QUARTER'`) for `pair` (`BTCUSDT` / `ETHUSDT`) to compute the
+        Institutional Quarterly Basis Regime Scalar.
+        """
+        clean_pair = pair.split(":")[0].replace("/", "")
+        basis_path = self.cache_dir / "quarterly_basis" / "1h" / f"{clean_pair}.parquet"
+        cached_df = pd.DataFrame()
+
+        if self.enable_warm_start and basis_path.exists():
+            try:
+                raw_b = pd.read_parquet(basis_path).tail(max(limit, 120))
+                if not raw_b.empty and "timestamp" in raw_b.columns:
+                    cached_df = raw_b.copy()
+                    cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
+            except Exception:
+                pass
+
+        live_records: list[dict[str, Any]] = []
+        try:
+            fn_basis = getattr(self.exchange, "fapiDataGetBasis", None)
+            if callable(fn_basis) and not isinstance(fn_basis, MagicMock):
+                rows = fn_basis(
+                    {
+                        "pair": clean_pair,
+                        "contractType": contract_type,
+                        "period": "1h",
+                        "limit": min(limit, 48),
+                    }
+                )
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, dict):
+                            ts_ms = int(r.get("timestamp") or 0)
+                            b_rate_raw = r.get("basisRate")
+                            ann_raw = r.get("annualizedBasisRate")
+                            if ts_ms > 0 and (b_rate_raw is not None or ann_raw is not None):
+                                b_rate = float(b_rate_raw or 0.0)
+                                ann_rate = (
+                                    float(ann_raw)
+                                    if (ann_raw not in (None, ""))
+                                    else float(b_rate * 4.0)
+                                )
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "basisRate": b_rate,
+                                        "annualizedBasisRate": ann_rate,
+                                    }
+                                )
+        except Exception:
+            pass
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged.tail(limit).reset_index(drop=True)
+
     def fetch_symbol_obi(self, symbol: str, levels: int = 5) -> float | None:
         """
         Fetches Top-N Level-2 Order Book depth from Binance Futures and returns
@@ -1223,12 +1299,18 @@ class ShadowTradingDaemon:
             )
             return []
 
-        # Fetch live funding rates (or 72h history for 7-Factor Engine), Open Interest (#46), Taker Flow (#48), Premium Index (#49) & Smart Money (#55)
+        # Fetch live funding rates (or 72h history for 7-Factor Engine), Open Interest (#46), Taker Flow (#48), Premium Index (#49), Smart Money (#55) & Quarterly Basis (#58)
         funding_data: dict[str, pd.DataFrame] = {}
         open_interest_data: dict[str, pd.DataFrame] = {}
         taker_flow_data: dict[str, pd.DataFrame] = {}
         premium_index_data: dict[str, pd.DataFrame] = {}
         smart_money_data: dict[str, pd.DataFrame] = {}
+        quarterly_basis_data: dict[str, pd.DataFrame] = {}
+        if use_7f:
+            for b_pair in ("BTCUSDT", "ETHUSDT"):
+                df_qb = self.fetch_quarterly_basis_history(b_pair)
+                if not df_qb.empty:
+                    quarterly_basis_data[b_pair] = df_qb
         for sym in self.symbols:
             clean_sym = sym.replace("/", "")
             if clean_sym not in market_data:
@@ -1284,6 +1366,7 @@ class ShadowTradingDaemon:
                 taker_flow_data=taker_flow_data if taker_flow_data else None,
                 premium_index_data=premium_index_data if premium_index_data else None,
                 smart_money_data=smart_money_data if smart_money_data else None,
+                quarterly_basis_data=quarterly_basis_data if quarterly_basis_data else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
@@ -1481,11 +1564,19 @@ class ShadowTradingDaemon:
     @staticmethod
     def _is_tradfi_or_gapped_symbol(symbol: str, df: pd.DataFrame | None = None) -> bool:
         """
-        Returns True if `symbol` is a non-crypto TradFi equity/ETF/FX/commodity perpetual
-        or exhibits non-24/7 session gaps / flat market-closed bars.
+        Tier 2 (Issue #58) Ecosystem Guardrail:
+        Returns True if `symbol` is:
+        1) A non-crypto TradFi equity/ETF/FX/commodity perpetual (`NON_CRYPTO_TRADFI_BASES`)
+        2) A retail option contract (`-C`, `-P`) or leveraged decay token (`UP`, `DOWN`, `BULL`, `BEAR`)
+        3) Exhibiting non-24/7 session gaps / flat market-closed bars.
         """
+        raw_upper = symbol.upper()
+        if "-C" in raw_upper or "-P" in raw_upper:
+            return True
         base = symbol.split(":")[0].replace("/USDT", "").replace("USDT", "").upper()
         if base in NON_CRYPTO_TRADFI_BASES:
+            return True
+        if len(base) > 3 and base.endswith(("UP", "DOWN", "BULL", "BEAR")):
             return True
         if df is not None and not df.empty and len(df) >= 20:
             zero_vol_bars = int((df["volume"] <= 0).sum())

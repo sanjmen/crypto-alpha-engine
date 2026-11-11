@@ -80,6 +80,9 @@ class SevenFactorAllocationResult:
     cmf_blend_weight: float = 0.0
     smart_money_tstat: float = 0.0
     smart_money_blend_weight: float = 0.0
+    quarterly_basis_apr: float = 0.0
+    basis_regime_scalar: float = 1.0
+    basis_regime_label: str = "NEUTRAL"
 
 
 def make_continuous_neutral_weights(
@@ -590,6 +593,75 @@ class SevenFactorOnlineEngine:
             sm_df[sym] = s_re.ffill().fillna(0.0)
         return sm_df
 
+    def _extract_quarterly_basis(
+        self,
+        quarterly_basis: Optional[
+            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
+        ],
+        close: pd.DataFrame,
+    ) -> Optional[pd.Series]:
+        """
+        Tier 2 (Issue #58): Extracts annualized quarterly delivery basis (`CURRENT_QUARTER` vs Spot Index)
+        from `fapiDataGetBasis` (`annualizedBasisRate` or `basisRate * 4.0`) aligned to `close.index`.
+        """
+        if quarterly_basis is None:
+            return None
+
+        def _parse_single_basis(item: Union[float, int, pd.Series, pd.DataFrame]) -> Optional[pd.Series]:
+            if isinstance(item, (int, float, np.floating)):
+                return pd.Series(float(item), index=close.index, dtype=float)
+            if isinstance(item, pd.Series):
+                s = item.copy()
+                if not isinstance(s.index, pd.DatetimeIndex):
+                    s.index = pd.to_datetime(s.index, utc=True)
+                elif s.index.tz is None:
+                    s.index = s.index.tz_localize("UTC")
+                s.index = s.index.round("1h")
+                s = s[~s.index.duplicated(keep="last")].sort_index()
+                return s.reindex(close.index).ffill().fillna(0.0)
+            if isinstance(item, pd.DataFrame) and not item.empty:
+                d_b = item.copy()
+                if "timestamp" in d_b.columns:
+                    ts = d_b["timestamp"]
+                    if pd.api.types.is_numeric_dtype(ts):
+                        unit = "ms" if float(ts.dropna().max()) > 1e11 else "s"
+                        d_b = d_b.set_index(pd.to_datetime(ts, unit=unit, utc=True))
+                    else:
+                        d_b = d_b.set_index(pd.to_datetime(ts, utc=True))
+                elif not isinstance(d_b.index, pd.DatetimeIndex):
+                    d_b.index = pd.to_datetime(d_b.index, utc=True)
+                elif d_b.index.tz is None:
+                    d_b.index = d_b.index.tz_localize("UTC")
+                d_b.index = d_b.index.round("1h")
+                d_b = d_b[~d_b.index.duplicated(keep="last")].sort_index()
+                if "annualizedBasisRate" in d_b.columns:
+                    s = pd.to_numeric(d_b["annualizedBasisRate"], errors="coerce")
+                elif "annualized_basis" in d_b.columns:
+                    s = pd.to_numeric(d_b["annualized_basis"], errors="coerce")
+                elif "basisRate" in d_b.columns:
+                    s = pd.to_numeric(d_b["basisRate"], errors="coerce") * 4.0
+                else:
+                    s = pd.to_numeric(d_b[d_b.columns[0]], errors="coerce")
+                s_re = s.reindex(close.index)
+                if s_re.notna().sum() == 0:
+                    s_shift = s.copy()
+                    s_shift.index = s_shift.index + pd.Timedelta(hours=1)
+                    s_re = s_shift.reindex(close.index)
+                return s_re.ffill().fillna(0.0)
+            return None
+
+        if isinstance(quarterly_basis, dict):
+            parsed_list = []
+            for v in quarterly_basis.values():
+                p_s = _parse_single_basis(v)
+                if p_s is not None:
+                    parsed_list.append(p_s)
+            if not parsed_list:
+                return None
+            return pd.concat(parsed_list, axis=1).mean(axis=1).fillna(0.0)
+
+        return _parse_single_basis(quarterly_basis)
+
     def _compute_subhourly_pullback_adjustment(
         self,
         bars_15m: Optional[Dict[str, pd.DataFrame]],
@@ -630,6 +702,9 @@ class SevenFactorOnlineEngine:
         taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
         premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
         smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        quarterly_basis: Optional[
+            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
+        ] = None,
     ) -> Dict[str, Union[pd.DataFrame, pd.Series]]:
         """
         Computes full historical matrices for the 7 factors, online factor weights,
@@ -643,6 +718,7 @@ class SevenFactorOnlineEngine:
         taker_pair = self._extract_taker_flow(taker_flow, bars_1h, close)
         prem_close = self._extract_premium_index(premium_index, close)
         sm_div = self._extract_smart_money(smart_money, close)
+        q_basis_apr = self._extract_quarterly_basis(quarterly_basis, close)
         idx = close.index
         cols = list(close.columns)
 
@@ -821,6 +897,30 @@ class SevenFactorOnlineEngine:
         conviction = (raw_fw.sum(axis=1) / (float(priors_aligned.sum()) ** 2.0)).clip(
             self.conviction_bounds[0], self.conviction_bounds[1]
         )
+
+        # Tier 2 (Issue #58): Quarterly Delivery Basis Regime Scalar (`fapiDataGetBasis`)
+        # - Healthy Institutional Contango (+3% to +18% APR): scalar = 1.05
+        # - Severe Backwardation / Macro Stress (<= -2% APR): scalar = 0.88
+        # - Overheated Retail Blow-Off (>= +25% APR): scalar = 0.90
+        basis_regime_scalar = pd.Series(1.0, index=idx, dtype=float)
+        if q_basis_apr is not None:
+            b_ema = q_basis_apr.ewm(span=6, min_periods=1).mean()
+            basis_regime_scalar = pd.Series(
+                np.where(
+                    b_ema <= -0.02,
+                    0.88,
+                    np.where(
+                        b_ema >= 0.25,
+                        0.90,
+                        np.where((b_ema >= 0.03) & (b_ema <= 0.18), 1.05, 1.0),
+                    ),
+                ),
+                index=idx,
+                dtype=float,
+            )
+            conviction = (conviction * basis_regime_scalar).clip(
+                self.conviction_bounds[0], self.conviction_bounds[1]
+            )
 
         comb_w = pd.DataFrame(0.0, index=idx, columns=cols)
         for k in FACTOR_NAMES:
@@ -1126,6 +1226,8 @@ class SevenFactorOnlineEngine:
             "sm_div": sm_div if sm_div is not None else pd.DataFrame(0.0, index=idx, columns=cols),
             "t_sm": t_sm,
             "alpha_sm_dyn": alpha_sm_dyn,
+            "quarterly_basis_apr": q_basis_apr if q_basis_apr is not None else pd.Series(0.0, index=idx),
+            "basis_regime_scalar": basis_regime_scalar,
         }
 
     def allocate_latest(
@@ -1137,6 +1239,9 @@ class SevenFactorOnlineEngine:
         taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
         premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
         smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
+        quarterly_basis: Optional[
+            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
+        ] = None,
     ) -> SevenFactorAllocationResult:
         """
         Evaluates the 7-Factor Causal Online Engine on the latest bar and returns
@@ -1150,6 +1255,7 @@ class SevenFactorOnlineEngine:
             taker_flow=taker_flow,
             premium_index=premium_index,
             smart_money=smart_money,
+            quarterly_basis=quarterly_basis,
         )
 
         w_latest = mats["w_base_1x"].iloc[-1].copy()
@@ -1185,6 +1291,16 @@ class SevenFactorOnlineEngine:
         port_vol_72h = float(mats["port_vol_72h"].iloc[-1])
         median_vol = float(mats["median_vol"].iloc[-1])
         conviction = float(mats["conviction"].iloc[-1])
+        q_apr_latest = float(mats["quarterly_basis_apr"].iloc[-1])
+        b_scalar_latest = float(mats["basis_regime_scalar"].iloc[-1])
+        if b_scalar_latest <= 0.89:
+            b_label = "BACKWARDATION_STRESS"
+        elif b_scalar_latest <= 0.91:
+            b_label = "OVERHEATED_CONTANGO"
+        elif b_scalar_latest >= 1.04:
+            b_label = "INSTITUTIONAL_CONTANGO"
+        else:
+            b_label = "NEUTRAL"
 
         return SevenFactorAllocationResult(
             unit_weights=unit_weights,
@@ -1201,4 +1317,7 @@ class SevenFactorOnlineEngine:
             cmf_blend_weight=float(mats["alpha_cmf_dyn"].iloc[-1]),
             smart_money_tstat=float(mats["t_sm"].iloc[-1]),
             smart_money_blend_weight=float(mats["alpha_sm_dyn"].iloc[-1]),
+            quarterly_basis_apr=q_apr_latest,
+            basis_regime_scalar=b_scalar_latest,
+            basis_regime_label=b_label,
         )
