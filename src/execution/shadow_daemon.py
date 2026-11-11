@@ -123,6 +123,8 @@ class ShadowTradingDaemon:
         cache_dir: str = "data/cache",
         enable_warm_start: bool = True,
         enable_subhourly_pullback: bool = True,
+        enable_smart_money: bool = True,
+        enable_quarterly_basis: bool = True,
     ):
         self.broker = broker
         self.allocator = allocator or MetaStrategyAllocator()
@@ -173,6 +175,8 @@ class ShadowTradingDaemon:
         self.cache_dir = Path(cache_dir)
         self.enable_warm_start = enable_warm_start
         self.enable_subhourly_pullback = enable_subhourly_pullback
+        self.enable_smart_money = bool(enable_smart_money)
+        self.enable_quarterly_basis = bool(enable_quarterly_basis)
 
         if self.ws_client:
             self.ws_client.on_tick_callback = self._on_ws_tick
@@ -1306,7 +1310,7 @@ class ShadowTradingDaemon:
         premium_index_data: dict[str, pd.DataFrame] = {}
         smart_money_data: dict[str, pd.DataFrame] = {}
         quarterly_basis_data: dict[str, pd.DataFrame] = {}
-        if use_7f:
+        if use_7f and self.enable_quarterly_basis:
             for b_pair in ("BTCUSDT", "ETHUSDT"):
                 df_qb = self.fetch_quarterly_basis_history(b_pair)
                 if not df_qb.empty:
@@ -1328,9 +1332,10 @@ class ShadowTradingDaemon:
                 df_pr = self.fetch_premium_index_history(sym)
                 if not df_pr.empty:
                     premium_index_data[clean_sym] = df_pr
-                df_sm = self.fetch_smart_money_history(sym)
-                if not df_sm.empty:
-                    smart_money_data[clean_sym] = df_sm
+                if self.enable_smart_money:
+                    df_sm = self.fetch_smart_money_history(sym)
+                    if not df_sm.empty:
+                        smart_money_data[clean_sym] = df_sm
             else:
                 try:
                     fr = self.exchange.fetch_funding_rate(sym)

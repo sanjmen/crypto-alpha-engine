@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Lever #3 preset: Start at 3.0x Market-Neutral base leverage with tighter 6%% DD de-step bracket",
     )
+    parser.add_argument(
+        "--enable-m13",
+        action="store_true",
+        help="Explicitly enable Milestone M13 experimental strategy suite in --mainnet/--testnet (auto-enabled in --shadow)",
+    )
     parser.add_argument("--f6-min-tstat", type=float, default=0.75, help="Lever #1: Minimum t-stat required to activate F6_Liq_Surge (default: 0.75)")
     parser.add_argument("--anomaly-pct-equity", type=float, default=0.045, help="Lever #2: Max anomaly notional as fraction of total equity (default: 0.045 = 4.5%%)")
     parser.add_argument(
@@ -291,16 +296,31 @@ def main() -> None:
         logger.info(f"Resetting database records in {db_path}...")
         db.reset_all_data()
 
-    # In --shadow mode, automatically enable M13 3.0x Market-Neutral preset by default
-    use_mn_3x = getattr(args, "market_neutral_3x", False) or (mode == "shadow")
+    # M13 experimental strategy suite is auto-enabled in --shadow, and opt-in (--enable-m13) in --mainnet
+    # Note: 100% Maker Priority (Post-Only GTX + L1 Orderbook top-of-book chase) is active in ALL modes!
+    is_m13 = (mode == "shadow") or getattr(args, "enable_m13", False)
+    use_mn_3x = getattr(args, "market_neutral_3x", False) or is_m13
     start_lev = 3.0 if use_mn_3x and args.start_leverage == 2.5 else args.start_leverage
     dd_bracket_val = 0.06 if use_mn_3x and args.dd_bracket == 0.10 else args.dd_bracket
+
+    BASELINE_20D_PRIORS = {
+        "macro": 0.28,
+        "med": 0.16,
+        "fast": 0.16,
+        "rev": 0.14,
+        "carry": 0.15,
+        "liq": 0.11,
+        "size": 0.18,
+    }
+    priors_cfg = None if is_m13 else BASELINE_20D_PRIORS
+    f6_gate_cfg = args.f6_min_tstat if is_m13 else None
 
     broker = ShadowExecutionBroker(
         database=db,
         initial_cash=effective_capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         live_broker=live_broker,
+        enable_yield_collateral=is_m13,
     )
     if not cfg["is_live"]:
         broker.scale_capital(effective_capital)
@@ -313,7 +333,7 @@ def main() -> None:
     pairs_strategy = CointegratedPairsStrategy() if args.enable_pairs else None
     use_seven_factor = not args.legacy_allocator
     seven_factor_engine = (
-        SevenFactorOnlineEngine(f6_min_tstat=args.f6_min_tstat)
+        SevenFactorOnlineEngine(priors=priors_cfg, f6_min_tstat=f6_gate_cfg)
         if use_seven_factor
         else None
     )
@@ -331,11 +351,13 @@ def main() -> None:
     )
 
     if use_seven_factor:
+        suite_tag = "M13 Suite" if is_m13 else "Baseline 20d + 100% Maker Priority"
+        f6_tag = f"t>={f6_gate_cfg:.2f}" if f6_gate_cfg is not None else "Baseline"
         logger.info(
-            f"7-Factor Causal Online Engine ENABLED [{mode.upper()}] | Capital: ${effective_capital:,.2f} | "
+            f"7-Factor Causal Online Engine ENABLED [{mode.upper()} | {suite_tag}] | Capital: ${effective_capital:,.2f} | "
             f"Stepped Leverage: {start_lev:.1f}x -> {args.max_leverage:.1f}x "
             f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM | "
-            f"F6 Gate t>={args.f6_min_tstat:.2f})"
+            f"F6 Gate: {f6_tag} | Maker Priority: {args.anomaly_prefer_maker})"
         )
 
     if args.enable_anomalies:
@@ -356,9 +378,12 @@ def main() -> None:
         fade_strat = create_illiquid_funding_fade(test_mode=is_small_test)
         fade_strat.symbols_filter = None
         fade_strat.max_position_usd = args.anomaly_size
-        harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
-        harvester_strat.symbols_filter = None
-        harvester_strat.max_position_usd = args.anomaly_size
+
+        harvester_strat = None
+        if is_m13:
+            harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
+            harvester_strat.symbols_filter = None
+            harvester_strat.max_position_usd = args.anomaly_size
 
         allocator = MetaStrategyAllocator(
             pairs_strategy=pairs_strategy,
@@ -394,8 +419,10 @@ def main() -> None:
         enable_market_scan=True,
         enable_anomalies=args.enable_anomalies,
         anomaly_size=args.anomaly_size,
-        anomaly_pct_equity=args.anomaly_pct_equity,
+        anomaly_pct_equity=args.anomaly_pct_equity if is_m13 else None,
         anomaly_prefer_maker=args.anomaly_prefer_maker,
+        enable_smart_money=is_m13,
+        enable_quarterly_basis=is_m13,
         profit_lock_trigger_pct=args.profit_lock_trigger,
         profit_lock_level_pct=args.profit_lock_level,
         trailing_trigger_pct=args.trailing_trigger,
