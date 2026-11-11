@@ -400,6 +400,8 @@ class ShadowTradingDaemon:
                 self.rate_limiter.on_http_response(200, self.exchange.last_response_headers)
 
             parsed_universe: list[tuple[str, dict[str, float]]] = []
+            loaded_markets = getattr(self.exchange, "markets", None)
+            has_markets = isinstance(loaded_markets, dict) and bool(loaded_markets)
 
             for sym, t in raw_tickers.items():
                 if "-" in sym:
@@ -407,6 +409,14 @@ class ShadowTradingDaemon:
                 norm_sym = sym.split(":")[0]
                 if not (norm_sym.endswith("/USDT") or norm_sym.endswith("USDT")):
                     continue
+                if has_markets:
+                    mkt = (
+                        loaded_markets.get(sym)
+                        or loaded_markets.get(norm_sym)
+                        or loaded_markets.get(f"{norm_sym}:USDT")
+                    )
+                    if not isinstance(mkt, dict) or not mkt.get("active", True):
+                        continue
 
                 last = float(t.get("last") or t.get("close") or 0.0)
                 bid = float(t.get("bid") or last)
@@ -465,12 +475,21 @@ class ShadowTradingDaemon:
             self.latest_tickers.update(ticks)
         return self.latest_tickers
 
+    def _resolve_ccxt_symbol(self, symbol: str) -> str:
+        """Resolves 'SYM/USDT' to 'SYM/USDT:USDT' when the contract is futures-only in CCXT markets."""
+        loaded_markets = getattr(self.exchange, "markets", None)
+        if isinstance(loaded_markets, dict) and loaded_markets:
+            if symbol not in loaded_markets and f"{symbol}:USDT" in loaded_markets:
+                return f"{symbol}:USDT"
+        return symbol
+
     def fetch_symbol_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
         """Fetches recent OHLCV bars for alpha calculation."""
         try:
             if self.rate_limiter:
                 self.rate_limiter.acquire(weight=5, priority="LOW", wait=True)
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            req_symbol = self._resolve_ccxt_symbol(symbol)
+            ohlcv = self.exchange.fetch_ohlcv(req_symbol, timeframe=timeframe, limit=limit)
             if self.rate_limiter and hasattr(self.exchange, "last_response_headers"):
                 self.rate_limiter.on_http_response(200, self.exchange.last_response_headers)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -585,11 +604,12 @@ class ShadowTradingDaemon:
                 pass
 
         # Fetch live funding rate history or current funding rate
+        req_symbol = self._resolve_ccxt_symbol(symbol)
         try:
             if hasattr(self.exchange, "fetch_funding_rate_history") and not isinstance(
                 getattr(self.exchange, "fetch_funding_rate_history", None), MagicMock
             ):
-                hist = self.exchange.fetch_funding_rate_history(symbol, limit=9)
+                hist = self.exchange.fetch_funding_rate_history(req_symbol, limit=9)
                 if isinstance(hist, list):
                     for item in hist:
                         if item and item.get("fundingRate") is not None:
@@ -609,7 +629,7 @@ class ShadowTradingDaemon:
             pass
 
         try:
-            fr = self.exchange.fetch_funding_rate(symbol)
+            fr = self.exchange.fetch_funding_rate(req_symbol)
             if isinstance(fr, dict) and fr.get("fundingRate") is not None:
                 f_r = float(fr["fundingRate"])
                 records.append({
@@ -1338,7 +1358,7 @@ class ShadowTradingDaemon:
                         smart_money_data[clean_sym] = df_sm
             else:
                 try:
-                    fr = self.exchange.fetch_funding_rate(sym)
+                    fr = self.exchange.fetch_funding_rate(self._resolve_ccxt_symbol(sym))
                     if fr and "fundingRate" in fr and fr["fundingRate"] is not None:
                         f_rate = float(fr["fundingRate"])
                         df_f = pd.DataFrame([{"funding_rate": f_rate, "fundingRate": f_rate}])
@@ -1546,7 +1566,7 @@ class ShadowTradingDaemon:
             if pos.side == PositionSide.FLAT or pos.quantity <= 0:
                 continue
             try:
-                funding_info = self.exchange.fetch_funding_rate(sym)
+                funding_info = self.exchange.fetch_funding_rate(self._resolve_ccxt_symbol(sym))
                 rate = float(funding_info.get("fundingRate") or 0.0)
                 cf = self.broker.settle_funding(sym, rate)
                 settled_cashflows[sym] = cf
@@ -1892,7 +1912,7 @@ class ShadowTradingDaemon:
             # 3. Pump & Funding Fade (>= +25% with overheated funding)
             if pct >= 25.0 and self.allocator.funding_fade_strategy:
                 try:
-                    fr = self.exchange.fetch_funding_rate(sym)
+                    fr = self.exchange.fetch_funding_rate(self._resolve_ccxt_symbol(sym))
                     f_rate = float(fr.get("fundingRate") or 0.0) if fr else 0.0
                 except Exception:
                     f_rate = 0.0

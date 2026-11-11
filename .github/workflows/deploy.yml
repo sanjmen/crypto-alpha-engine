@@ -94,7 +94,7 @@ jobs:
             --quiet \
             --command="
               set -euo pipefail
-              mkdir -p ~/crypto-alpha-engine/data ~/crypto-alpha-engine/logs
+              mkdir -p ~/crypto-alpha-engine/data/cache ~/crypto-alpha-engine/logs
               tar -xzf /tmp/release.tar.gz -C ~/crypto-alpha-engine
               rm -f /tmp/release.tar.gz
               cd ~/crypto-alpha-engine

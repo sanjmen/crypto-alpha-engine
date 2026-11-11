@@ -25,7 +25,7 @@ COPY src/ /app/src/
 COPY scripts/ /app/scripts/
 COPY README.md /app/README.md
 
-# Prepare persistent directories
-RUN mkdir -p /app/data /app/logs
+# Prepare persistent directories (including Parquet warm-start cache dir)
+RUN mkdir -p /app/data/cache /app/logs
 
 CMD ["python", "scripts/run_trading.py", "--daemon", "--shadow"]

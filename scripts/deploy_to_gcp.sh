@@ -260,6 +260,81 @@ if [[ "$MODE" == "--monitor-shadow" ]]; then
         "docker exec -it crypto-shadow python scripts/run_trading.py --monitor --shadow"
 fi
 
+if [[ "$MODE" == "--diagnostics" ]]; then
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            mkdir -p ~/crypto-alpha-engine/data/cache ~/crypto-alpha-engine/logs
+            echo "=== 1. RECURSOS DE LA INSTANCIA (CPU / RAM / SWAP / DISCO) ==="
+            uptime
+            free -h
+            df -h /
+            echo ""
+            echo "=== 2. CONSUMO POR CONTENEDOR DOCKER ==="
+            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}"
+            echo ""
+            echo "=== 3. LATENCIA DESDE TOKIO A BINANCE FUTURES (fapi.binance.com) ==="
+            curl -s -o /dev/null -w "Cold Handshake (TCP+TLS+HTTP): %{time_total}s\nWarm Keep-Alive RTT #1: " https://fapi.binance.com/fapi/v1/time \
+                 -o /dev/null -w "%{time_total}s\nWarm Keep-Alive RTT #2: " https://fapi.binance.com/fapi/v1/time \
+                 -o /dev/null -w "%{time_total}s\n" https://fapi.binance.com/fapi/v1/time
+            echo ""
+            echo "=== 4. ESTADO INTERNO DE MAINNET Y SHADOW (SQLITE + BINANCE LIVE) ==="
+            docker exec -i crypto-mainnet python - << "PYEOF"
+import os, sqlite3
+from src.execution.live_broker import BinanceLiveBroker
+
+def inspect_db(path, label):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    hb = dict(conn.execute("SELECT * FROM daemon_heartbeat WHERE id=1").fetchone() or {})
+    eq = dict(conn.execute("SELECT * FROM accounts ORDER BY id DESC LIMIT 1").fetchone() or {})
+    rb = dict(conn.execute("SELECT * FROM rebalance_snapshots ORDER BY id DESC LIMIT 1").fetchone() or {})
+    pos = [dict(r) for r in conn.execute("SELECT symbol, side, quantity, entry_price, current_price, unrealized_pnl, strategy FROM positions WHERE quantity > 0").fetchall()]
+    pend = [dict(r) for r in conn.execute("SELECT id, symbol, side, order_type, quantity, price, status FROM orders WHERE status = ?", ("PENDING",)).fetchall()]
+    d_st = hb.get("status")
+    w_st = hb.get("ws_state")
+    tps = hb.get("ticks_per_sec", 0.0)
+    reg = rb.get("regime_detected")
+    upd = hb.get("timestamp")
+    t_eq = eq.get("total_equity", 0.0)
+    c_bal = eq.get("cash_balance", 0.0)
+    upnl = eq.get("unrealized_pnl", 0.0)
+    lev = eq.get("leverage", 0.0)
+    print(f"[{label}] Heartbeat: status={d_st} | ws={w_st} ({tps:.1f} ticks/s) | regime={reg} | updated={upd}")
+    print(f"[{label}] Equity: ${t_eq:.2f} | Cash: ${c_bal:.2f} | uPnL: ${upnl:+.2f} | Lev: {lev:.2f}x | Open Pos: {len(pos)} | Pending Orders: {len(pend)}")
+    return pos
+
+m_pos = inspect_db("data/live_trading.db", "MAINNET")
+s_pos = inspect_db("data/shadow_trading.db", "SHADOW")
+
+broker = BinanceLiveBroker(
+    api_key=os.environ.get("BINANCE_API_KEY"),
+    api_secret=os.environ.get("BINANCE_API_SECRET"),
+    dry_run=False,
+)
+ex_pos = broker.reconcile_positions_from_exchange()
+bal = broker.client.fetch_balance()
+col = broker.compute_effective_margin_collateral(bal)
+w_b = col.get("effective_wallet_usd", 0.0)
+f_b = col.get("effective_free_usd", 0.0)
+u_p = sum(float(p.unrealized_pnl) for p in ex_pos.values())
+print(f"[BINANCE LIVE API] Wallet: ${w_b:.2f} | Free: ${f_b:.2f} | uPnL: ${u_p:+.2f} | Total Equity: ${(w_b + u_p):.2f} | Live Positions: {len(ex_pos)}")
+local_map = {p["symbol"]: round(float(p["quantity"]), 6) for p in m_pos}
+live_map = {s: round(abs(float(p.quantity)), 6) for s, p in ex_pos.items()}
+diffs = {k: (local_map.get(k), live_map.get(k)) for k in set(local_map) | set(live_map) if local_map.get(k) != live_map.get(k)}
+sync_msg = diffs if diffs else "100% SINCRONIZADO"
+print(f"[SYNC CHECK] Discrepancias DB vs Binance Live: {len(diffs)} -> {sync_msg}")
+PYEOF
+            echo ""
+            echo "=== 5. ARCHIVOS EN CACHE PARQUET (data/cache) ==="
+            find ~/crypto-alpha-engine/data/cache -type f | wc -l
+            echo ""
+            echo "=== 6. ULTIMOS LOGS DE MAINNET Y SHADOW ==="
+            cd ~/crypto-alpha-engine && docker compose logs --tail=20
+        '
+    exit 0
+fi
+
 # Default: --status
 echo "=== Reglas de Firewall activas en $PROJECT_ID ==="
 gcloud compute firewall-rules list --project="$PROJECT_ID" --format="table(name,direction,sourceRanges.list():label=SOURCE_RANGES,allowed[].map().firewall_rule().list():label=ALLOW)"
