@@ -446,11 +446,17 @@ class ShadowExecutionBroker(IExecutionClient):
         assigned_role = role or ("MAKER" if order_type == OrderType.LIMIT else "TAKER")
         self.db.save_order(order, role=assigned_role, client_order_id=client_order_id)
 
-        # 2. Execution logic
-        if order_type == OrderType.MARKET:
-            self._fill_market_order(order)
-        elif order_type == OrderType.LIMIT:
-            self._evaluate_limit_order(order)
+        # 2. Execution logic (if live exchange call raises, cancel the local PENDING order so it never becomes a stale zombie)
+        try:
+            if order_type == OrderType.MARKET:
+                self._fill_market_order(order)
+            elif order_type == OrderType.LIMIT:
+                self._evaluate_limit_order(order)
+        except Exception:
+            if self.is_live and order.status == OrderStatus.PENDING:
+                order.status = OrderStatus.CANCELED
+                self.db.update_order_status(order.id, OrderStatus.CANCELED)
+            raise
 
         return order
 
