@@ -1097,6 +1097,17 @@ class ShadowTradingDaemon:
         # 4. Manage Dynamic Trailing Stop & Profit-Lock Ratchet
         self.manage_trailing_and_profit_locks(ticks)
 
+        # 4b. Periodic 60s Live Wallet Balance Sync (Issue #63 / M15-3)
+        if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
+            now_mono = time.monotonic()
+            last_sync = getattr(self, "_last_live_wallet_sync_mono", 0.0)
+            if (now_mono - last_sync) >= 60.0:
+                self._last_live_wallet_sync_mono = now_mono
+                try:
+                    self.broker.sync_from_live_exchange(sync_positions=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"Periodic live wallet sync note: {exc}")
+
         # 5. Mark to market
         mark_prices = {sym: t["price"] for sym, t in ticks.items()}
         portfolio = self.broker.mark_to_market(mark_prices)
