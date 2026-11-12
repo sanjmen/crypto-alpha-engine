@@ -550,6 +550,10 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
         last_gtx_rejected = False
         for attempt in range(self.max_chase_iterations):
+            rem_q = self.quantize_amount(symbol, remaining)
+            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < 20.5):
+                remaining = 0.0
+                break
             bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=limit_px)
             spread = max(ask - bid, bid * 0.0005, 1e-6)
             if side == OrderSide.BUY:
@@ -631,20 +635,31 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
         # Fallback for any remaining quantity
         if remaining > 1e-8 and self.allow_taker_fallback:
-            fb_params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
-            res_mkt = self.client.create_order(
-                symbol=symbol,
-                type="market",
-                side=ccxt_side,
-                amount=self.quantize_amount(symbol, remaining),
-                params=fb_params,
-            )
-            last_order_id = str(res_mkt.get("id", last_order_id))
-            avg_px = float(res_mkt.get("average") or res_mkt.get("price") or limit_px)
-            filled_total += remaining
-            cost_total += remaining * avg_px
-            remaining = 0.0
-            self.taker_fills_count += 1
+            rem_q = self.quantize_amount(symbol, remaining)
+            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < 20.5):
+                remaining = 0.0
+            else:
+                fb_params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
+                try:
+                    res_mkt = self.client.create_order(
+                        symbol=symbol,
+                        type="market",
+                        side=ccxt_side,
+                        amount=rem_q,
+                        params=fb_params,
+                    )
+                    last_order_id = str(res_mkt.get("id", last_order_id))
+                    avg_px = float(res_mkt.get("average") or res_mkt.get("price") or limit_px)
+                    filled_total += remaining
+                    cost_total += remaining * avg_px
+                    remaining = 0.0
+                    self.taker_fills_count += 1
+                except Exception as e:
+                    if filled_total > 0:
+                        logger.debug(f"Skipping sub-notional taker remainder on {symbol}: {e}")
+                        remaining = 0.0
+                    else:
+                        raise
 
         final_avg_px = (cost_total / filled_total) if filled_total > 0 else limit_px
         if filled_total > 0:

@@ -364,7 +364,29 @@ class ShadowTradingDaemon:
             "change_24h": prev.get("change_24h", 0.0),
             "volume_24h": prev.get("volume_24h", 0.0),
         }
-        self.broker.set_market_price(sym_slash, price=tick.price, bid=tick.bid, ask=tick.ask)
+        now_mono = time.monotonic()
+        persist_map = getattr(self, "_last_ws_db_persist_ts", None)
+        if persist_map is None:
+            persist_map = {}
+            self._last_ws_db_persist_ts = persist_map
+        should_persist = (now_mono - persist_map.get(sym_slash, 0.0)) >= 1.5
+        if should_persist:
+            persist_map[sym_slash] = now_mono
+        try:
+            self.broker.set_market_price(
+                sym_slash,
+                price=tick.price,
+                bid=tick.bid,
+                ask=tick.ask,
+                persist_db=should_persist,
+            )
+        except TypeError:
+            self.broker.set_market_price(
+                sym_slash,
+                price=tick.price,
+                bid=tick.bid,
+                ask=tick.ask,
+            )
 
     def fetch_live_tickers(self) -> dict[str, dict[str, float]]:
         """

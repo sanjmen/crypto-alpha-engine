@@ -429,9 +429,13 @@ def main() -> None:
         trailing_distance_pct=args.trailing_distance,
         core_take_profit_pct=args.core_tp,
         min_rebalance_notional=(
-            min(10.0, args.anomaly_size)
-            if args.enable_anomalies
-            else max(10.0, min(50.0, effective_capital * 0.01))
+            max(21.0, min(50.0, effective_capital * 0.01))
+            if effective_capital >= 500.0
+            else (
+                min(10.0, args.anomaly_size)
+                if args.enable_anomalies
+                else max(10.0, min(50.0, effective_capital * 0.01))
+            )
         ),
     )
     # In --shadow mode, automatically trigger an immediate rebalance on startup so new M13 changes apply right away

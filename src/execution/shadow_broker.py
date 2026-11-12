@@ -284,6 +284,7 @@ class ShadowExecutionBroker(IExecutionClient):
         price: float,
         bid: float | None = None,
         ask: float | None = None,
+        persist_db: bool = True,
     ) -> None:
         """Updates best price levels for a symbol and mark-to-markets open positions."""
         p = float(price)
@@ -294,7 +295,8 @@ class ShadowExecutionBroker(IExecutionClient):
         if symbol in self.portfolio.positions:
             pos = self.portfolio.positions[symbol]
             pos.current_price = p
-            self.db.save_position(pos)
+            if persist_db:
+                self.db.save_position(pos)
 
     def set_market_prices(self, prices: dict[str, float]) -> None:
         """Batch updates mark prices."""
