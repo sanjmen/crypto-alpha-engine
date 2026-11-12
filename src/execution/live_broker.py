@@ -92,6 +92,7 @@ class CCXTExecutionAdapter(IExecutionClient):
             },
         }
         self.client: ccxt.Exchange = exchange_class(config)
+        self._install_linear_market_aliases(self.client)
 
         if validate_permissions and not self.dry_run and api_key:
             try:
@@ -115,6 +116,28 @@ class CCXTExecutionAdapter(IExecutionClient):
         self.peak_equity = 100_000.0
         self.trade_history: list[Trade] = []
         self.orders: dict[str, Order] = {}
+
+    @staticmethod
+    def _install_linear_market_aliases(exchange: Any) -> None:
+        """
+        Ensures CCXT 4.5+ linear perpetual markets ('SYM/USDT:USDT') are also indexed
+        under 'SYM/USDT' in `exchange.markets` so all unified calls resolve to USDS-M Futures.
+        """
+        orig_load = getattr(exchange, "load_markets", None)
+        if not callable(orig_load):
+            return
+
+        def _wrapped_load_markets(*args: Any, **kwargs: Any) -> Any:
+            mkts = orig_load(*args, **kwargs)
+            if isinstance(mkts, dict):
+                for k, m in list(mkts.items()):
+                    if isinstance(k, str) and k.endswith(":USDT") and isinstance(m, dict):
+                        if m.get("swap", True) and m.get("linear", True) and not m.get("delivery", False):
+                            short_sym = k.split(":")[0]
+                            mkts[short_sym] = m
+            return mkts
+
+        exchange.load_markets = _wrapped_load_markets
 
     def get_portfolio(self) -> Portfolio:
         return self.portfolio
@@ -878,9 +901,17 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             logger.debug(f"Multi-Assets Margin check note: {e}")
 
         # 3. Enforce CROSSED Margin & Initial Leverage per Symbol
+        loaded_mkts = getattr(self.client, "markets", None)
+        has_mkts = isinstance(loaded_mkts, dict) and bool(loaded_mkts)
         for sym in symbols:
+            req_sym = sym
+            if has_mkts:
+                if sym not in loaded_mkts and f"{sym}:USDT" in loaded_mkts:
+                    req_sym = f"{sym}:USDT"
+                elif sym not in loaded_mkts:
+                    continue
             try:
-                self.client.set_margin_mode("cross", sym)
+                self.client.set_margin_mode("cross", req_sym)
                 report["margin_modes"][sym] = "CROSSED"
             except Exception as e:  # noqa: BLE001
                 err_str = str(e)
@@ -891,7 +922,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                     report["margin_modes"][sym] = f"ERROR: {e}"
 
             try:
-                lev_resp = self.client.set_leverage(target_int_lev, sym)
+                lev_resp = self.client.set_leverage(target_int_lev, req_sym)
                 confirmed_lev = int(lev_resp.get("leverage", target_int_lev)) if isinstance(lev_resp, dict) else target_int_lev
                 report["leverages"][sym] = confirmed_lev
             except Exception as e:  # noqa: BLE001

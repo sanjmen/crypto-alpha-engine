@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "1000"]
+    command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "3000", "--start-leverage", "5.0", "--max-leverage", "5.0", "--anomaly-size", "45.0"]
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

@@ -189,8 +189,13 @@ class ShadowTradingDaemon:
             self.exchange = ccxt.binance({
                 "enableRateLimit": True,
                 "timeout": 20000,
-                "options": {"defaultType": "future"},
+                "options": {
+                    "defaultType": "future",
+                    "fetchMarkets": {"types": ["linear", "delivery"]},
+                    "fetchCurrencies": False,
+                },
             })
+            self._install_linear_market_aliases(self.exchange)
 
         self.is_running = False
         self._thread: threading.Thread | None = None
@@ -474,6 +479,28 @@ class ShadowTradingDaemon:
             }
             self.latest_tickers.update(ticks)
         return self.latest_tickers
+
+    @staticmethod
+    def _install_linear_market_aliases(exchange: Any) -> None:
+        """
+        Ensures CCXT 4.5+ linear perpetual markets ('SYM/USDT:USDT') are also indexed
+        under 'SYM/USDT' in `exchange.markets` so all unified calls resolve to USDS-M Futures.
+        """
+        orig_load = getattr(exchange, "load_markets", None)
+        if not callable(orig_load) or isinstance(orig_load, MagicMock):
+            return
+
+        def _wrapped_load_markets(*args: Any, **kwargs: Any) -> Any:
+            mkts = orig_load(*args, **kwargs)
+            if isinstance(mkts, dict):
+                for k, m in list(mkts.items()):
+                    if isinstance(k, str) and k.endswith(":USDT") and isinstance(m, dict):
+                        if m.get("swap", True) and m.get("linear", True) and not m.get("delivery", False):
+                            short_sym = k.split(":")[0]
+                            mkts[short_sym] = m
+            return mkts
+
+        exchange.load_markets = _wrapped_load_markets
 
     def _resolve_ccxt_symbol(self, symbol: str) -> str:
         """Resolves 'SYM/USDT' to 'SYM/USDT:USDT' when the contract is futures-only in CCXT markets."""

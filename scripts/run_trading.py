@@ -266,7 +266,7 @@ def main() -> None:
         if args.configure_only:
             ex_cfg = live_broker.ensure_account_configuration(
                 symbols=symbols,
-                target_leverage=max(3.0, args.start_leverage),
+                target_leverage=max(5.0, args.max_leverage, args.start_leverage),
             )
             print(json.dumps(ex_cfg, indent=2))
             return
@@ -282,7 +282,7 @@ def main() -> None:
 
         ex_cfg = live_broker.ensure_account_configuration(
             symbols=symbols,
-            target_leverage=max(3.0, args.start_leverage),
+            target_leverage=max(5.0, args.max_leverage, args.start_leverage),
         )
         logger.info(
             f"🟢 [{mode.upper()}] BINANCE FUTURES CONNECTED | Mode={ex_cfg.get('position_mode')} | "

@@ -260,6 +260,53 @@ if [[ "$MODE" == "--monitor-shadow" ]]; then
         "docker exec -it crypto-shadow python scripts/run_trading.py --monitor --shadow"
 fi
 
+if [[ "$MODE" == "--switch-to-master" ]]; then
+    echo "=== [1/4] Actualizando BINANCE_API_KEY y BINANCE_API_SECRET en GitHub Secrets ==="
+    python3 -c '
+import pathlib, subprocess
+env_map = {}
+for raw in pathlib.Path(".env").read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    if line.startswith("export "):
+        line = line[7:].strip()
+    k, v = line.split("=", 1)
+    env_map[k.strip()] = v.strip().strip("\"").strip("\x27")
+for key in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
+    if env_map.get(key):
+        subprocess.run(["gh", "secret", "set", key], input=env_map[key].encode(), check=True)
+'
+    echo "[OK] Secretos de Cuenta Master actualizados en GitHub Actions."
+
+    echo "=== [2/4] Subiendo nuevo .env (Cuenta Master) a Tokio ==="
+    gcloud compute scp .env "$INSTANCE:/tmp/master.env" \
+        --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet
+
+    echo "=== [3/4] Deteniendo contenedor Mainnet, respaldando DB de Sub-cuenta y activando Master ==="
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            cd ~/crypto-alpha-engine
+            docker compose stop crypto-mainnet || true
+            if [ -f data/live_trading.db ]; then
+                mv data/live_trading.db data/subaccount_backup_live_trading.db
+            fi
+            rm -f data/live_trading.db-wal data/live_trading.db-shm
+            mv /tmp/master.env ~/crypto-alpha-engine/.env
+            chmod 600 ~/crypto-alpha-engine/.env
+        '
+
+    echo "=== [4/4] Verificando conexión y configuración (One-Way + Cross + 5x) en Cuenta Master ==="
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            cd ~/crypto-alpha-engine
+            docker compose run --rm crypto-mainnet python scripts/run_trading.py --configure-only --mainnet --capital 3000 --start-leverage 5.0 --max-leverage 5.0
+        '
+    exit 0
+fi
+
 if [[ "$MODE" == "--diagnostics" ]]; then
     gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
         --command='
