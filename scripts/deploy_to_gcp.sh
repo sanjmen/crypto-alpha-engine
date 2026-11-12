@@ -525,6 +525,32 @@ PYEOF
     exit 0
 fi
 
+if [[ "$MODE" == "--deploy" ]]; then
+    echo "=== [1/2] Empaquetando código actual (git archive HEAD) y subiendo a Tokio ==="
+    git archive --format=tar.gz -o /tmp/crypto-alpha-src.tar.gz HEAD
+    gcloud compute scp /tmp/crypto-alpha-src.tar.gz "$INSTANCE:/tmp/crypto-alpha-src.tar.gz" \
+        --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet
+    rm -f /tmp/crypto-alpha-src.tar.gz
+
+    echo "=== [2/2] Reconstruyendo y reiniciando contenedores Docker (Mainnet & Shadow) en Tokio ==="
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            mkdir -p ~/crypto-alpha-engine/data ~/crypto-alpha-engine/logs
+            tar -xzf /tmp/crypto-alpha-src.tar.gz -C ~/crypto-alpha-engine/
+            rm -f /tmp/crypto-alpha-src.tar.gz
+            cd ~/crypto-alpha-engine
+            chmod 600 .env
+            docker build -t crypto-alpha-engine:latest .
+            docker compose up -d --no-build --remove-orphans
+            sleep 10
+            docker compose ps
+            echo ""
+            docker compose logs --tail=30
+        '
+    exit 0
+fi
+
 # Default: --status
 echo "=== Reglas de Firewall activas en $PROJECT_ID ==="
 gcloud compute firewall-rules list --project="$PROJECT_ID" --format="table(name,direction,sourceRanges.list():label=SOURCE_RANGES,allowed[].map().firewall_rule().list():label=ALLOW)"

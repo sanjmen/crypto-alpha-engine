@@ -1208,19 +1208,23 @@ class ShadowTradingDaemon:
                 tp = pos.take_profit
                 sl = pos.stop_loss
                 if self.core_take_profit_pct and self.core_take_profit_pct > 0:
-                    if tp is None or (pos.side == PositionSide.LONG and tp <= entry) or (pos.side == PositionSide.SHORT and tp >= entry):
-                        if pos.side == PositionSide.LONG:
-                            tp = round(entry * (1.0 + self.core_take_profit_pct), 6 if entry < 1.0 else 2)
-                        else:  # SHORT
-                            tp = round(entry * (1.0 - self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                    if pos.side == PositionSide.LONG:
+                        tp = round(entry * (1.0 + self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                    else:  # SHORT
+                        tp = round(entry * (1.0 - self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                else:
+                    tp = None
 
                 if self.core_stop_loss_pct and self.core_stop_loss_pct > 0:
-                    if sl is None:
+                    if sl is None or not pos.is_profit_locked:
                         sl_decimals = 6 if entry < 1.0 else (4 if entry < 100.0 else 2)
                         if pos.side == PositionSide.LONG:
                             sl = round(entry * (1.0 - self.core_stop_loss_pct), sl_decimals)
                         else:  # SHORT
                             sl = round(entry * (1.0 + self.core_stop_loss_pct), sl_decimals)
+                else:
+                    if sl is not None and not pos.is_profit_locked:
+                        sl = None
 
                 needs_refresh = (pos.take_profit != tp) or (pos.stop_loss != sl)
                 if not needs_refresh and db and hasattr(db, "get_pending_orders"):
@@ -1230,17 +1234,19 @@ class ShadowTradingDaemon:
                             has_tp = any(
                                 o.order_type == OrderType.TAKE_PROFIT and abs(o.quantity - pos.quantity) <= 1e-6
                                 for o in pend
-                            ) if tp is not None else True
+                            ) if tp is not None else not any(o.order_type == OrderType.TAKE_PROFIT for o in pend)
                             has_sl = any(
                                 o.order_type == OrderType.STOP_LOSS and abs(o.quantity - pos.quantity) <= 1e-6
                                 for o in pend
-                            ) if sl is not None else True
+                            ) if sl is not None else not any(o.order_type == OrderType.STOP_LOSS for o in pend)
                             if not (has_tp and has_sl):
                                 needs_refresh = True
                     except Exception:
                         pass
 
-                if needs_refresh and (tp is not None or sl is not None):
+                if needs_refresh and (
+                    tp is not None or sl is not None or pos.take_profit is not None or pos.stop_loss is not None
+                ):
                     self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
 
     def manage_trailing_and_profit_locks(
@@ -1340,8 +1346,8 @@ class ShadowTradingDaemon:
             lock_trig = self.anomaly_profit_lock_trigger_pct if is_anomaly else self.profit_lock_trigger_pct
             lock_lvl = self.anomaly_profit_lock_level_pct if is_anomaly else self.profit_lock_level_pct
 
-            # Phase 3: Trailing Stop (Peak gain >= 4.0% Core / >= 5.5% Anomaly)
-            if peak_ret >= trail_trig:
+            # Phase 3: Trailing Stop (only active when trail_trig > 0)
+            if trail_trig is not None and trail_trig > 0 and peak_ret >= trail_trig:
                 if pos.side == PositionSide.LONG:
                     trail_target = pos.peak_price * (1.0 - trail_dist)
                     trail_target = round(trail_target, 6 if trail_target < 1.0 else 2)
@@ -1353,8 +1359,8 @@ class ShadowTradingDaemon:
                     if (pos.stop_loss is None or trail_target < pos.stop_loss) and curr_p < trail_target:
                         candidate_sl = trail_target
 
-            # Phase 2: Profit-Lock (Peak gain >= 2.5% -> +0.8% Core / >= 4.0% -> +2.0% Anomaly)
-            elif peak_ret >= lock_trig:
+            # Phase 2: Profit-Lock (Peak gain >= 3.5% -> +1.5% Core / >= 4.5% -> +2.5% Anomaly)
+            elif lock_trig is not None and lock_trig > 0 and peak_ret >= lock_trig:
                 if pos.side == PositionSide.LONG:
                     lock_target = entry * (1.0 + lock_lvl)
                     lock_target = round(lock_target, 6 if lock_target < 1.0 else 2)

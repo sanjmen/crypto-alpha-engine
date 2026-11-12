@@ -215,10 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-volume", type=float, default=20000000.0, help="Minimum 24h volume filter in USDT for anomaly scanning (default: 20M)")
     parser.add_argument("--profit-lock-trigger", type=float, default=0.035, help="Peak gain required to arm Core Profit-Lock Stop-Profit (default: 0.035)")
     parser.add_argument("--profit-lock-level", type=float, default=0.015, help="Net profit floor locked when Core Profit-Lock triggers (default: 0.015)")
-    parser.add_argument("--trailing-trigger", type=float, default=0.045, help="Peak gain required to arm Core continuous Trailing Stop (default: 0.045)")
+    parser.add_argument("--trailing-trigger", type=float, default=None, help="Peak gain required to arm Core continuous Trailing Stop (default: 0.0 in shadow [disabled], 0.045 in mainnet)")
     parser.add_argument("--trailing-distance", type=float, default=0.020, help="Distance behind peak price for Core Trailing Stop (default: 0.020)")
-    parser.add_argument("--core-tp", type=float, default=0.080, help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.080)")
-    parser.add_argument("--core-sl", type=float, default=0.025, help="Initial protective Stop-Loss distance for core/7-Factor legs (default: 0.025 = 2.5%%)")
+    parser.add_argument("--core-tp", type=float, default=None, help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.050 in shadow, 0.080 in mainnet)")
+    parser.add_argument("--core-sl", type=float, default=None, help="Initial protective Stop-Loss distance for core/7-Factor legs (default: None/0.0 in shadow, 0.025 in mainnet)")
     return parser
 
 
@@ -422,6 +422,19 @@ def main() -> None:
     rate_limiter = ExchangeRateLimiter()
     ws_client = ResilientWebSocketClient(symbols=symbols)
 
+    # Mode-resolved Core bracket profile:
+    # - Shadow Lab (--shadow): TP +5.0% Maker + Profit-Lock (+3.5% -> +1.5%), Trailing Stop disabled (0.0), initial SL disabled (None)
+    # - Mainnet (--mainnet): TP +8.0% Maker + Profit-Lock (+3.5% -> +1.5%) + Trailing (+4.5% / 2.0%) + Initial SL (-2.5%)
+    eff_core_tp = args.core_tp if args.core_tp is not None else (0.050 if is_m13_experimental else 0.080)
+    eff_trailing_trigger = args.trailing_trigger if args.trailing_trigger is not None else (0.0 if is_m13_experimental else 0.045)
+    eff_core_sl = args.core_sl if args.core_sl is not None else (None if is_m13_experimental else 0.025)
+    logger.info(
+        f"🛡️ Core Bracket Profile [{mode.upper()}]: TP={eff_core_tp*100:.1f}% (Maker), "
+        f"Profit-Lock={args.profit_lock_trigger*100:.1f}%->{args.profit_lock_level*100:.1f}%, "
+        f"Trailing={'DISABLED' if not eff_trailing_trigger or eff_trailing_trigger <= 0 else f'{eff_trailing_trigger*100:.1f}%/{args.trailing_distance*100:.1f}%'}, "
+        f"Initial SL={'DISABLED' if not eff_core_sl or eff_core_sl <= 0 else f'-{eff_core_sl*100:.1f}%'}"
+    )
+
     daemon = ShadowTradingDaemon(
         broker=broker,
         allocator=allocator,
@@ -442,10 +455,10 @@ def main() -> None:
         enable_quarterly_basis=is_m15_core,
         profit_lock_trigger_pct=args.profit_lock_trigger,
         profit_lock_level_pct=args.profit_lock_level,
-        trailing_trigger_pct=args.trailing_trigger,
+        trailing_trigger_pct=eff_trailing_trigger,
         trailing_distance_pct=args.trailing_distance,
-        core_take_profit_pct=args.core_tp,
-        core_stop_loss_pct=args.core_sl,
+        core_take_profit_pct=eff_core_tp,
+        core_stop_loss_pct=eff_core_sl,
         min_rebalance_notional=(
             max(21.0, min(50.0, effective_capital * 0.01))
             if effective_capital >= 500.0

@@ -1312,6 +1312,75 @@ def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_
     db.close()
 
 
+def test_shadow_core_tp_5pct_profit_lock_without_trailing_or_initial_sl():
+    """
+    Verifies the Shadow Core Bracket Profile:
+    - core_take_profit_pct = 0.050 (+5.0% Maker TP)
+    - profit_lock_trigger_pct = 0.035 -> profit_lock_level_pct = 0.015 (+3.5% -> +1.5%)
+    - trailing_trigger_pct = 0.0 (Trailing Stop disabled on Core so positions do not give back -2.0% as Taker)
+    - core_stop_loss_pct = None (Initial negative Stop-Loss disabled on Core)
+    """
+    from src.domain.enums import OrderType
+    from src.execution.shadow_broker import ShadowExecutionBroker
+    from src.execution.shadow_daemon import ShadowTradingDaemon
+
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        symbols=["SOL/USDT"],
+        profit_lock_trigger_pct=0.035,
+        profit_lock_level_pct=0.015,
+        trailing_trigger_pct=0.0,
+        trailing_distance_pct=0.020,
+        core_take_profit_pct=0.050,
+        core_stop_loss_pct=None,
+    )
+
+    broker.set_market_price("SOL/USDT", price=100.00)
+    broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=5.0,
+        price=100.00,
+        strategy="F3_Fast_Swing_PB (12h-48h)",
+    )
+    pos = broker.portfolio.positions["SOL/USDT"]
+
+    # 1. Simulate legacy +8% TP ($108.0) and -2.5% SL ($97.5) and verify ensure_position_brackets refreshes to +5% TP ($105.0) and SL=None
+    broker.create_bracket_orders("SOL/USDT", take_profit=108.00, stop_loss=97.50)
+    assert pos.take_profit == 108.00
+    assert pos.stop_loss == 97.50
+
+    daemon.ensure_position_brackets()
+    assert pos.take_profit == 105.00
+    assert pos.stop_loss is None
+    pend = db.get_pending_orders(symbol="SOL/USDT")
+    assert len(pend) == 1
+    assert pend[0].order_type == OrderType.TAKE_PROFIT
+    assert pend[0].price == 105.00
+
+    # 2. At +1.0% peak gain ($101.00), trailing_trigger=0.0 must NOT arm any stop loss
+    ratcheted_1 = daemon.manage_trailing_and_profit_locks({"SOL/USDT": {"price": 101.00}})
+    assert len(ratcheted_1) == 0
+    assert pos.stop_loss is None
+
+    # 3. At +3.6% peak gain ($103.60 >= +3.5%), Profit-Lock arms at +1.5% ($101.50)
+    ratcheted_2 = daemon.manage_trailing_and_profit_locks({"SOL/USDT": {"price": 103.60}})
+    assert len(ratcheted_2) == 1
+    assert pos.stop_loss == 101.50
+    assert pos.is_profit_locked is True
+
+    # 4. At +4.7% peak gain ($104.70 >= +4.5%), Trailing Stop remains disabled -> stop_loss stays at $101.50 waiting for $105.00 Maker TP
+    ratcheted_3 = daemon.manage_trailing_and_profit_locks({"SOL/USDT": {"price": 104.70}})
+    assert len(ratcheted_3) == 0
+    assert pos.stop_loss == 101.50
+    assert pos.take_profit == 105.00
+    db.close()
+
+
+
 
 
 

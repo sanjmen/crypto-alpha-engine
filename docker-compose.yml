@@ -19,10 +19,8 @@ services:
         max-file: "5"
 
   crypto-shadow:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: crypto-alpha-engine:latest
+    pull_policy: never
     container_name: crypto-shadow
     restart: unless-stopped
     env_file:
