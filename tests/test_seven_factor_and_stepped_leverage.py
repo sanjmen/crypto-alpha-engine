@@ -348,15 +348,15 @@ def test_seven_factor_dynamic_profit_lock_and_trailing_stop():
     assert pos.stop_loss is None
     assert pos.take_profit is None
 
-    # 1. ensure_position_brackets attaches +8.0% Maker Take-Profit ($0.92) while keeping stop_loss=None
+    # 1. ensure_position_brackets attaches +8.0% Maker Take-Profit ($0.92) and -2.5% protective Stop-Loss ($1.025)
     daemon.ensure_position_brackets()
     assert pos.take_profit == 0.92
-    assert pos.stop_loss is None
+    assert pos.stop_loss == 1.025
 
-    # 2. Price dips +1.0% in favor of SHORT ($0.9900) -> peak_price tracked, SL still None
+    # 2. Price dips +1.0% in favor of SHORT ($0.9900) -> peak_price tracked, SL remains at initial protective $1.025
     daemon.manage_trailing_and_profit_locks({"APT/USDT": {"price": 0.9900}})
     assert pos.peak_price == 0.9900
-    assert pos.stop_loss is None
+    assert pos.stop_loss == 1.025
 
     # 3. Price dips +2.6% in favor of SHORT ($0.9740 >= +2.5% trigger) -> dynamically arms Profit-Lock at +0.8% ($0.9920)
     ratcheted = daemon.manage_trailing_and_profit_locks({"APT/USDT": {"price": 0.9740}})

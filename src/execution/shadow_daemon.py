@@ -120,6 +120,7 @@ class ShadowTradingDaemon:
         intracycle_post_stop_settle_sec: float = 900.0,
         core_bracket_cooldown_sec: float = 4.0 * 3600.0,
         core_take_profit_pct: float = 0.080,
+        core_stop_loss_pct: float = 0.025,
         cache_dir: str = "data/cache",
         enable_warm_start: bool = True,
         enable_subhourly_pullback: bool = True,
@@ -172,6 +173,7 @@ class ShadowTradingDaemon:
         self.last_rest_tickers_ok: bool = True
         self._last_kline_fetch_ok: bool = True
         self.core_take_profit_pct = core_take_profit_pct
+        self.core_stop_loss_pct = core_stop_loss_pct
         self.cache_dir = Path(cache_dir)
         self.enable_warm_start = enable_warm_start
         self.enable_subhourly_pullback = enable_subhourly_pullback
@@ -1086,13 +1088,13 @@ class ShadowTradingDaemon:
                 ask=t["ask"],
             )
 
-        # 2. Check pending limit orders against fresh ticks
+        # 2. Ensure open positions have active TP and SL bracket orders
+        self.ensure_position_brackets()
+
+        # 3. Check pending limit orders against fresh ticks
         filled_orders = self.broker.check_pending_orders(ticks)
         if filled_orders:
             self._refresh_anomaly_cooldowns(filled_orders)
-
-        # 3. Ensure open positions have active TP and SL bracket orders
-        self.ensure_position_brackets()
 
         # 4. Manage Dynamic Trailing Stop & Profit-Lock Ratchet
         self.manage_trailing_and_profit_locks(ticks)
@@ -1174,11 +1176,13 @@ class ShadowTradingDaemon:
         """
         Ensures active positions have appropriate bracket orders:
         - Anomaly strategies: both Take-Profit and initial Stop-Loss brackets.
-        - Core / 7-Factor strategies: passive Maker Take-Profit (+8.0% default) with
-          dynamic Stop-Profit / Trailing Stop armed via manage_trailing_and_profit_locks().
+        - Core / 7-Factor strategies: passive Maker Take-Profit (+8.0% default) and
+          protective initial Stop-Loss (-2.5% default, `core_stop_loss_pct`), with
+          dynamic Stop-Profit / Trailing Stop ratcheted via manage_trailing_and_profit_locks().
         """
         portfolio = self.broker.get_portfolio()
         anomaly_strats = ANOMALY_STRATEGIES
+        db = getattr(self.broker, "db", None)
         for sym, pos in portfolio.positions.items():
             if pos.side == PositionSide.FLAT or pos.quantity <= 0:
                 continue
@@ -1200,13 +1204,44 @@ class ShadowTradingDaemon:
                         sl = round(entry * 1.08, 6 if entry < 1.0 else 2)
 
                     self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
-            elif self.core_take_profit_pct and self.core_take_profit_pct > 0:
-                if pos.take_profit is None:
-                    if pos.side == PositionSide.LONG:
-                        tp = round(entry * (1.0 + self.core_take_profit_pct), 6 if entry < 1.0 else 2)
-                    else:  # SHORT
-                        tp = round(entry * (1.0 - self.core_take_profit_pct), 6 if entry < 1.0 else 2)
-                    self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=pos.stop_loss)
+            else:
+                tp = pos.take_profit
+                sl = pos.stop_loss
+                if self.core_take_profit_pct and self.core_take_profit_pct > 0:
+                    if tp is None or (pos.side == PositionSide.LONG and tp <= entry) or (pos.side == PositionSide.SHORT and tp >= entry):
+                        if pos.side == PositionSide.LONG:
+                            tp = round(entry * (1.0 + self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                        else:  # SHORT
+                            tp = round(entry * (1.0 - self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+
+                if self.core_stop_loss_pct and self.core_stop_loss_pct > 0:
+                    if sl is None:
+                        sl_decimals = 6 if entry < 1.0 else (4 if entry < 100.0 else 2)
+                        if pos.side == PositionSide.LONG:
+                            sl = round(entry * (1.0 - self.core_stop_loss_pct), sl_decimals)
+                        else:  # SHORT
+                            sl = round(entry * (1.0 + self.core_stop_loss_pct), sl_decimals)
+
+                needs_refresh = (pos.take_profit != tp) or (pos.stop_loss != sl)
+                if not needs_refresh and db and hasattr(db, "get_pending_orders"):
+                    try:
+                        pend = db.get_pending_orders(symbol=sym)
+                        if isinstance(pend, list):
+                            has_tp = any(
+                                o.order_type == OrderType.TAKE_PROFIT and abs(o.quantity - pos.quantity) <= 1e-6
+                                for o in pend
+                            ) if tp is not None else True
+                            has_sl = any(
+                                o.order_type == OrderType.STOP_LOSS and abs(o.quantity - pos.quantity) <= 1e-6
+                                for o in pend
+                            ) if sl is not None else True
+                            if not (has_tp and has_sl):
+                                needs_refresh = True
+                    except Exception:
+                        pass
+
+                if needs_refresh and (tp is not None or sl is not None):
+                    self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
 
     def manage_trailing_and_profit_locks(
         self,

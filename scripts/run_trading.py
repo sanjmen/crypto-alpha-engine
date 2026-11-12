@@ -218,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trailing-trigger", type=float, default=0.045, help="Peak gain required to arm Core continuous Trailing Stop (default: 0.045)")
     parser.add_argument("--trailing-distance", type=float, default=0.020, help="Distance behind peak price for Core Trailing Stop (default: 0.020)")
     parser.add_argument("--core-tp", type=float, default=0.080, help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.080)")
+    parser.add_argument("--core-sl", type=float, default=0.025, help="Initial protective Stop-Loss distance for core/7-Factor legs (default: 0.025 = 2.5%%)")
     return parser
 
 
@@ -444,6 +445,7 @@ def main() -> None:
         trailing_trigger_pct=args.trailing_trigger,
         trailing_distance_pct=args.trailing_distance,
         core_take_profit_pct=args.core_tp,
+        core_stop_loss_pct=args.core_sl,
         min_rebalance_notional=(
             max(21.0, min(50.0, effective_capital * 0.01))
             if effective_capital >= 500.0

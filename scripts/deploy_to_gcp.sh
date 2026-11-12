@@ -455,6 +455,43 @@ def inspect_db(path, label):
     print(f"[{label}] Heartbeat: status={d_st} | ws={w_st} ({tps:.1f} ticks/s) | regime={reg} | updated={upd}")
     print(f"[{label}] Equity: ${t_eq:.2f} | Cash: ${c_bal:.2f} | uPnL: ${upnl:+.2f} | Lev: {lev:.2f}x | Open Pos: {len(pos)} | Pending Orders: {len(pend)}")
     print(f"[{label}] DB Size: {sz_mb:.2f} MB (WAL: {wal_mb:.2f} MB) | Rows: accounts={acc_cnt}, orders={ord_cnt}, trades={trd_cnt}")
+    sf = dict(conn.execute("SELECT * FROM seven_factor_telemetry WHERE id=1").fetchone() or {})
+    if sf:
+        w_j = sf.get("factor_weights_json", "{}")
+        t_j = sf.get("factor_tstats_json", "{}")
+        e_l = sf.get("effective_leverage", 0.0)
+        v_s = sf.get("vol_scalar", 0.0)
+        print(f"[{label}] 7F Telemetry: eff_lev={e_l:.2f}x | vol_scalar={v_s:.2f} | weights={w_j} | tstats={t_j}")
+    if rb:
+        rb_ts = rb.get("timestamp")
+        print(f"[{label}] Last Rebalance: {rb_ts} | regime={reg}")
+    long_usd = sum(float(p["quantity"]) * float(p["current_price"]) for p in pos if p["side"] == "LONG")
+    short_usd = sum(float(p["quantity"]) * float(p["current_price"]) for p in pos if p["side"] == "SHORT")
+    net_usd = long_usd - short_usd
+    print(f"[{label}] Exposure: LONG=${long_usd:.2f} | SHORT=${short_usd:.2f} | NET=${net_usd:+.2f} | GROSS=${(long_usd+short_usd):.2f}")
+    for p in sorted(pos, key=lambda x: float(x["unrealized_pnl"])):
+        s_sym = p["symbol"]
+        s_side = p["side"]
+        s_qty = float(p["quantity"])
+        s_ent = float(p["entry_price"])
+        s_cur = float(p["current_price"])
+        s_not = s_qty * s_cur
+        s_upnl = float(p["unrealized_pnl"])
+        s_pct = ((s_cur / s_ent - 1.0) * 100.0) if (s_ent > 0 and s_side == "LONG") else (((1.0 - s_cur / s_ent) * 100.0) if s_ent > 0 else 0.0)
+        s_st = p.get("strategy") or ""
+        print(f"  [{label}] {s_sym:12s} | {s_side:5s} | Notional=${s_not:7.2f} | Entry={s_ent:10.5f} -> Now={s_cur:10.5f} ({s_pct:+6.2f}%) | uPnL=${s_upnl:+7.2f} | {s_st}")
+    trds = [dict(r) for r in conn.execute("SELECT timestamp, symbol, side, price, quantity, notional, fee_paid, is_maker, realized_pnl, strategy FROM trades ORDER BY timestamp DESC LIMIT 12").fetchall()]
+    print(f"[{label}] Last {len(trds)} Trades:")
+    for t in trds:
+        t_ts = str(t["timestamp"])[:19]
+        t_sym = t["symbol"]
+        t_sd = t["side"]
+        t_not = float(t["notional"])
+        t_rp = float(t["realized_pnl"])
+        t_fee = float(t["fee_paid"])
+        t_mk = "MAKER" if t["is_maker"] else "TAKER"
+        t_st = t.get("strategy") or ""
+        print(f"  [{label} TRD] {t_ts} | {t_sym:12s} | {t_sd:4s} | ${t_not:7.2f} | rPnL=${t_rp:+6.2f} | fee=${t_fee:.3f} ({t_mk}) | {t_st}")
     return pos
 
 m_pos = inspect_db("data/live_trading.db", "MAINNET")
