@@ -52,8 +52,10 @@ class ShadowExecutionBroker(IExecutionClient):
         enable_yield_collateral: bool = True,
         collateral_yield_apy: float = 0.055,
         collateral_haircut: float = 0.999,
+        account_snapshot_interval_sec: float = 60.0,
     ):
         self.db = database or ShadowDatabase()
+        self.account_snapshot_interval_sec = float(account_snapshot_interval_sec)
         self.taker_fee_pct = taker_fee_pct
         self.maker_fee_pct = maker_fee_pct
         self.slippage = slippage_bps / 10_000.0
@@ -894,12 +896,18 @@ class ShadowExecutionBroker(IExecutionClient):
         self,
         prices: dict[str, float],
         timestamp: datetime | None = None,
+        min_snapshot_interval_sec: float | None = None,
     ) -> Portfolio:
         """
         Updates mark prices and refreshes unrealized PnL, equity, and account state.
         """
         self.set_market_prices(prices)
-        self._record_account_snapshot(timestamp)
+        eff_interval = (
+            self.account_snapshot_interval_sec
+            if min_snapshot_interval_sec is None
+            else float(min_snapshot_interval_sec)
+        )
+        self._record_account_snapshot(timestamp, min_interval_sec=eff_interval)
         return self.portfolio
 
     def _cancel_bracket_orders(self, symbol: str) -> None:
@@ -1006,7 +1014,11 @@ class ShadowExecutionBroker(IExecutionClient):
 
         return realized_pnl
 
-    def _record_account_snapshot(self, timestamp: datetime | None = None) -> None:
+    def _record_account_snapshot(
+        self,
+        timestamp: datetime | None = None,
+        min_interval_sec: float = 0.0,
+    ) -> None:
         """Calculates portfolio aggregates and persists an account snapshot."""
         equity = self.portfolio.total_equity
         margin_used = sum(abs(p.market_value) for p in self.portfolio.positions.values())
@@ -1015,14 +1027,28 @@ class ShadowExecutionBroker(IExecutionClient):
         unrealized = sum(p.unrealized_pnl for p in self.portfolio.positions.values())
         realized = equity - self.portfolio.initial_cash - unrealized
 
-        self.db.save_account_snapshot(
-            initial_capital=self.portfolio.initial_cash,
-            cash_balance=self.portfolio.cash,
-            unrealized_pnl=unrealized,
-            realized_pnl=realized,
-            total_equity=equity,
-            margin_used=margin_used,
-            free_margin=free_margin,
-            leverage=leverage,
-            timestamp=timestamp,
-        )
+        try:
+            self.db.save_account_snapshot(
+                initial_capital=self.portfolio.initial_cash,
+                cash_balance=self.portfolio.cash,
+                unrealized_pnl=unrealized,
+                realized_pnl=realized,
+                total_equity=equity,
+                margin_used=margin_used,
+                free_margin=free_margin,
+                leverage=leverage,
+                timestamp=timestamp,
+                min_interval_sec=min_interval_sec,
+            )
+        except TypeError:
+            self.db.save_account_snapshot(
+                initial_capital=self.portfolio.initial_cash,
+                cash_balance=self.portfolio.cash,
+                unrealized_pnl=unrealized,
+                realized_pnl=realized,
+                total_equity=equity,
+                margin_used=margin_used,
+                free_margin=free_margin,
+                leverage=leverage,
+                timestamp=timestamp,
+            )

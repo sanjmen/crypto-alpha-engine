@@ -9,6 +9,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -28,6 +29,10 @@ class ShadowDatabase:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self._lock = threading.RLock()
+        self._last_account_row_id: int | None = None
+        self._last_account_insert_mono: float = 0.0
+        self._last_account_cash: float | None = None
+        self._last_account_init_capital: float | None = None
 
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -276,11 +281,62 @@ class ShadowDatabase:
         free_margin: float,
         leverage: float,
         timestamp: datetime | None = None,
+        min_interval_sec: float = 0.0,
     ) -> int:
-        """Inserts an account equity snapshot."""
+        """
+        Inserts an account equity snapshot, or updates the latest snapshot in-place
+        when `min_interval_sec > 0` and neither cash_balance nor initial_capital changed
+        within the throttling window (Issue #59 / M14 Option A).
+        """
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        now_mono = time.monotonic()
+        init_cap_f = float(initial_capital)
+        cash_f = float(cash_balance)
+        upnl_f = float(unrealized_pnl)
+        rpnl_f = float(realized_pnl)
+        eq_f = float(total_equity)
+        margin_f = float(margin_used)
+        free_f = float(free_margin)
+        lev_f = float(leverage)
+
         with self._lock:
             cursor = self._conn.cursor()
+            can_update_in_place = (
+                min_interval_sec > 0.0
+                and self._last_account_row_id is not None
+                and (now_mono - self._last_account_insert_mono) < min_interval_sec
+                and self._last_account_cash is not None
+                and abs(cash_f - self._last_account_cash) < 1e-4
+                and self._last_account_init_capital is not None
+                and abs(init_cap_f - self._last_account_init_capital) < 1e-4
+            )
+            if can_update_in_place:
+                cursor.execute(
+                    """
+                    UPDATE accounts
+                    SET timestamp = ?,
+                        unrealized_pnl = ?,
+                        realized_pnl = ?,
+                        total_equity = ?,
+                        margin_used = ?,
+                        free_margin = ?,
+                        leverage = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        ts,
+                        upnl_f,
+                        rpnl_f,
+                        eq_f,
+                        margin_f,
+                        free_f,
+                        lev_f,
+                        self._last_account_row_id,
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    return int(self._last_account_row_id)
+
             cursor.execute(
                 """
                 INSERT INTO accounts (
@@ -290,17 +346,22 @@ class ShadowDatabase:
                 """,
                 (
                     ts,
-                    float(initial_capital),
-                    float(cash_balance),
-                    float(unrealized_pnl),
-                    float(realized_pnl),
-                    float(total_equity),
-                    float(margin_used),
-                    float(free_margin),
-                    float(leverage),
+                    init_cap_f,
+                    cash_f,
+                    upnl_f,
+                    rpnl_f,
+                    eq_f,
+                    margin_f,
+                    free_f,
+                    lev_f,
                 ),
             )
-            return cursor.lastrowid
+            row_id = int(cursor.lastrowid)
+            self._last_account_row_id = row_id
+            self._last_account_insert_mono = now_mono
+            self._last_account_cash = cash_f
+            self._last_account_init_capital = init_cap_f
+            return row_id
 
     def get_latest_account(self) -> dict[str, Any] | None:
         """Returns the most recent account snapshot or None."""
@@ -1012,9 +1073,137 @@ class ShadowDatabase:
             res["factor_tstats"] = json.loads(res.get("factor_tstats_json") or "{}")
             return res
 
+    def prune_old_records(
+        self,
+        accounts_minute_res_days: float = 7.0,
+        canceled_orders_retention_hours: float = 24.0,
+        audit_retention_days: float = 14.0,
+        keep_recent_accounts: int = 500,
+        run_vacuum: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """
+        Issue #59 (M14 Option A): Native TTL pruning, historical account snapshot
+        downsampling, and WAL auto-compaction.
+        - Retains the latest `keep_recent_accounts` rows in `accounts` at full resolution.
+        - Downsamples `accounts` rows within `accounts_minute_res_days` (default 7d) to
+          1 snapshot per minute (`YYYY-MM-DDTHH:MM`), and older rows to 1 snapshot per hour
+          (`YYYY-MM-DDTHH`).
+        - Deletes terminal zero-fill `CANCELED` / `REJECTED` orders older than
+          `canceled_orders_retention_hours` that are not referenced in `trades`.
+        - Deletes `reconciliation_audit_logs` older than `audit_retention_days` (preserving
+          the latest 200 entries).
+        - Runs `PRAGMA wal_checkpoint(TRUNCATE)` and optional `VACUUM`.
+        """
+        ref_now = now or datetime.now(timezone.utc)
+        cutoff_7d_iso = (ref_now - timedelta(days=float(accounts_minute_res_days))).isoformat()
+        cutoff_orders_iso = (ref_now - timedelta(hours=float(canceled_orders_retention_hours))).isoformat()
+        cutoff_audit_iso = (ref_now - timedelta(days=float(audit_retention_days))).isoformat()
+        keep_n = max(1, int(keep_recent_accounts))
+
+        with self._lock:
+            cursor = self._conn.cursor()
+
+            # Find boundary id for the most recent `keep_n` account rows
+            row_bound = cursor.execute(
+                "SELECT MIN(id) FROM (SELECT id FROM accounts ORDER BY id DESC LIMIT ?)",
+                (keep_n,),
+            ).fetchone()
+            min_recent_id = int(row_bound[0]) if (row_bound and row_bound[0] is not None) else None
+
+            accounts_deleted = 0
+            if min_recent_id is not None:
+                # 1a. Downsample recent history (< 7d, id < min_recent_id) to 1 row per minute
+                cursor.execute(
+                    """
+                    DELETE FROM accounts
+                    WHERE id < ?
+                      AND timestamp >= ?
+                      AND id NOT IN (
+                          SELECT MAX(id)
+                          FROM accounts
+                          WHERE id < ? AND timestamp >= ?
+                          GROUP BY substr(timestamp, 1, 16)
+                      )
+                    """,
+                    (min_recent_id, cutoff_7d_iso, min_recent_id, cutoff_7d_iso),
+                )
+                accounts_deleted += max(0, int(cursor.rowcount))
+
+                # 1b. Downsample older history (>= 7d, id < min_recent_id) to 1 row per hour
+                cursor.execute(
+                    """
+                    DELETE FROM accounts
+                    WHERE id < ?
+                      AND timestamp < ?
+                      AND id NOT IN (
+                          SELECT MAX(id)
+                          FROM accounts
+                          WHERE id < ? AND timestamp < ?
+                          GROUP BY substr(timestamp, 1, 13)
+                      )
+                    """,
+                    (min_recent_id, cutoff_7d_iso, min_recent_id, cutoff_7d_iso),
+                )
+                accounts_deleted += max(0, int(cursor.rowcount))
+
+            # 2. Prune terminal zero-fill CANCELED / REJECTED orders unreferenced by trades
+            cursor.execute(
+                """
+                DELETE FROM orders
+                WHERE status IN ('CANCELED', 'CANCELLED', 'REJECTED')
+                  AND COALESCE(filled_quantity, 0.0) <= 0.0
+                  AND updated_at < ?
+                  AND id NOT IN (SELECT DISTINCT order_id FROM trades)
+                """,
+                (cutoff_orders_iso,),
+            )
+            orders_deleted = max(0, int(cursor.rowcount))
+
+            # 3. Prune old reconciliation_audit_logs (keeping latest 200 rows)
+            cursor.execute(
+                """
+                DELETE FROM reconciliation_audit_logs
+                WHERE timestamp < ?
+                  AND id NOT IN (
+                      SELECT id FROM reconciliation_audit_logs ORDER BY id DESC LIMIT 200
+                  )
+                """,
+                (cutoff_audit_iso,),
+            )
+            audit_deleted = max(0, int(cursor.rowcount))
+
+            total_deleted = accounts_deleted + orders_deleted + audit_deleted
+            vacuumed = 0
+            if self.db_path != ":memory:":
+                try:
+                    cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    cursor.execute("PRAGMA optimize;")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"SQLite WAL checkpoint note: {exc}")
+
+                if run_vacuum or total_deleted >= 2000:
+                    try:
+                        cursor.execute("VACUUM;")
+                        vacuumed = 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"SQLite VACUUM note: {exc}")
+
+            return {
+                "accounts_deleted": accounts_deleted,
+                "orders_deleted": orders_deleted,
+                "audit_deleted": audit_deleted,
+                "total_deleted": total_deleted,
+                "vacuumed": vacuumed,
+            }
+
     def reset_all_data(self) -> None:
         """Clears all records from all tables (used for testing and fresh start)."""
         with self._lock:
+            self._last_account_row_id = None
+            self._last_account_insert_mono = 0.0
+            self._last_account_cash = None
+            self._last_account_init_capital = None
             cursor = self._conn.cursor()
             cursor.execute("DELETE FROM trades;")
             cursor.execute("DELETE FROM orders;")

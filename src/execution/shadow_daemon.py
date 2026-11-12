@@ -231,6 +231,32 @@ class ShadowTradingDaemon:
         self.start_time = datetime.now(timezone.utc)
         self.total_ticks_processed = 0
         self.last_tick_time: datetime | None = None
+        self.db_prune_interval_sec: float = 21600.0
+        self.last_db_prune_time: datetime | None = None
+        self.run_db_maintenance(now=self.start_time)
+
+    def run_db_maintenance(self, now: datetime | None = None) -> dict[str, int]:
+        """
+        Issue #59 (M14 Option A): Runs periodic SQLite TTL pruning, historical account
+        snapshot downsampling, terminal zero-fill order cleanup, and WAL truncation.
+        """
+        ref_now = now or datetime.now(timezone.utc)
+        self.last_db_prune_time = ref_now
+        db_inst = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
+        if not db_inst or not hasattr(db_inst, "prune_old_records"):
+            return {"total_deleted": 0}
+        try:
+            stats = db_inst.prune_old_records(now=ref_now)
+            if isinstance(stats, dict) and stats.get("total_deleted", 0) > 0:
+                logger.info(
+                    f"🧹 SQLite TTL Pruning completed: removed {stats.get('total_deleted', 0)} stale rows "
+                    f"(accounts={stats.get('accounts_deleted', 0)}, orders={stats.get('orders_deleted', 0)}, "
+                    f"audit={stats.get('audit_deleted', 0)}, vacuumed={bool(stats.get('vacuumed', 0))})"
+                )
+            return stats if isinstance(stats, dict) else {"total_deleted": 0}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"SQLite maintenance note: {exc}")
+            return {"total_deleted": 0}
 
     def _refresh_anomaly_cooldowns(self, filled_orders: list[Order] | None = None) -> None:
         """
@@ -2134,6 +2160,13 @@ class ShadowTradingDaemon:
         funding_cashflows = {}
         if funding_due:
             funding_cashflows = self.run_funding_cycle()
+
+        # 5. Periodic SQLite TTL Pruning & WAL Compaction (every 6h)
+        if (
+            self.last_db_prune_time is None
+            or (now - self.last_db_prune_time).total_seconds() >= self.db_prune_interval_sec
+        ):
+            self.run_db_maintenance(now=now)
 
         return {
             "timestamp": now.isoformat(),
