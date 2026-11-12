@@ -141,5 +141,50 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 * **Issue #36**: Meta: Hierarchical Risk Parity (HRP) Portfolio Allocation Engine
   * Quasi-diagonalization, dendrogram bisection, and tree-based risk allocation eliminating correlation inversion instability.
 
+---
+
+## Milestone 11 & 12: 7-Factor Causal Online Engine, Stepped Leverage & Mainnet Bridge (M11–M12) [COMPLETED]
+**Objective**: Implement the 7-Factor Causal Online Meta-Allocator (`36h/96h/240h` net t-statistics), 72h Volatility Targeting, Hysteresis Stepped Leverage (`2.5x/3.0x -> 5.0x`), operational shields (Open Interest Squeeze Guard, L2 OBI Adaptive Maker Routing, CVD Absorption, Spot-Perp Basis), and the Binance USDS-M Futures Mainnet live execution bridge.
+
+* **Issues #37–#50**:
+  * `SevenFactorOnlineEngine` (`F1_Macro_Idio_PB`, `F2_Med_Idio_PB`, `F3_Fast_Swing_PB`, `F4_Rev_24_72h`, `F5_Carry_Neg`, `F6_Liq_Surge`, `F7_HighLiq_Size`).
+  * `SteppedLeverageController` with compound HWM step-ups (`+0.5x` per `+15%` gain) and drawdown de-escalation (`-0.5x` per `6%` DD).
+  * `BinanceLiveBroker` with `Post-Only (GTX)` Maker Limit-Chase, L1 top-of-book pricing, and automatic One-Way / Cross-Margin / Leverage configuration.
+
+---
+
+## Milestone 13: Parallel Multi-Mode Engine, Yield Acceleration & Smart Money Integration (M13) [COMPLETED]
+**Objective**: Build unified multi-mode execution (`--shadow`, `--testnet`, `--mainnet`), implement the 4 Direct Yield Levers, and integrate Binance institutional positioning (`fapiData`), extreme funding harvesting, yield-bearing collateral (`BFUSD`/`LDUSDT`), and quarterly delivery basis regime scaling.
+
+* **Issue #51**: Unified Multi-Mode Trading Launcher (`scripts/run_trading.py`) with isolated SQLite WAL databases.
+* **Issue #52**: Factor #6 (`F6_Liq_Surge`) High-Conviction Gating (`t-stat >= +0.75`).
+* **Issue #53**: Post-Only (`GTX`) Maker Limit-Chase & Dynamic `% Equity` Sizing for Anomaly Strategies.
+* **Issue #54**: Market-Neutral `3.0x` Base Leverage Calibration & Multi-Slice Order Chunking (`$5k–$50k`).
+* **Issue #55**: Tier 1A Institutional Positioning Factor (`F8_Smart_Money_Flow` via `fapiData`).
+* **Issue #56**: Tier 1B Extreme Funding Rate Harvester (`300+` Perps with Beta-Neutral `BTC/USDT` Hedge).
+* **Issue #57**: Tier 1C Yield-Bearing Futures Collateral Integration (`BFUSD` & `LDUSDT` Cross-Margin Accounting).
+* **Issue #58**: Tier 2 Quarterly Delivery Basis Regime Indicator (`fapiDataGetBasis`) & Ecosystem Guardrails.
+
+---
+
+## Milestone 14: Storage/SQLite TTL Pruning & WebSocket Event-Loop Optimization (M14) [COMPLETED]
+**Objective**: Optimize SQLite WAL disk growth and WebSocket thread CPU consumption on the Google Cloud Tokyo (`asia-northeast1-a`) production VM.
+
+* **Issue #59 [CLOSED]**: Native SQLite TTL Pruning (`retention_days=7` for `accounts`/`orders`/`reconciliation_audit_logs` while preserving 100% of `trades`, `funding_settlements`, and `rebalance_snapshots`), `60s` Account Snapshot Throttling, L1 Tick Deduplication, and `PRAGMA wal_checkpoint(TRUNCATE)` (reduced DB from `25 MB` to `2.8 MB` and CPU from `21%` to `<4%`).
+* **Issue #60 [OPEN — Reserve]**: Optional Redis 7 Ephemeral Streams for high-frequency tick fan-out if scaling to multiple consumers.
+
+---
+
+## Milestone 15: Selective Production Promotion & Core Bracket Optimization (M15) [COMPLETED]
+**Objective**: Promote empirically validated M13 features to `--mainnet` while keeping experimental anomaly modules quarantined in `--shadow`, and optimize Core exit barriers based on the 22-day live database audit and 14-configuration backtest matrix.
+
+* **Issue #61 [CLOSED]**: Promote Dynamic Online IC (`priors=None`) and `F6_Liq_Surge` Gate (`t-stat >= +0.75`) to `--mainnet`.
+* **Issue #62 [CLOSED]**: Promote `F8_Smart_Money_Flow`, `Quarterly Delivery Basis` Regime Scalar, and `BFUSD/LDUSDT` Yield Collateral Accounting to `--mainnet`.
+* **Issue #63 [CLOSED]**: Implement `60s` Live Wallet Balance Sync (`sync_from_live_exchange`) in `--mainnet`.
+* **Issue #64 [OPEN — Quarantine in `--shadow`]**: Quarantine `Extreme Funding Harvester` in `--shadow` pending post-settlement stop-loss refinement.
+* **Issue #65 [OPEN — Quarantine in `--shadow`]**: Quarantine `4.5% Dynamic Anomaly Equity Sizing` in `--shadow` (keeping `$45` cap in `--mainnet`).
+* **Core Bracket Optimization (`commits cfdb24b` & `4cdbb2a`)**: Unify Core 7-Factor exit brackets to **Passive Maker Take-Profit `+5.0%` (`0.02%` fee) + Profit-Lock (`+3.5% -> +1.5%`) with Trailing Stop disabled (`0.0`) and initial negative Stop-Loss disabled (`None`)** across both `--shadow` and `--mainnet` (documented in [`docs/SYSTEM_OPERATION_AND_DECISIONS_2026.md`](SYSTEM_OPERATION_AND_DECISIONS_2026.md)).
+
+
 
 

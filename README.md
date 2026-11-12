@@ -25,9 +25,12 @@ Built on **Clean Architecture (Hexagonal / Ports & Adapters)**:
 * **Execution (`src/execution/`)**: Paper trading and live CCXT order execution.
 
 Detailed architectural specifications: [`docs/system_architecture.md`](docs/system_architecture.md).  
+Master system operations, empirical barrier audit & decision log (Nov 2026): [`docs/SYSTEM_OPERATION_AND_DECISIONS_2026.md`](docs/SYSTEM_OPERATION_AND_DECISIONS_2026.md).  
+22-Month & Sub-Hourly quantitative research report: [`reports/high_frequency_and_alpha_research_2026.md`](reports/high_frequency_and_alpha_research_2026.md).  
+Milestone M13–M15 specification: [`docs/MILESTONE_M13_YIELD_ACCELERATION.md`](docs/MILESTONE_M13_YIELD_ACCELERATION.md).  
 Mathematical formulations: [`docs/mathematical_formulation.md`](docs/mathematical_formulation.md).  
 Empirical data census & sources report: [`docs/deep_data_census_report.md`](docs/deep_data_census_report.md).  
-Development roadmap: [`docs/roadmap.md`](docs/roadmap.md).
+Development roadmap (M1–M15): [`docs/roadmap.md`](docs/roadmap.md).
 
 ---
 
@@ -67,19 +70,21 @@ pytest -v tests/
 
 ---
 
-## 🛰️ Live Shadow Trading Engine (0 Capital Risk)
+## 🛰️ Unified Multi-Mode Trading Engine (`--mainnet`, `--shadow`, `--testnet`)
 
-Run simulated execution against real-time Binance USDS-M Futures Mainnet prices with local SQLite WAL persistence:
+Run Production (`--mainnet`) and Shadow Lab (`--shadow`) simultaneously in isolated processes and SQLite WAL databases (`data/live_trading.db` vs. `data/shadow_trading.db`), locally or on Google Cloud Tokyo (`asia-northeast1-a`) via Docker + Zero-Trust IAP:
 
 ```bash
-# 1. Run a single synchronous step (poll Binance Mainnet, evaluate orders, record snapshot):
-python scripts/run_shadow_trading.py --once
+# 1. Production Live Mainnet (uses data/live_trading.db):
+python scripts/run_trading.py --daemon --mainnet
+python scripts/run_trading.py --monitor --mainnet
 
-# 2. Run the continuous background daemon:
-python scripts/run_shadow_trading.py --daemon
+# 2. Local Shadow Lab in parallel (0 capital risk, uses data/shadow_trading.db):
+python scripts/run_trading.py --daemon --shadow
+python scripts/run_trading.py --monitor --shadow
 
-# 3. Launch the real-time Rich terminal telemetry dashboard:
-python scripts/run_shadow_trading.py --monitor
+# 3. Check live status of Tokyo VM containers (crypto-mainnet & crypto-shadow):
+./scripts/deploy_to_gcp.sh --status
 ```
 
 ---
