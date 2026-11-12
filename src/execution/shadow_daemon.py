@@ -191,7 +191,7 @@ class ShadowTradingDaemon:
                 "timeout": 20000,
                 "options": {
                     "defaultType": "future",
-                    "fetchMarkets": {"types": ["linear", "delivery"]},
+                    "fetchMarkets": {"types": ["linear"]},
                     "fetchCurrencies": False,
                 },
             })
