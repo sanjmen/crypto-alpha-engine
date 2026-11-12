@@ -307,6 +307,106 @@ for key in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
     exit 0
 fi
 
+if [[ "$MODE" == "--close-subaccount" ]]; then
+    echo "=== Cerrando todas las posiciones y órdenes abiertas en la Sub-Cuenta ==="
+    if .venv/bin/python - << 'PYEOF'
+import pathlib
+from src.execution.live_broker import BinanceLiveBroker
+
+env_map = {}
+p = pathlib.Path(".env")
+for raw in p.read_text().splitlines() if p.exists() else []:
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    if line.startswith("export "):
+        line = line[7:].strip()
+    k, v = line.split("=", 1)
+    env_map[k.strip()] = v.strip().strip('"').strip("'")
+
+sub_key = env_map.get("SUB_BINANCE_API_KEY")
+sub_sec = env_map.get("SUB_BINANCE_API_SECRET")
+if not sub_key or not sub_sec:
+    raise SystemExit("ERROR: Define SUB_BINANCE_API_KEY y SUB_BINANCE_API_SECRET en .env")
+
+broker = BinanceLiveBroker(api_key=sub_key, api_secret=sub_sec, dry_run=False)
+ex_pos = broker.reconcile_positions_from_exchange()
+print(f"Posiciones abiertas encontradas en Sub-Cuenta: {len(ex_pos)}")
+for sym, pos in ex_pos.items():
+    try:
+        broker.client.cancel_all_orders(sym)
+    except Exception:
+        pass
+    side = "sell" if pos.side.value == "LONG" else "buy"
+    qty = abs(float(pos.quantity))
+    res = broker.client.create_order(symbol=sym, type="market", side=side, amount=qty, params={"reduceOnly": True})
+    oid = res.get("id")
+    print(f"  [CERRADA] {sym} ({pos.side.value} qty={qty}) -> order_id={oid}")
+
+bal = broker.client.fetch_balance()
+col = broker.compute_effective_margin_collateral(bal)
+w_usd = col.get("effective_wallet_usd", 0.0)
+f_usd = col.get("effective_free_usd", 0.0)
+print(f"Balance Sub-Cuenta libre para transferir: Wallet=${w_usd:.2f} | Free=${f_usd:.2f}")
+PYEOF
+    then
+        echo "[OK] Posiciones de Sub-Cuenta cerradas exitosamente."
+        exit 0
+    fi
+
+    echo "-> Reintentando desde la IP de la instancia en Tokio ($STATIC_IP)..."
+    gcloud compute scp .env "$INSTANCE:/tmp/sub_check.env" \
+        --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            docker cp /tmp/sub_check.env crypto-mainnet:/tmp/sub_check.env
+            rm -f /tmp/sub_check.env
+            docker exec -i crypto-mainnet python - << "PYEOF"
+import pathlib
+from src.execution.live_broker import BinanceLiveBroker
+
+env_map = {}
+p = pathlib.Path("/tmp/sub_check.env")
+for raw in p.read_text().splitlines() if p.exists() else []:
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    if line.startswith("export "):
+        line = line[7:].strip()
+    k, v = line.split("=", 1)
+    env_map[k.strip()] = v.strip().strip("\"").strip("\x27")
+p.unlink(missing_ok=True)
+
+sub_key = env_map.get("SUB_BINANCE_API_KEY")
+sub_sec = env_map.get("SUB_BINANCE_API_SECRET")
+if not sub_key or not sub_sec:
+    raise SystemExit("ERROR: Define SUB_BINANCE_API_KEY y SUB_BINANCE_API_SECRET en .env")
+
+broker = BinanceLiveBroker(api_key=sub_key, api_secret=sub_sec, dry_run=False)
+ex_pos = broker.reconcile_positions_from_exchange()
+print(f"Posiciones abiertas encontradas en Sub-Cuenta: {len(ex_pos)}")
+for sym, pos in ex_pos.items():
+    try:
+        broker.client.cancel_all_orders(sym)
+    except Exception:
+        pass
+    side = "sell" if pos.side.value == "LONG" else "buy"
+    qty = abs(float(pos.quantity))
+    res = broker.client.create_order(symbol=sym, type="market", side=side, amount=qty, params={"reduceOnly": True})
+    oid = res.get("id")
+    print(f"  [CERRADA] {sym} ({pos.side.value} qty={qty}) -> order_id={oid}")
+
+bal = broker.client.fetch_balance()
+col = broker.compute_effective_margin_collateral(bal)
+w_usd = col.get("effective_wallet_usd", 0.0)
+f_usd = col.get("effective_free_usd", 0.0)
+print(f"Balance Sub-Cuenta libre para transferir: Wallet=${w_usd:.2f} | Free=${f_usd:.2f}")
+PYEOF
+        '
+    exit 0
+fi
+
 if [[ "$MODE" == "--diagnostics" ]]; then
     gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
         --command='
@@ -331,6 +431,8 @@ import os, sqlite3
 from src.execution.live_broker import BinanceLiveBroker
 
 def inspect_db(path, label):
+    sz_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0.0
+    wal_mb = os.path.getsize(path + "-wal") / (1024 * 1024) if os.path.exists(path + "-wal") else 0.0
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     hb = dict(conn.execute("SELECT * FROM daemon_heartbeat WHERE id=1").fetchone() or {})
@@ -338,6 +440,9 @@ def inspect_db(path, label):
     rb = dict(conn.execute("SELECT * FROM rebalance_snapshots ORDER BY id DESC LIMIT 1").fetchone() or {})
     pos = [dict(r) for r in conn.execute("SELECT symbol, side, quantity, entry_price, current_price, unrealized_pnl, strategy FROM positions WHERE quantity > 0").fetchall()]
     pend = [dict(r) for r in conn.execute("SELECT id, symbol, side, order_type, quantity, price, status FROM orders WHERE status = ?", ("PENDING",)).fetchall()]
+    acc_cnt = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+    ord_cnt = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    trd_cnt = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
     d_st = hb.get("status")
     w_st = hb.get("ws_state")
     tps = hb.get("ticks_per_sec", 0.0)
@@ -349,6 +454,7 @@ def inspect_db(path, label):
     lev = eq.get("leverage", 0.0)
     print(f"[{label}] Heartbeat: status={d_st} | ws={w_st} ({tps:.1f} ticks/s) | regime={reg} | updated={upd}")
     print(f"[{label}] Equity: ${t_eq:.2f} | Cash: ${c_bal:.2f} | uPnL: ${upnl:+.2f} | Lev: {lev:.2f}x | Open Pos: {len(pos)} | Pending Orders: {len(pend)}")
+    print(f"[{label}] DB Size: {sz_mb:.2f} MB (WAL: {wal_mb:.2f} MB) | Rows: accounts={acc_cnt}, orders={ord_cnt}, trades={trd_cnt}")
     return pos
 
 m_pos = inspect_db("data/live_trading.db", "MAINNET")

@@ -111,6 +111,7 @@ class ResilientWebSocketClient:
         self.reconnect_attempts: int = 0
 
         self.latest_ticks: dict[str, PriceTick] = {}
+        self._last_emit_mono: dict[str, float] = {}
         self.tick_buffer: deque[PriceTick] = deque(maxlen=self.config.tick_buffer_capacity)
 
         self._thread: threading.Thread | None = None
@@ -188,8 +189,9 @@ class ResilientWebSocketClient:
             try:
                 connect_kwargs: dict[str, Any] = {
                     "ping_interval": self.config.ping_interval_sec,
-                    "ping_timeout": 10.0,
+                    "ping_timeout": 60.0,
                     "close_timeout": 5.0,
+                    "max_queue": 512,
                 }
                 async with websockets.connect(url, **connect_kwargs) as ws:
                     self._ws = ws
@@ -199,11 +201,15 @@ class ResilientWebSocketClient:
                     self.disconnected_at = None
                     self.reconnect_attempts = 0
                     self._set_state(WebSocketState.CONNECTED, "Connection established")
+                    msg_counter = 0
 
                     async for message in ws:
                         if self._stop_event.is_set():
                             break
                         self._process_ws_message(message)
+                        msg_counter += 1
+                        if msg_counter % 50 == 0:
+                            await asyncio.sleep(0)
 
                         # Check for 24-hour rollover pre-emption
                         if self.connected_since and (time.monotonic() - self.connected_since) >= self.config.max_connection_duration_sec:
@@ -312,11 +318,17 @@ class ResilientWebSocketClient:
             ask_p = stream_data.get("a")
 
             if symbol and bid_p and ask_p:
+                sym_up = symbol.upper()
                 b = float(bid_p)
                 a = float(ask_p)
+                prev = self.latest_ticks.get(sym_up)
+                last_emit = self._last_emit_mono.get(sym_up, 0.0)
+                if prev is not None and prev.bid == b and prev.ask == a and (now - last_emit) < 0.25:
+                    return
+                self._last_emit_mono[sym_up] = now
                 mid = (b + a) / 2.0
                 tick = PriceTick(
-                    symbol=symbol.upper(),
+                    symbol=sym_up,
                     price=mid,
                     bid=b,
                     ask=a,
