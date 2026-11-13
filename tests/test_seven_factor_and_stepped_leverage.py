@@ -1380,6 +1380,73 @@ def test_shadow_core_tp_5pct_profit_lock_without_trailing_or_initial_sl():
     db.close()
 
 
+def test_shadow_monitor_single_instance_reclaim_and_tty_watchdog(tmp_path, monkeypatch):
+    """
+    Verifies ShadowMonitor:
+    1. Reclaims stale `--monitor` processes via both PID lockfile and `/proc` cmdline scan,
+       while never killing `--daemon` or a different mode's `--monitor`.
+    2. Exits cleanly after a single snapshot when launched without a TTY (`require_tty=True`),
+       cleaning up its `.monitor.pid` file.
+    3. Detects disconnected pseudo-terminals (`st_nlink == 0` or `BrokenPipeError`).
+    """
+    import os
+
+    db_file = tmp_path / "live_trading.db"
+    db = ShadowDatabase(db_path=str(db_file))
+    db.close()
+
+    # Fake /proc directory with:
+    # - 11111: Mainnet daemon (MUST NOT be killed)
+    # - 22222: Hung Mainnet monitor (MUST be killed)
+    # - 33333: Shadow monitor (MUST NOT be killed by Mainnet monitor)
+    fake_proc = tmp_path / "proc"
+    fake_proc.mkdir()
+    for pid_str, args in [
+        ("11111", ["python", "scripts/run_trading.py", "--daemon", "--mainnet"]),
+        ("22222", ["python", "scripts/run_trading.py", "--monitor", "--mainnet"]),
+        ("33333", ["python", "scripts/run_trading.py", "--monitor", "--shadow"]),
+    ]:
+        pdir = fake_proc / pid_str
+        pdir.mkdir()
+        (pdir / "cmdline").write_bytes(("\x00".join(args) + "\x00").encode("utf-8"))
+
+    # Also write an old PID (44444) in the lockfile
+    pid_lock = tmp_path / "live_trading.db.monitor.pid"
+    pid_lock.write_text("44444", encoding="utf-8")
+
+    killed_pids: list[int] = []
+
+    def _mock_terminate(pid: int, grace_sec: float = 0.25) -> bool:
+        killed_pids.append(pid)
+        return True
+
+    monitor = ShadowMonitor(db_path=str(db_file))
+    monkeypatch.setattr(ShadowMonitor, "_terminate_pid_safely", staticmethod(_mock_terminate))
+
+    reclaimed = monitor.reclaim_stale_monitors(proc_root=str(fake_proc))
+    assert 44444 in reclaimed
+    assert 22222 in reclaimed
+    assert 11111 not in killed_pids  # Daemon untouched
+    assert 33333 not in killed_pids  # Shadow monitor untouched
+    assert pid_lock.exists()
+    assert int(pid_lock.read_text(encoding="utf-8").strip()) == os.getpid()
+
+    # Verify non-TTY invocation exits immediately after rendering 1 snapshot and releases lockfile
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monitor.run_live(refresh_rate=0.01, require_tty=True)
+    assert not pid_lock.exists()
+
+    # Verify _is_terminal_alive detects revoked devpts (st_nlink == 0)
+    class _DeadPtyStat:
+        st_nlink = 0
+
+    monkeypatch.setattr("sys.stdout.fileno", lambda: 1)
+    monkeypatch.setattr("os.isatty", lambda fd: True)
+    monkeypatch.setattr("os.fstat", lambda fd: _DeadPtyStat())
+    assert ShadowMonitor._is_terminal_alive(initial_tty=True) is False
+
+
+
 
 
 

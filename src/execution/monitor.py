@@ -8,10 +8,14 @@ live WebSocket heartbeat, and 24h market pulse / anomaly radar.
 import argparse
 from datetime import datetime, timezone
 import json
+import logging
 import os
+import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from rich.console import Console
@@ -668,22 +672,210 @@ class ShadowMonitor:
             print(f"  - [{t['id'][:10]}] {t['symbol']} {t['side']} {float(t['quantity']):,.2f} @ ${float(t['price']):,.4f} | PnL: ${float(t.get('realized_pnl', 0.0)):+,.2f}")
         print("=" * 80 + "\n")
 
-    def run_live(self, refresh_rate: float = 2.0) -> None:
-        """Starts live dashboard loop."""
-        if not HAS_RICH:
-            print("Running in non-rich mode...")
-            while True:
-                self.render_snapshot()
-                time.sleep(refresh_rate)
+    def _get_pid_file_path(self) -> str:
+        """Returns the single-instance lockfile path associated with this monitor's database."""
+        if not self.db_path or self.db_path == ":memory:":
+            return "/tmp/crypto_monitor_memory.pid"
+        return f"{os.path.abspath(self.db_path)}.monitor.pid"
 
-        refresh_per_second = max(1, int(1.0 / refresh_rate)) if refresh_rate < 1.0 else 1
-        with Live(self.render_snapshot(), refresh_per_second=refresh_per_second, console=self.console) as live:
-            while True:
-                try:
+    @staticmethod
+    def _terminate_pid_safely(pid: int, grace_sec: float = 0.25) -> bool:
+        """Sends SIGTERM (and SIGKILL if needed) to a stale monitor PID."""
+        if pid <= 1 or pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return False
+        except OSError:
+            return False
+
+        deadline = time.monotonic() + max(0.05, grace_sec)
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                break
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+            return True
+        except OSError:
+            return True
+
+    def reclaim_stale_monitors(self, proc_root: str = "/proc") -> List[int]:
+        """
+        Ensures only one live dashboard process runs at a time per database/container:
+        1. Reclaims any previous PID recorded in `<db_path>.monitor.pid`.
+        2. Scans `/proc` (on Linux/Docker) for any hung `--monitor` process (excluding `--daemon`)
+           and terminates it before writing the current process PID lockfile.
+        """
+        my_pid = os.getpid()
+        reclaimed: List[int] = []
+        pid_file = self._get_pid_file_path()
+
+        # 1. Check PID lockfile
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    old_pid = int(f.read().strip())
+                if old_pid > 1 and old_pid != my_pid:
+                    cmdline_path = os.path.join(proc_root, str(old_pid), "cmdline")
+                    is_safe_target = True
+                    if os.path.exists(cmdline_path):
+                        try:
+                            with open(cmdline_path, "rb") as cf:
+                                raw_cmd = cf.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+                            if "--daemon" in raw_cmd or "--monitor" not in raw_cmd:
+                                is_safe_target = False
+                        except OSError:
+                            pass
+                    if is_safe_target and self._terminate_pid_safely(old_pid):
+                        reclaimed.append(old_pid)
+            except (ValueError, OSError):
+                pass
+
+        # 2. Scan /proc for any orphan/hung `--monitor` processes inside the container
+        if os.path.isdir(proc_root):
+            db_basename = os.path.basename(self.db_path) if self.db_path else ""
+            is_mainnet_db = "live_trading" in db_basename
+            is_testnet_db = "testnet_trading" in db_basename
+            try:
+                for entry in os.listdir(proc_root):
+                    if not entry.isdigit():
+                        continue
+                    pid = int(entry)
+                    if pid <= 1 or pid == my_pid or pid in reclaimed:
+                        continue
+                    cmdline_file = os.path.join(proc_root, entry, "cmdline")
+                    try:
+                        with open(cmdline_file, "rb") as cf:
+                            args_list = [a for a in cf.read().decode("utf-8", errors="ignore").split("\x00") if a]
+                    except OSError:
+                        continue
+                    if not args_list:
+                        continue
+                    cmd_joined = " ".join(args_list)
+                    if "--monitor" not in cmd_joined or "--daemon" in cmd_joined:
+                        continue
+                    # Match same mode/db so a shadow monitor on the same host doesn't kill a mainnet monitor
+                    if is_mainnet_db and ("--shadow" in args_list or "--testnet" in args_list):
+                        continue
+                    if is_testnet_db and ("--shadow" in args_list or "--mainnet" in args_list):
+                        continue
+                    if not is_mainnet_db and not is_testnet_db and ("--mainnet" in args_list or "--testnet" in args_list):
+                        continue
+                    if self._terminate_pid_safely(pid):
+                        reclaimed.append(pid)
+            except OSError:
+                pass
+
+        # 3. Record current PID in lockfile
+        try:
+            parent_dir = os.path.dirname(pid_file)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(pid_file, "w", encoding="utf-8") as f:
+                f.write(str(my_pid))
+        except OSError:
+            pass
+
+        if reclaimed:
+            logger.info(f"🧹 Reclaimed {len(reclaimed)} stale monitor process(es): {reclaimed}")
+        return reclaimed
+
+    def _release_pid_file(self) -> None:
+        """Removes the PID lockfile on exit if owned by the current process."""
+        pid_file = self._get_pid_file_path()
+        try:
+            if os.path.exists(pid_file):
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    recorded = f.read().strip()
+                if recorded == str(os.getpid()):
+                    os.remove(pid_file)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _is_terminal_alive(initial_tty: bool) -> bool:
+        """
+        Detects whether the controlling SSH/docker-exec terminal or stdout pipe has closed.
+        On Linux devpts, when an SSH pseudo-terminal disconnects, `st_nlink` on the slave
+        `/dev/pts/N` fd drops to 0 or `os.isatty(fd)` becomes False.
+        """
+        try:
+            sys.stdout.flush()
+            if initial_tty:
+                fd = sys.stdout.fileno()
+                if not os.isatty(fd):
+                    return False
+                st = os.fstat(fd)
+                if getattr(st, "st_nlink", 1) == 0:
+                    return False
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+        return True
+
+    def run_live(self, refresh_rate: float = 2.0, require_tty: bool = True) -> None:
+        """
+        Starts live dashboard loop with:
+        - Single-instance lock & automatic stale monitor reclamation
+        - Non-TTY single-snapshot fallback (prevents infinite background loops when run without `-it`)
+        - Disconnected SSH / pseudo-TTY & BrokenPipe self-termination watchdog
+        """
+        self.reclaim_stale_monitors()
+
+        try:
+            try:
+                is_tty = bool(sys.stdout.isatty())
+            except Exception:
+                is_tty = False
+
+            if require_tty and not is_tty:
+                logger.info("Non-interactive stdout detected (no TTY); rendering single snapshot and exiting.")
+                layout = self.render_snapshot()
+                if HAS_RICH and self.console and layout is not None:
+                    self.console.print(layout)
+                return
+
+            stop_requested = False
+
+            def _handle_disconnect_signal(signum: int, _frame: Any) -> None:
+                nonlocal stop_requested
+                stop_requested = True
+
+            for sig_name in ("SIGHUP", "SIGTERM"):
+                sig_val = getattr(signal, sig_name, None)
+                if sig_val is not None:
+                    try:
+                        signal.signal(sig_val, _handle_disconnect_signal)
+                    except (ValueError, OSError):
+                        pass
+
+            if not HAS_RICH:
+                print("Running in non-rich mode...")
+                while not stop_requested and self._is_terminal_alive(is_tty):
+                    self.render_snapshot()
                     time.sleep(refresh_rate)
-                    live.update(self.render_snapshot())
-                except KeyboardInterrupt:
-                    break
+                return
+
+            refresh_per_second = max(1, int(1.0 / refresh_rate)) if refresh_rate < 1.0 else 1
+            with Live(self.render_snapshot(), refresh_per_second=refresh_per_second, console=self.console) as live:
+                while not stop_requested:
+                    try:
+                        time.sleep(refresh_rate)
+                        if stop_requested or not self._is_terminal_alive(is_tty):
+                            break
+                        live.update(self.render_snapshot())
+                    except (KeyboardInterrupt, BrokenPipeError, EOFError, OSError):
+                        break
+        finally:
+            self._release_pid_file()
 
 
 def main():
