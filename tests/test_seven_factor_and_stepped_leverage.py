@@ -1446,6 +1446,87 @@ def test_shadow_monitor_single_instance_reclaim_and_tty_watchdog(tmp_path, monke
     assert ShadowMonitor._is_terminal_alive(initial_tty=True) is False
 
 
+def test_rebalance_reduce_first_ordering_and_max_leverage_cap():
+    """
+    Verifies:
+    1. SteppedLeverageController caps effective_leverage at max_leverage (5.0x) even when vol_scalar > 1.0.
+    2. ShadowTradingDaemon.run_rebalance_cycle() routes margin-releasing (position-reducing) orders
+       BEFORE margin-consuming (position-increasing) orders, preventing Binance -2019 Margin is insufficient.
+    3. Full position closes (target_val == 0.0) are permitted even when notional ($23.40) is below
+       min_rebalance_notional ($30.00).
+    """
+    from src.domain.enums import OrderType
+
+    ctrl = SteppedLeverageController(
+        initial_capital=3000.0,
+        start_leverage=5.0,
+        max_leverage=5.0,
+    )
+    snap = ctrl.update_state(current_equity=3000.0, vol_scalar=1.15)
+    assert snap.effective_leverage == 5.0
+
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0, max_gross_leverage=6.0)
+
+    # Pre-open positions:
+    # - BTC/USDT LONG $200 (will INCREASE to $1000 -> margin consumer, listed 1st in symbols)
+    # - APT/USDT LONG $23.40 (will FULL CLOSE to $0 -> < $30 min_rebalance_notional, margin releaser)
+    # - FET/USDT LONG $1500 (will REDUCE to $500 -> -$1000 margin releaser, listed last in symbols)
+    for sym, px, qty in [("BTC/USDT", 100.0, 2.0), ("APT/USDT", 1.0, 23.4), ("FET/USDT", 1.0, 1500.0)]:
+        broker.set_market_price(sym, price=px, bid=px, ask=px)
+        broker.create_order(symbol=sym, side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=qty)
+
+    mock_alloc = MagicMock()
+    mock_alloc.use_seven_factor_engine = False
+    mock_alloc.last_seven_factor_result = None
+    mock_alloc.last_leverage_snapshot = None
+    mock_alloc.last_dominant_strategy = {}
+    mock_alloc.generate_portfolio_allocations.return_value = (
+        {"BTCUSDT": 1000.0, "APTUSDT": 0.0, "FETUSDT": 500.0},
+        "TRENDING",
+        {"momentum": 1.0, "stat_arb": 0.0, "carry": 0.0},
+    )
+
+    mock_ex = MagicMock()
+    idx_1h = pd.date_range("2026-11-01", periods=100, freq="1h", tz="UTC")
+    mock_ex.fetch_ohlcv.return_value = [
+        [int(ts.timestamp() * 1000), 100.0, 101.0, 99.0, 100.0, 10000.0] for ts in idx_1h
+    ]
+    mock_ex.fetch_funding_rate.return_value = {"fundingRate": 0.0001}
+
+    routed_symbols: list[str] = []
+    mock_router = MagicMock()
+
+    def _record_route(symbol, side, quantity, current_price, urgency, strategy=None, obi=None):
+        routed_symbols.append(symbol)
+        return broker.create_order(symbol=symbol, side=side, order_type=OrderType.MARKET, quantity=quantity)
+
+    mock_router.route_order.side_effect = _record_route
+
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        allocator=mock_alloc,
+        router=mock_router,
+        exchange_client=mock_ex,
+        symbols=["BTC/USDT", "APT/USDT", "FET/USDT"],
+        enable_warm_start=False,
+        enable_anomalies=False,
+        min_rebalance_notional=30.0,
+        turnover_deadband=0.0,
+    )
+    daemon.latest_tickers = {
+        "BTC/USDT": {"price": 100.0, "bid": 100.0, "ask": 100.0},
+        "APT/USDT": {"price": 1.0, "bid": 1.0, "ask": 1.0},
+        "FET/USDT": {"price": 1.0, "bid": 1.0, "ask": 1.0},
+    }
+
+    daemon.run_rebalance_cycle()
+    # FET/USDT (-$1000 reduction) and APT/USDT (-$23.40 full close) MUST execute BEFORE BTC/USDT (+$800 increase)
+    assert routed_symbols == ["FET/USDT", "APT/USDT", "BTC/USDT"]
+    db.close()
+
+
+
 
 
 

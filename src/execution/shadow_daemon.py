@@ -1549,13 +1549,15 @@ class ShadowTradingDaemon:
         executed_deltas: dict[str, float] = {}
         dominant_strats = getattr(self.allocator, "last_dominant_strategy", {})
 
+        db = getattr(self.broker, "db", None)
+        rebalance_candidates: list[dict[str, Any]] = []
         for sym in scan_symbols:
             price = current_prices.get(sym) or self.latest_tickers.get(sym, {}).get("price", 0.0)
             if price <= 0:
                 continue
 
             clean_sym = sym.replace("/", "")
-            target_val = target_dollars.get(clean_sym, target_dollars.get(sym, 0.0))
+            target_val = float(target_dollars.get(clean_sym, target_dollars.get(sym, 0.0)))
 
             pos = portfolio.positions.get(sym)
             current_qty = pos.quantity if (pos and pos.side != PositionSide.FLAT) else 0.0
@@ -1567,15 +1569,15 @@ class ShadowTradingDaemon:
             dollar_delta = target_val - current_val
 
             # Always cancel any stale pending LIMIT order from a previous rebalance cycle first
-            db = getattr(self.broker, "db", None)
             if db:
                 for pending_ord in db.get_pending_orders(symbol=sym):
                     if pending_ord.order_type == OrderType.LIMIT:
                         self.broker.cancel_order(pending_ord.id, sym)
 
-            # 1. Minimum notional gate (relaxed for anomaly test sizing)
+            # 1. Minimum notional gate (relaxed for anomaly test sizing; full closes allowed down to $5 exchange floor)
             min_notional = min(self.min_rebalance_notional, self.anomaly_size) if self.enable_anomalies else self.min_rebalance_notional
-            if abs(dollar_delta) < min_notional:
+            is_full_close = current_qty > 0 and abs(target_val) < 1e-6
+            if abs(dollar_delta) < min_notional and not (is_full_close and abs(dollar_delta) >= 5.0):
                 continue
 
             # 2. Turnover deadband gate:
@@ -1594,6 +1596,34 @@ class ShadowTradingDaemon:
                 delta_turnover = abs(dollar_delta) / total_equity
                 if not is_new_position and delta_turnover < effective_deadband and abs(target_val) > 0:
                     continue
+
+            net_notional_change = abs(target_val) - abs(current_val)
+            rebalance_candidates.append(
+                {
+                    "sym": sym,
+                    "clean_sym": clean_sym,
+                    "price": price,
+                    "target_val": target_val,
+                    "pos": pos,
+                    "dollar_delta": dollar_delta,
+                    "net_notional_change": net_notional_change,
+                }
+            )
+
+        # Sort rebalance orders Reduce-First:
+        # 1) Margin-releasing orders (closes & reductions, net_notional_change < 0) from largest release to smallest
+        # 2) Margin-consuming orders (opens & increases, net_notional_change >= 0) after margin is freed
+        rebalance_candidates.sort(
+            key=lambda item: (0 if item["net_notional_change"] < 0 else 1, item["net_notional_change"])
+        )
+
+        for cand in rebalance_candidates:
+            sym = cand["sym"]
+            clean_sym = cand["clean_sym"]
+            price = cand["price"]
+            target_val = cand["target_val"]
+            pos = cand["pos"]
+            dollar_delta = cand["dollar_delta"]
 
             order_qty = abs(dollar_delta) / price
             side = OrderSide.BUY if dollar_delta > 0 else OrderSide.SELL

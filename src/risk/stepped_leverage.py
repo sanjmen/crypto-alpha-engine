@@ -113,7 +113,7 @@ class SteppedLeverageController:
             active_base = unlocked_tier
 
         v_scalar = float(np.clip(vol_scalar, 0.55, 1.15))
-        eff_lev = float(active_base * v_scalar)
+        eff_lev = float(min(self.max_leverage, active_base * v_scalar))
 
         # Next milestone telemetry
         if unlocked_tier < self.max_leverage and self.step_leverage > 0.0:
