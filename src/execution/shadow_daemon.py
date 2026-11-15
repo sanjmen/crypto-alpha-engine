@@ -1362,6 +1362,34 @@ class ShadowTradingDaemon:
             candidate_sl: float | None = None
             is_anomaly = pos.strategy in ANOMALY_STRATEGIES
 
+            # Auto-close orphan Funding Harvester Hedge if no Extreme Funding Harvester position remains open
+            if pos.strategy == "Funding Harvester Hedge":
+                has_active_harvester = any(
+                    p.side != PositionSide.FLAT
+                    and p.quantity > 0
+                    and p.strategy == "Extreme Funding Harvester"
+                    for p in self.broker.portfolio.positions.values()
+                )
+                if not has_active_harvester:
+                    close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+                    qty_to_close = pos.quantity
+                    try:
+                        self.broker.set_market_price(sym, price=curr_p)
+                        self.broker.create_order(
+                            symbol=sym,
+                            side=close_side,
+                            order_type=OrderType.MARKET,
+                            quantity=qty_to_close,
+                            strategy="Funding Harvester Hedge",
+                        )
+                        logger.info(
+                            f"🛡️ Closed orphan Funding Harvester Hedge on {sym} @ ${curr_p:,.4f} "
+                            "(primary harvester leg closed)"
+                        )
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Error closing orphan Funding Harvester Hedge {sym}: {e}")
+
             # Enforce Time-Stop (48h default) on open Anomaly positions so stagnant slots never zombie-lock
             if is_anomaly and self.anomaly_max_hold_hours and self.anomaly_max_hold_hours > 0:
                 opened_dt = getattr(pos, "opened_at", None)
@@ -2010,10 +2038,11 @@ class ShadowTradingDaemon:
 
         candidates = []
         open_clean_syms = {s.replace("/", "") for s in all_open_positions}
+        core_clean_syms = {s.replace("/", "") for s in self.symbols}
         for sym, t in self.latest_tickers.items():
             clean_sym = sym.replace("/", "")
-            # Skip if any position (core or anomaly) is already open on this symbol
-            if sym in all_open_positions or clean_sym in open_clean_syms:
+            # Skip if symbol belongs to the Core 7-Factor universe or already has an open position
+            if clean_sym in core_clean_syms or sym in all_open_positions or clean_sym in open_clean_syms:
                 continue
 
             # Skip non-crypto TradFi equities/ETFs/FX perpetuals
@@ -2094,6 +2123,7 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 0.95, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
+                            open_clean_syms.add(sym.replace("/", ""))
                             logger.info(
                                 f"Anomaly Executed: Oversold Bounce LONG on {sym} @ ${fill_p:,.4f} "
                                 f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"
@@ -2124,6 +2154,7 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 0.96, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
+                            open_clean_syms.add(sym.replace("/", ""))
                             logger.info(
                                 f"Anomaly Executed: Early Breakout LONG on {sym} @ ${fill_p:,.4f} "
                                 f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"
@@ -2161,6 +2192,7 @@ class ShadowTradingDaemon:
                             sl = round(fill_p * 1.05, 6 if fill_p < 1.0 else 2)
                             self.broker.create_bracket_orders(symbol=sym, take_profit=tp, stop_loss=sl)
                             executed_orders.append(order)
+                            open_clean_syms.add(sym.replace("/", ""))
                             logger.info(
                                 f"Anomaly Executed: Pump & Funding Fade SHORT on {sym} @ ${fill_p:,.4f} "
                                 f"[Size: ${notional_usd:.2f} | Conf: {conf_sc:.2f}] (TP: ${tp}, SL: ${sl})"

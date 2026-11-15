@@ -52,6 +52,8 @@ class SteppedLeverageController:
         base_deadband_ratio: float = 0.04 / 2.2,
         base_max_single_ratio: float = 0.45 / 2.2,
         max_leg_share: Optional[float] = 0.32,
+        min_leg_share: float = 0.05,
+        max_leg_positions: int = 5,
         high_water_mark: Optional[float] = None,
     ) -> None:
         self.initial_capital = max(float(initial_capital), 1.0)
@@ -64,6 +66,8 @@ class SteppedLeverageController:
         self.base_deadband_ratio = float(base_deadband_ratio)
         self.base_max_single_ratio = float(base_max_single_ratio)
         self.max_leg_share = max_leg_share
+        self.min_leg_share = float(min_leg_share)
+        self.max_leg_positions = int(max_leg_positions)
         self.high_water_mark = max(
             float(high_water_mark) if high_water_mark is not None else self.initial_capital,
             self.initial_capital,
@@ -186,7 +190,40 @@ class SteppedLeverageController:
                 max_single = float(self.max_leg_share) * (target_g / 2.0)
             else:
                 max_single = snap.max_single_asset_weight
-            clipped = np.clip(raw_w, -max_single, max_single)
+
+            # Prune low-conviction tail stubs (< min_leg_share or beyond max_leg_positions)
+            # on full-universe books (>= 8 symbols) so sub-deadband noise stubs cannot get trapped.
+            raw_pruned = raw_w.copy()
+            if len(symbols) >= 8 and self.min_leg_share > 0.0:
+                pos_init = np.maximum(raw_pruned, 0.0)
+                neg_init = np.maximum(-raw_pruned, 0.0)
+                if pos_init.sum() > 1e-10 and int((pos_init > 1e-10).sum()) > 3:
+                    p_shares = pos_init / float(pos_init.sum())
+                    p_order = np.argsort(-pos_init)
+                    keep_p = np.zeros_like(pos_init, dtype=bool)
+                    for rank_idx, sym_idx in enumerate(p_order):
+                        if pos_init[sym_idx] <= 1e-10:
+                            break
+                        if rank_idx < 3 or (
+                            rank_idx < self.max_leg_positions and p_shares[sym_idx] >= self.min_leg_share
+                        ):
+                            keep_p[sym_idx] = True
+                    raw_pruned = np.where((raw_pruned > 0.0) & (~keep_p), 0.0, raw_pruned)
+
+                if neg_init.sum() > 1e-10 and int((neg_init > 1e-10).sum()) > 3:
+                    n_shares = neg_init / float(neg_init.sum())
+                    n_order = np.argsort(-neg_init)
+                    keep_n = np.zeros_like(neg_init, dtype=bool)
+                    for rank_idx, sym_idx in enumerate(n_order):
+                        if neg_init[sym_idx] <= 1e-10:
+                            break
+                        if rank_idx < 3 or (
+                            rank_idx < self.max_leg_positions and n_shares[sym_idx] >= self.min_leg_share
+                        ):
+                            keep_n[sym_idx] = True
+                    raw_pruned = np.where((raw_pruned < 0.0) & (~keep_n), 0.0, raw_pruned)
+
+            clipped = np.clip(raw_pruned, -max_single, max_single)
             pos = np.maximum(clipped, 0.0)
             neg = np.minimum(clipped, 0.0)
             if pos.sum() > 1e-10 and np.abs(neg.sum()) > 1e-10:
@@ -211,7 +248,13 @@ class SteppedLeverageController:
         if current_weights:
             prev_w = np.array([float(current_weights.get(s, 0.0)) for s in symbols], dtype=float)
             delta = np.abs(desired - prev_w)
-            upd = np.where((np.abs(desired) < 1e-9) | (delta >= db), desired, prev_w)
+            sign_flip = (desired * prev_w) < -1e-9
+            sub_db_decay = (np.abs(desired) < 0.5 * db) & (np.abs(prev_w) < db)
+            upd = np.where(
+                (np.abs(desired) < 1e-9) | (delta >= db) | sign_flip | sub_db_decay,
+                desired,
+                prev_w,
+            )
 
             # Re-balance long/short legs after deadband when net drift exceeds 2.5% (or cap gross <= eff_lev)
             pos_u = np.maximum(upd, 0.0)

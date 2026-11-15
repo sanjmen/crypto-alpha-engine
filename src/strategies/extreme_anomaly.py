@@ -134,6 +134,12 @@ class OversoldBounceStrategy(IStrategy):
             closes = df["close"]
             ret_24h = float((closes.iloc[-1] - closes.iloc[-25]) / (closes.iloc[-25] + 1e-8))
             ret_4h = float((closes.iloc[-1] - closes.iloc[-5]) / (closes.iloc[-5] + 1e-8)) if len(closes) >= 5 else 0.0
+            ret_1h = float((closes.iloc[-1] - closes.iloc[-2]) / (closes.iloc[-2] + 1e-8)) if len(closes) >= 2 else 0.0
+            bar_pos = 0.5
+            if {"high", "low"}.issubset(df.columns):
+                rng_1h = float(df["high"].iloc[-1]) - float(df["low"].iloc[-1])
+                if rng_1h > 1e-8:
+                    bar_pos = (float(closes.iloc[-1]) - float(df["low"].iloc[-1])) / rng_1h
             rsi_series = calculate_rsi(closes, period=14)
             rsi_curr = float(rsi_series.iloc[-1])
             vol_ratio = 1.5
@@ -142,6 +148,11 @@ class OversoldBounceStrategy(IStrategy):
                 vol_curr = float(volumes.iloc[-1])
                 vol_mean_24h = float(volumes.iloc[-25:-1].mean()) + 1e-6
                 vol_ratio = vol_curr / vol_mean_24h
+
+            # Anti-falling-knife guard: block entry during a violent vertical crash bar (ret_1h < -4.0%)
+            # or when the current 1h bar is closing at its dead low without a rejection wick.
+            if ret_1h < -0.040 or (ret_1h < -0.025 and bar_pos < 0.25):
+                continue
 
             # Flush condition: severe 24h drop and oversold RSI
             if ret_24h <= self.dump_threshold_24h and rsi_curr <= self.rsi_threshold:
@@ -227,10 +238,18 @@ class EarlyBreakoutStrategy(IStrategy):
 
             ret_4h = float((closes.iloc[-1] - closes.iloc[-5]) / (closes.iloc[-5] + 1e-8))
             ret_24h = float((closes.iloc[-1] - closes.iloc[-25]) / (closes.iloc[-25] + 1e-8))
+            ret_1h = float((closes.iloc[-1] - closes.iloc[-2]) / (closes.iloc[-2] + 1e-8)) if len(closes) >= 2 else 0.0
+            high_4h = float(df["high"].iloc[-4:].max()) if "high" in df.columns else float(closes.iloc[-4:].max())
+            up_bars_4h = int((closes.diff().iloc[-4:] > 0).sum())
 
             vol_curr = float(volumes.iloc[-1])
             vol_mean_24h = float(volumes.iloc[-25:-1].mean()) + 1e-6
             vol_ratio = vol_curr / vol_mean_24h
+
+            # Anti-wick-blowoff guard: price must hold within 3.5% of the 4h high (no upper-wick rejection),
+            # the current 1h bar must be constructive (0.0 <= ret_1h <= 0.09), and >=2 of last 4 bars up.
+            if float(closes.iloc[-1]) < high_4h * 0.965 or ret_1h < 0.0 or ret_1h > 0.09 or up_bars_4h < 2:
+                continue
 
             # Early breakout condition
             if ret_4h >= self.pump_threshold_4h and vol_ratio >= self.volume_multiplier:
@@ -316,8 +335,13 @@ class PumpFundingFadeStrategy(IStrategy):
 
             closes = df["close"]
             ret_24h = float((closes.iloc[-1] - closes.iloc[-25]) / (closes.iloc[-25] + 1e-8))
+            ret_1h = float((closes.iloc[-1] - closes.iloc[-2]) / (closes.iloc[-2] + 1e-8)) if len(closes) >= 2 else 0.0
             rsi_series = calculate_rsi(closes, period=14)
             rsi_curr = float(rsi_series.iloc[-1])
+
+            # Anti-vertical-squeeze guard: do not short while the current 1h candle is surging > +2.5%
+            if ret_1h > 0.025:
+                continue
 
             # Extract latest funding rate
             f_rate = 0.0
@@ -495,6 +519,7 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
             vols = df["volume"].astype(float)
             ret_24h = (closes.iloc[-1] / max(closes.iloc[-25], 1e-12)) - 1.0
             ret_4h = (closes.iloc[-1] / max(closes.iloc[-5], 1e-12)) - 1.0
+            ret_1h = (closes.iloc[-1] / max(closes.iloc[-2], 1e-12)) - 1.0 if len(closes) >= 2 else 0.0
             rsi_val = float(calculate_rsi(closes, period=14).iloc[-1])
             avg_vol_20h = float(vols.iloc[-24:-4].mean()) if len(vols) >= 24 else 1.0
             recent_vol = float(vols.iloc[-4:].mean())
@@ -512,7 +537,14 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
                         beta_est = float(np.clip(cov / b_var, 0.50, 1.50))
 
             # Case 1: Deep Negative Funding Squeeze -> LONG
-            if current_funding <= self.neg_funding_threshold and ret_4h >= -0.04 and rsi_val >= 32.0:
+            # Require positive 4h and 1h stabilization (ret_4h > 0, ret_1h >= 0) and no severe 24h collapse
+            if (
+                current_funding <= self.neg_funding_threshold
+                and ret_4h > 0.0
+                and ret_1h >= 0.0
+                and ret_24h >= -0.10
+                and rsi_val >= 35.0
+            ):
                 raw_score = min(abs(current_funding) / abs(self.neg_funding_threshold) * 0.65, 1.0)
                 signals.append(
                     Signal(
@@ -533,7 +565,13 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
                     )
                 )
             # Case 2: Extreme Positive Funding Blow-Off -> SHORT
-            elif current_funding >= self.pos_funding_threshold and ret_4h <= 0.06 and rsi_val >= 60.0:
+            # Require stalled 4h/1h momentum (ret_4h <= 0.02, ret_1h <= 0.005)
+            elif (
+                current_funding >= self.pos_funding_threshold
+                and ret_4h <= 0.02
+                and ret_1h <= 0.005
+                and rsi_val >= 60.0
+            ):
                 raw_score = -min(current_funding / self.pos_funding_threshold * 0.65, 1.0)
                 signals.append(
                     Signal(

@@ -736,6 +736,136 @@ def test_nov15_funding_cache_200_settlements_and_5x_intracycle_drift_denom(tmp_p
     db.close()
 
 
+def test_nov15_zombie_stub_pruning_signflip_deadband_and_anomaly_guards():
+    """
+    Tests Nov 15 Deep Audit Fixes:
+    1) SteppedLeverageController.scale_and_deadband_weights() prunes <5% leg-share tail stubs
+       on the 15-coin universe and releases sign-flipped (e.g. SUIUSDT) and sub-deadband stubs
+       to 0.0 instead of trapping them inside the 9.09% ($251) deadband.
+    2) Anomaly strategies block upper-wick blow-offs (EarlyBreakout), vertical short-squeeze candles
+       (PumpFundingFade), vertical crash bars (OversoldBounce), and negative-return freefalls
+       (ExtremeFundingHarvester).
+    3) run_anomaly_scan() blocks Core 7-Factor universe symbols from being hijacked by Anomaly
+       strategies, and manage_trailing_and_profit_locks() auto-closes orphan Funding Harvester Hedges.
+    """
+    from src.risk.stepped_leverage import SteppedLeverageController
+    from src.strategies.extreme_anomaly import (
+        EarlyBreakoutStrategy,
+        ExtremeFundingHarvesterStrategy,
+        OversoldBounceStrategy,
+        PumpFundingFadeStrategy,
+    )
+
+    # 1. Verify Zombie Stub Pruning & Sign-Flip Release on the 15-coin live snapshot
+    ctrl = SteppedLeverageController(initial_capital=2767.0, start_leverage=5.0, max_leverage=5.0)
+    unit_w = {
+        "BTCUSDT": 0.0811,
+        "ARBUSDT": 0.0588,
+        "LINKUSDT": 0.0536,
+        "ETHUSDT": 0.0465,
+        "NEARUSDT": 0.0111,  # 4.1% of Long leg (< 5% -> pruned!)
+        "XRPUSDT": 0.0084,   # 3.2% of Long leg (< 5% -> pruned!)
+        "SOLUSDT": 0.0066,
+        "BNBUSDT": 0.0031,
+        "ADAUSDT": 0.0010,
+        "FETUSDT": 0.0001,
+        "SUIUSDT": -0.0021,  # 0.8% of Short leg + sign-flipped vs +$29.84 current -> pruned!
+        "DOGEUSDT": -0.0150,
+        "AVAXUSDT": -0.0845,
+        "APTUSDT": -0.0845,
+        "RENDERUSDT": -0.0845,
+    }
+    eq = 2767.09
+    curr_w = {
+        "BTCUSDT": 1422.49 / eq,
+        "ARBUSDT": 275.36 / eq,
+        "LINKUSDT": 1001.97 / eq,
+        "ETHUSDT": 932.54 / eq,
+        "NEARUSDT": 127.96 / eq,
+        "XRPUSDT": 201.27 / eq,
+        "BNBUSDT": 159.65 / eq,
+        "ADAUSDT": 13.63 / eq,
+        "SUIUSDT": 29.84 / eq,  # Previously trapped LONG despite negative score!
+        "DOGEUSDT": -333.20 / eq,
+        "AVAXUSDT": -1351.20 / eq,
+        "APTUSDT": -1352.51 / eq,
+        "RENDERUSDT": -1152.80 / eq,
+    }
+    final_w, _ = ctrl.scale_and_deadband_weights(
+        unit_weights=unit_w,
+        current_equity=eq,
+        vol_scalar=1.0,
+        current_weights=curr_w,
+    )
+    # All 5 zombie Long stubs (NEAR, XRP, BNB, ADA, SUI) must be closed (absent from final_w)
+    for stub_sym in ("NEARUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "SUIUSDT", "SOLUSDT", "FETUSDT"):
+        assert stub_sym not in final_w
+    # Top 4 Longs and Top 4 Shorts remain active and strictly dollar-neutral
+    for leader_sym in ("BTCUSDT", "ARBUSDT", "LINKUSDT", "ETHUSDT"):
+        assert final_w.get(leader_sym, 0.0) > 0.0
+    for short_sym in ("AVAXUSDT", "APTUSDT", "RENDERUSDT", "DOGEUSDT"):
+        assert final_w.get(short_sym, 0.0) < 0.0
+    assert pytest.approx(sum(final_w.values()), abs=1e-6) == 0.0
+
+    # 2. Verify Anomaly Candle-Structure Guards on today's exact blow-off/crash patterns
+    idx = pd.date_range("2026-11-15", periods=30, freq="1h", tz="UTC")
+    # 2a. JCT/USDT upper-wick blow-off (spiked to 0.00284, closed at 0.00225 = 20.8% below 4h high)
+    c_jct = np.full(30, 0.00200)
+    c_jct[-4:] = [0.00201, 0.00210, 0.00225, 0.00228]
+    h_jct = c_jct * 1.01
+    h_jct[-2] = 0.00284  # Massive upper blow-off wick
+    v_jct = np.full(30, 1000.0)
+    v_jct[-1] = 5000.0
+    df_jct = pd.DataFrame({"open": c_jct, "high": h_jct, "low": c_jct * 0.99, "close": c_jct, "volume": v_jct}, index=idx)
+    eb = EarlyBreakoutStrategy(pump_threshold_4h=0.08, volume_multiplier=2.5)
+    assert len(eb.generate_signals({"JCT/USDT": df_jct})) == 0
+
+    # 2b. EVAA/USDT vertical +16% 1h short-squeeze bar -> PumpFundingFade must wait for deceleration
+    c_evaa = np.linspace(1.80, 2.41, 30)
+    c_evaa[-1] = 2.80  # +16.2% in the final 1h bar
+    df_evaa = pd.DataFrame({"open": c_evaa, "high": c_evaa * 1.01, "low": c_evaa * 0.99, "close": c_evaa, "volume": np.full(30, 1000.0)}, index=idx)
+    pf = PumpFundingFadeStrategy(pump_threshold_24h=0.25, min_funding_rate=0.0005)
+    assert len(pf.generate_signals({"EVAA/USDT": df_evaa}, funding_data={"EVAA/USDT": pd.DataFrame([{"funding_rate": 0.0010}])})) == 0
+
+    # 2c. BTW/USDT vertical -6.6% crash bar closing at low -> OversoldBounce must not catch falling knife
+    c_btw = np.linspace(0.80, 0.605, 30)
+    c_btw[-1] = 0.565  # -6.6% 1h crash bar
+    df_btw = pd.DataFrame({"open": c_btw * 1.01, "high": c_btw * 1.01, "low": c_btw, "close": c_btw, "volume": np.full(30, 1000.0)}, index=idx)
+    ob = OversoldBounceStrategy(dump_threshold_24h=-0.15, rsi_threshold=28.0)
+    assert len(ob.generate_signals({"BTW/USDT": df_btw})) == 0
+
+    # 2d. SOPH/USDT negative 4h/1h freefall -> ExtremeFundingHarvester must block LONG entry
+    c_soph = np.linspace(0.00160, 0.00138, 30)
+    df_soph = pd.DataFrame({"open": c_soph, "high": c_soph * 1.01, "low": c_soph * 0.99, "close": c_soph, "volume": np.full(30, 1000.0)}, index=idx)
+    fh = ExtremeFundingHarvesterStrategy()
+    assert len(fh.generate_signals({"SOPH/USDT": df_soph}, funding_data={"SOPH/USDT": pd.DataFrame([{"funding_rate": -0.0030}])})) == 0
+
+    # 3. Verify Core symbol exclusion in run_anomaly_scan and Orphan Harvester Hedge cleanup
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    d = ShadowTradingDaemon(broker=broker, symbols=["APT/USDT", "SOL/USDT"], enable_warm_start=False)
+    d.allocator.oversold_bounce_strategy = OversoldBounceStrategy(dump_threshold_24h=-0.15, rsi_threshold=28.0)
+    d.latest_tickers = {
+        "APT/USDT": {"price": 0.44, "bid": 0.439, "ask": 0.441, "change_24h": -22.0, "volume_24h": 50_000_000.0}
+    }
+    assert len(d.run_anomaly_scan()) == 0  # APT/USDT is a Core symbol -> never hijacked by Anomaly scan
+
+    # Open an orphan Funding Harvester Hedge on SOL/USDT with no active Extreme Funding Harvester position
+    broker.set_market_price("SOL/USDT", price=72.0)
+    broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=1.0,
+        strategy="Funding Harvester Hedge",
+    )
+    assert broker.portfolio.positions["SOL/USDT"].side == PositionSide.SHORT
+    d.manage_trailing_and_profit_locks({"SOL/USDT": {"price": 71.5}})
+    assert broker.portfolio.positions["SOL/USDT"].side == PositionSide.FLAT
+    db.close()
+
+
+
 
 
 
