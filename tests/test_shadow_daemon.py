@@ -648,5 +648,94 @@ def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: 
     assert abs(pos.stop_loss - round(pos.entry_price * 0.95, 6)) < 1e-5
 
 
+def test_nov15_funding_cache_200_settlements_and_5x_intracycle_drift_denom(tmp_path):
+    """
+    Tests Nov 15 Production Audit Fixes:
+    1) fetch_funding_history_72h fetches up to 200 8h settlements (1,600h > 1,000h matrix),
+       persists settled records to `FUNDING/{SYM}.parquet`, and SevenFactorOnlineEngine only
+       charges `funding_per_bar` on true 8h settlement hours (`hour % 8 == 0`), eliminating
+       artificial 8h Carry/Fast factor flips.
+    2) is_intracycle_rebalance_needed normalizes net drift by `max(core_gross_usd, equity)`
+       so a single TP/Profit-Lock at 5x leverage (~10-12% of gross book) does NOT falsely
+       trigger premature mid-bar book churn, while >=25% gross book drift DOES trigger.
+    """
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0, max_gross_leverage=6.0)
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        cache_dir=str(tmp_path),
+        enable_warm_start=True,
+    )
+
+    # 1. Verify 200-settlement funding fetch & Parquet persistence
+    base_ts = pd.Timestamp("2026-11-01T00:00:00Z")
+    synthetic_hist = [
+        {
+            "timestamp": int((base_ts + pd.Timedelta(hours=8 * i)).timestamp() * 1000),
+            "fundingRate": 0.0001,
+        }
+        for i in range(150)
+    ]
+
+    class DummyFundingExchange:
+        @staticmethod
+        def fetch_funding_rate_history(symbol, limit=200):
+            assert limit >= 150
+            return synthetic_hist
+
+        @staticmethod
+        def fetch_funding_rate(symbol):
+            return {"fundingRate": 0.0001}
+
+    daemon.exchange = DummyFundingExchange()
+    df_f = daemon.fetch_funding_history_72h("BTC/USDT")
+    assert len(df_f) >= 150
+    parquet_file = tmp_path / "FUNDING" / "BTCUSDT.parquet"
+    assert parquet_file.exists()
+    cached_parquet = pd.read_parquet(parquet_file)
+    assert len(cached_parquet) == 150
+
+    # 2. Verify 5x leverage intracycle drift denominator (core_gross_usd vs equity)
+    from datetime import timedelta
+
+    daemon.allocator.use_seven_factor_engine = True
+    now = datetime.now(timezone.utc)
+    daemon.last_rebalance_time = now - timedelta(hours=1)
+    daemon.last_core_bracket_fill_time = now - timedelta(minutes=20)
+
+    # Simulate 5x leverage ($3,000 equity, $7,000 Long vs $5,600 Short after one $1,400 Short hit TP):
+    # Drift is $1,400 / $3,000 = 46.7% of Equity, but only $1,400 / $12,600 = 11.1% of Gross (< 25%)!
+    broker.set_market_price("BTC/USDT", price=1000.0)
+    broker.set_market_price("ETH/USDT", price=1000.0)
+    broker.create_order(
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=7.0,
+        strategy="F3_Fast_Swing_PB (12h-48h)",
+    )
+    broker.create_order(
+        symbol="ETH/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=5.6,
+        strategy="F7_HighLiq_Size (Quality)",
+    )
+    assert daemon.is_intracycle_rebalance_needed(now) is False
+
+    # Now simulate multiple shorts closing so Short leg drops to $3,600 ($7,000 Long vs $3,600 Short):
+    # Gross = $10,600, Net Drift = $3,400 / $10,600 = 32.1% >= 25.0% -> MUST trigger!
+    broker.create_order(
+        symbol="ETH/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=2.0,
+        strategy="F7_HighLiq_Size (Quality)",
+    )
+    assert daemon.is_intracycle_rebalance_needed(now) is True
+    db.close()
+
+
+
 
 

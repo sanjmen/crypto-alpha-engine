@@ -313,11 +313,12 @@ class SevenFactorOnlineEngine:
                     d_f = fr_val.copy()
                     if "timestamp" in d_f.columns:
                         d_f = d_f.set_index(pd.to_datetime(d_f["timestamp"], utc=True))
-                    d_f.index = d_f.index.round("1h")
+                    d_f.index = d_f.index.floor("1h")
                     d_f = d_f[~d_f.index.duplicated(keep="last")].sort_index()
                     reindexed = d_f["fundingRate"].astype(float).reindex(close.index)
-                    funding_per_bar[sym] = reindexed.fillna(0.0)
-                    raw_funding[sym] = reindexed.ffill().fillna(0.0)
+                    is_settlement = (close.index.hour % 8 == 0)
+                    funding_per_bar.loc[is_settlement, sym] = reindexed.loc[is_settlement].fillna(0.0)
+                    raw_funding[sym] = reindexed.ffill().bfill().fillna(0.0)
 
         return close, volume, dollar_vol, raw_funding, funding_per_bar
 

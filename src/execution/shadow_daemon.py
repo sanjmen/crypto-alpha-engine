@@ -657,63 +657,90 @@ class ShadowTradingDaemon:
 
         return merged.tail(target_bars).reset_index(drop=True)
 
-    def fetch_funding_history_72h(self, symbol: str) -> pd.DataFrame:
+    def fetch_funding_history_72h(self, symbol: str, limit: int = 200) -> pd.DataFrame:
         """
-        Fetches the trailing 72h (9 settlements) of perpetual funding rates for `symbol`,
-        combining local cache (`data/cache/FUNDING/{CLEAN_SYM}.parquet`) with live API data.
+        Fetches trailing perpetual funding rate settlements for `symbol` (up to `limit` 8h
+        settlements = 1,600h to cover the full 1,000h 7-Factor online IC window), combining
+        local cache (`data/cache/FUNDING/{CLEAN_SYM}.parquet`) with live API data and
+        persisting updated settlement history to Parquet.
         """
         clean_sym = symbol.split(":")[0].replace("/", "")
-        records: list[dict[str, Any]] = []
+        settled_records: list[dict[str, Any]] = []
 
         fund_path = self.cache_dir / "FUNDING" / f"{clean_sym}.parquet"
         if self.enable_warm_start and fund_path.exists():
             try:
-                f_cache = pd.read_parquet(fund_path).tail(15)
+                f_cache = pd.read_parquet(fund_path).tail(max(limit, 250))
                 if not f_cache.empty and "funding_rate" in f_cache.columns:
                     ts_s = self._normalize_timestamp_series(f_cache["timestamp"])
                     for ts_val, fr_val in zip(ts_s, f_cache["funding_rate"]):
-                        records.append({
-                            "timestamp": ts_val,
+                        settled_records.append({
+                            "timestamp": pd.Timestamp(ts_val).round("1h"),
                             "fundingRate": float(fr_val),
                             "funding_rate": float(fr_val),
                         })
             except Exception:
                 pass
 
-        # Fetch live funding rate history or current funding rate
+        # Fetch live funding rate history (full 200 settlements on cold cache, incremental 24 on warm cache)
         req_symbol = self._resolve_ccxt_symbol(symbol)
+        live_hist_fetched = False
         try:
             if hasattr(self.exchange, "fetch_funding_rate_history") and not isinstance(
                 getattr(self.exchange, "fetch_funding_rate_history", None), MagicMock
             ):
-                hist = self.exchange.fetch_funding_rate_history(req_symbol, limit=9)
+                fetch_lim = min(max(limit, 200), 500) if len(settled_records) < 125 else 24
+                hist = self.exchange.fetch_funding_rate_history(req_symbol, limit=fetch_lim)
                 if isinstance(hist, list):
                     for item in hist:
                         if item and item.get("fundingRate") is not None:
                             ts_ms = item.get("timestamp")
                             ts_dt = (
-                                pd.to_datetime(ts_ms, unit="ms", utc=True)
+                                pd.to_datetime(ts_ms, unit="ms", utc=True).round("1h")
                                 if ts_ms
-                                else datetime.now(timezone.utc)
+                                else pd.Timestamp.now(tz="UTC").floor("1h")
                             )
                             f_r = float(item["fundingRate"])
-                            records.append({
+                            settled_records.append({
                                 "timestamp": ts_dt,
                                 "fundingRate": f_r,
                                 "funding_rate": f_r,
                             })
+                            live_hist_fetched = True
         except Exception:
             pass
+
+        df_settled = pd.DataFrame()
+        if settled_records:
+            df_settled = pd.DataFrame(settled_records)
+            df_settled["timestamp"] = pd.to_datetime(df_settled["timestamp"], utc=True)
+            df_settled = (
+                df_settled.drop_duplicates(subset=["timestamp"], keep="last")
+                .sort_values("timestamp")
+                .tail(max(limit, 250))
+                .reset_index(drop=True)
+            )
+            if self.enable_warm_start and live_hist_fetched:
+                try:
+                    fund_path.parent.mkdir(parents=True, exist_ok=True)
+                    df_settled.to_parquet(fund_path, index=False)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"Could not persist funding cache {fund_path}: {e}")
+
+        records = df_settled.to_dict("records") if not df_settled.empty else []
+        settled_hours = set(df_settled["timestamp"]) if not df_settled.empty else set()
 
         try:
             fr = self.exchange.fetch_funding_rate(req_symbol)
             if isinstance(fr, dict) and fr.get("fundingRate") is not None:
                 f_r = float(fr["fundingRate"])
-                records.append({
-                    "timestamp": datetime.now(timezone.utc),
-                    "fundingRate": f_r,
-                    "funding_rate": f_r,
-                })
+                now_hour = pd.Timestamp.now(tz="UTC").floor("1h")
+                if now_hour not in settled_hours:
+                    records.append({
+                        "timestamp": now_hour,
+                        "fundingRate": f_r,
+                        "funding_rate": f_r,
+                    })
         except Exception:
             pass
 
@@ -725,11 +752,12 @@ class ShadowTradingDaemon:
         df_f = (
             df_f.drop_duplicates(subset=["timestamp"], keep="last")
             .sort_values("timestamp")
+            .tail(max(limit, 250))
             .reset_index(drop=True)
         )
         return df_f
 
-    def fetch_open_interest_history_24h(self, symbol: str, limit: int = 36) -> pd.DataFrame:
+    def fetch_open_interest_history_24h(self, symbol: str, limit: int = 240) -> pd.DataFrame:
         """
         Fetches trailing hourly Open Interest history (`sumOpenInterest`) for `symbol`
         (Issue #46), combining local cache (`data/cache/open_interest/1h/{CLEAN_SYM}.parquet`)
@@ -741,7 +769,7 @@ class ShadowTradingDaemon:
 
         if self.enable_warm_start and oi_path.exists():
             try:
-                raw_oi = pd.read_parquet(oi_path).tail(max(limit, 72))
+                raw_oi = pd.read_parquet(oi_path).tail(max(limit, 300))
                 if not raw_oi.empty and "timestamp" in raw_oi.columns and "sumOpenInterest" in raw_oi.columns:
                     cached_df = raw_oi[["timestamp", "sumOpenInterest"]].copy()
                     cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
@@ -753,7 +781,8 @@ class ShadowTradingDaemon:
         try:
             fn = getattr(self.exchange, "fapiDataGetOpenInterestHist", None)
             if callable(fn) and not isinstance(fn, MagicMock):
-                rows = fn({"symbol": clean_sym, "period": "1h", "limit": min(limit, 48)})
+                fetch_lim = min(limit, 500) if len(cached_df) < limit else min(limit, 48)
+                rows = fn({"symbol": clean_sym, "period": "1h", "limit": fetch_lim})
                 if isinstance(rows, list):
                     for r in rows:
                         if isinstance(r, dict) and r.get("sumOpenInterest") is not None:
@@ -781,9 +810,15 @@ class ShadowTradingDaemon:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
-        return merged
+        if self.enable_warm_start and live_records:
+            try:
+                oi_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(limit, 500)).to_parquet(oi_path, index=False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not persist open_interest cache {oi_path}: {e}")
+        return merged.tail(limit).reset_index(drop=True)
 
-    def fetch_taker_flow_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+    def fetch_taker_flow_history(self, symbol: str, limit: int = 240) -> pd.DataFrame:
         """
         Fetches trailing hourly Taker Buy/Sell Volume (`quote_volume`, `taker_buy_quote_volume`)
         for `symbol` (Issue #48), combining local cache (`data/cache/taker_flow/1h/{CLEAN_SYM}.parquet`)
@@ -795,7 +830,7 @@ class ShadowTradingDaemon:
 
         if self.enable_warm_start and tk_path.exists():
             try:
-                raw_tk = pd.read_parquet(tk_path).tail(max(limit, 240))
+                raw_tk = pd.read_parquet(tk_path).tail(max(limit, 300))
                 req_cols = {"timestamp", "quote_volume", "taker_buy_quote_volume"}
                 if not raw_tk.empty and req_cols.issubset(raw_tk.columns):
                     cached_df = raw_tk[list(req_cols)].copy()
@@ -809,7 +844,8 @@ class ShadowTradingDaemon:
         try:
             fn = getattr(self.exchange, "fapiPublicGetKlines", None)
             if callable(fn) and not isinstance(fn, MagicMock):
-                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": min(limit, 36)})
+                fetch_lim = min(limit, 500) if len(cached_df) < limit else min(limit, 36)
+                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": fetch_lim})
                 if isinstance(rows, list):
                     for r in rows:
                         if isinstance(r, (list, tuple)) and len(r) >= 11:
@@ -838,9 +874,15 @@ class ShadowTradingDaemon:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
+        if self.enable_warm_start and live_records:
+            try:
+                tk_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(limit, 500)).to_parquet(tk_path, index=False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not persist taker_flow cache {tk_path}: {e}")
         return merged.tail(limit).reset_index(drop=True)
 
-    def fetch_premium_index_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+    def fetch_premium_index_history(self, symbol: str, limit: int = 240) -> pd.DataFrame:
         """
         Fetches trailing hourly Spot-Perp Premium Index (`close`) for `symbol`
         (Issue #49), combining local cache (`data/cache/premium_index/1h/{CLEAN_SYM}.parquet`)
@@ -852,7 +894,7 @@ class ShadowTradingDaemon:
 
         if self.enable_warm_start and pr_path.exists():
             try:
-                raw_pr = pd.read_parquet(pr_path).tail(max(limit, 240))
+                raw_pr = pd.read_parquet(pr_path).tail(max(limit, 300))
                 if not raw_pr.empty and "timestamp" in raw_pr.columns and "close" in raw_pr.columns:
                     cached_df = raw_pr[["timestamp", "close"]].copy()
                     cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
@@ -864,7 +906,8 @@ class ShadowTradingDaemon:
         try:
             fn = getattr(self.exchange, "fapiPublicGetPremiumIndexKlines", None)
             if callable(fn) and not isinstance(fn, MagicMock):
-                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": min(limit, 36)})
+                fetch_lim = min(limit, 500) if len(cached_df) < limit else min(limit, 36)
+                rows = fn({"symbol": clean_sym, "interval": "1h", "limit": fetch_lim})
                 if isinstance(rows, list):
                     for r in rows:
                         if isinstance(r, (list, tuple)) and len(r) >= 5:
@@ -892,9 +935,15 @@ class ShadowTradingDaemon:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
+        if self.enable_warm_start and live_records:
+            try:
+                pr_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(limit, 500)).to_parquet(pr_path, index=False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not persist premium_index cache {pr_path}: {e}")
         return merged.tail(limit).reset_index(drop=True)
 
-    def fetch_smart_money_history(self, symbol: str, limit: int = 192) -> pd.DataFrame:
+    def fetch_smart_money_history(self, symbol: str, limit: int = 240) -> pd.DataFrame:
         """
         Fetches trailing hourly Binance Institutional Smart-Money Positioning (`top_pos_ls_ratio`,
         `global_acc_ls_ratio`, and `smart_money_div = ln(top_pos_ls_ratio / global_acc_ls_ratio)`)
@@ -908,7 +957,7 @@ class ShadowTradingDaemon:
 
         if self.enable_warm_start and sm_path.exists():
             try:
-                raw_sm = pd.read_parquet(sm_path).tail(max(limit, 240))
+                raw_sm = pd.read_parquet(sm_path).tail(max(limit, 300))
                 if not raw_sm.empty and "timestamp" in raw_sm.columns:
                     cached_df = raw_sm.copy()
                     cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
@@ -931,8 +980,9 @@ class ShadowTradingDaemon:
                 and not isinstance(fn_top, MagicMock)
                 and not isinstance(fn_glob, MagicMock)
             ):
-                top_rows = fn_top({"symbol": clean_sym, "period": "1h", "limit": min(limit, 36)})
-                glob_rows = fn_glob({"symbol": clean_sym, "period": "1h", "limit": min(limit, 36)})
+                fetch_lim = min(limit, 500) if len(cached_df) < limit else min(limit, 36)
+                top_rows = fn_top({"symbol": clean_sym, "period": "1h", "limit": fetch_lim})
+                glob_rows = fn_glob({"symbol": clean_sym, "period": "1h", "limit": fetch_lim})
                 top_map: dict[int, float] = {}
                 if isinstance(top_rows, list):
                     for r in top_rows:
@@ -974,13 +1024,19 @@ class ShadowTradingDaemon:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
+        if self.enable_warm_start and live_records:
+            try:
+                sm_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(limit, 500)).to_parquet(sm_path, index=False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not persist smart_money cache {sm_path}: {e}")
         return merged.tail(limit).reset_index(drop=True)
 
     def fetch_quarterly_basis_history(
         self,
         pair: str = "BTCUSDT",
         contract_type: str = "CURRENT_QUARTER",
-        limit: int = 72,
+        limit: int = 120,
     ) -> pd.DataFrame:
         """
         Tier 2 (Issue #58): Fetches trailing hourly Quarterly Delivery Basis (`fapiDataGetBasis`,
@@ -993,7 +1049,7 @@ class ShadowTradingDaemon:
 
         if self.enable_warm_start and basis_path.exists():
             try:
-                raw_b = pd.read_parquet(basis_path).tail(max(limit, 120))
+                raw_b = pd.read_parquet(basis_path).tail(max(limit, 240))
                 if not raw_b.empty and "timestamp" in raw_b.columns:
                     cached_df = raw_b.copy()
                     cached_df["timestamp"] = self._normalize_timestamp_series(cached_df["timestamp"])
@@ -1004,12 +1060,13 @@ class ShadowTradingDaemon:
         try:
             fn_basis = getattr(self.exchange, "fapiDataGetBasis", None)
             if callable(fn_basis) and not isinstance(fn_basis, MagicMock):
+                fetch_lim = min(limit, 500) if len(cached_df) < limit else min(limit, 48)
                 rows = fn_basis(
                     {
                         "pair": clean_pair,
                         "contractType": contract_type,
                         "period": "1h",
-                        "limit": min(limit, 48),
+                        "limit": fetch_lim,
                     }
                 )
                 if isinstance(rows, list):
@@ -1050,6 +1107,12 @@ class ShadowTradingDaemon:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
+        if self.enable_warm_start and live_records:
+            try:
+                basis_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(limit, 500)).to_parquet(basis_path, index=False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not persist quarterly_basis cache {basis_path}: {e}")
         return merged.tail(limit).reset_index(drop=True)
 
     def fetch_symbol_obi(self, symbol: str, levels: int = 5) -> float | None:
@@ -1656,9 +1719,10 @@ class ShadowTradingDaemon:
             weights.get("macro", 0.0) + weights.get("med", 0.0) + weights.get("fast", 0.0),
         )
         arb_w = weights.get("stat_arb", weights.get("rev", 0.0))
-        cry_w = weights.get(
-            "carry",
-            weights.get("carry", 0.0) + weights.get("liq", 0.0) + weights.get("size", 0.0),
+        cry_w = (
+            weights["carry"]
+            if "momentum" in weights
+            else (weights.get("carry", 0.0) + weights.get("liq", 0.0) + weights.get("size", 0.0))
         )
         self.broker.db.save_rebalance_snapshot(
             regime_detected=regime.value if hasattr(regime, "value") else str(regime),
@@ -1801,16 +1865,18 @@ class ShadowTradingDaemon:
                 elif pos.side == PositionSide.SHORT:
                     core_short_usd += pos.market_value
 
-        if (core_long_usd + core_short_usd) <= 0.0:
+        core_gross_usd = core_long_usd + core_short_usd
+        if core_gross_usd <= 0.0:
             return False
 
         equity = max(portfolio.total_equity, 1.0)
-        net_drift_pct = abs(core_long_usd - core_short_usd) / equity
+        denom = max(core_gross_usd, equity, 1.0)
+        net_drift_pct = abs(core_long_usd - core_short_usd) / denom
         if net_drift_pct >= self.intracycle_drift_threshold_pct:
             logger.info(
                 f"⚖️ Intra-cycle Core neutrality drift detected: "
                 f"Long=${core_long_usd:,.1f} vs Short=${core_short_usd:,.1f} "
-                f"(Net Drift={net_drift_pct*100:.1f}% >= {self.intracycle_drift_threshold_pct*100:.1f}%). "
+                f"(Gross=${core_gross_usd:,.1f}, Net Drift={net_drift_pct*100:.1f}% >= {self.intracycle_drift_threshold_pct*100:.1f}%). "
                 f"Triggering automatic neutrality rebalance."
             )
             return True
