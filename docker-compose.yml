@@ -23,6 +23,7 @@ services:
     pull_policy: never
     container_name: crypto-shadow
     restart: unless-stopped
+    profiles: ["shadow"]
     env_file:
       - .env
     command: ["python", "scripts/run_trading.py", "--daemon", "--shadow", "--capital", "3000"]
