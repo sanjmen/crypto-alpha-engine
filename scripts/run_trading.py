@@ -52,6 +52,7 @@ _load_dotenv_file()
 
 from src.execution.database import DEFAULT_DB_PATH, ShadowDatabase
 from src.execution.execution_router import SmartExecutionRouter
+from src.execution.feature_flags import FeatureFlags
 from src.execution.live_broker import BinanceLiveBroker
 from src.execution.monitor import ShadowMonitor
 from src.execution.rate_limiter import ExchangeRateLimiter
@@ -201,14 +202,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-anomalies",
         dest="enable_anomalies",
         action="store_true",
-        default=True,
-        help="Enable extreme anomaly & illiquid tail strategies (ENABLED by default)",
+        default=None,
+        help="Enable extreme anomaly & illiquid tail strategies (default: OFF in --mainnet, ON in --shadow)",
     )
     parser.add_argument(
         "--disable-anomalies",
         dest="enable_anomalies",
         action="store_false",
         help="Disable extreme anomaly satellite strategies",
+    )
+    parser.add_argument(
+        "--equity-floor-usd",
+        type=float,
+        default=None,
+        help="Regla #2: Hard capital floor in USDT that flattens all positions and halts trading (default: 2600.0 in --mainnet)",
+    )
+    parser.add_argument(
+        "--max-24h-dd",
+        type=float,
+        default=0.065,
+        help="Emergency 24h drawdown circuit breaker fraction (default: 0.065 = 6.5%%)",
+    )
+    parser.add_argument(
+        "--show-flags",
+        action="store_true",
+        help="Print active runtime Feature Flags and 3 Reglas de Blindaje invariants from SQLite and exit",
+    )
+    parser.add_argument(
+        "--set-flag",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Live-toggle a runtime feature flag in SQLite without restarting daemon (e.g. --set-flag enable_anomaly_capsule=false)",
     )
     parser.add_argument("--enable-pairs", action="store_true", help="Enable Cointegrated Pairs strategy")
     parser.add_argument("--anomaly-size", type=float, default=15.0, help="Max dollar allocation per anomaly event (default: 15.0 USDT)")
@@ -230,8 +255,45 @@ def main() -> None:
     db_path = cfg["db_path"]
     effective_capital = float(cfg["capital"])
 
+    is_m13_experimental = (mode == "shadow") or getattr(args, "enable_m13", False)
+    is_m15_core = is_m13_experimental or not getattr(args, "legacy_baseline_priors", False)
+    feature_flags = FeatureFlags.from_env_and_args(
+        args=args,
+        mode=mode,
+        is_m15_core=is_m15_core,
+    )
+
+    if getattr(args, "show_flags", False) or getattr(args, "set_flag", None):
+        db_flag = ShadowDatabase(db_path=db_path)
+        stored = db_flag.get_feature_flags()
+        active_ff = FeatureFlags.from_dict(stored, fallback=feature_flags)
+        if getattr(args, "set_flag", None):
+            for raw_item in args.set_flag:
+                if "=" not in raw_item:
+                    logger.error(f"Invalid --set-flag format '{raw_item}', expected KEY=VALUE")
+                    db_flag.close()
+                    sys.exit(1)
+                k_raw, v_raw = raw_item.split("=", 1)
+                c_key, p_val = active_ff.apply_override(k_raw, v_raw)
+                logger.info(f"🚩 Updated Feature Flag: {c_key} = {p_val}")
+            db_flag.save_feature_flags(active_ff.to_dict())
+        invariants_tel = db_flag.get_latest_shield_invariants_telemetry()
+        print(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "db_path": db_path,
+                    "feature_flags": active_ff.to_dict(),
+                    "shield_invariants": invariants_tel,
+                },
+                indent=2,
+            )
+        )
+        db_flag.close()
+        return
+
     symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else DEFAULT_SHADOW_SYMBOLS.copy()
-    if args.enable_anomalies and args.legacy_allocator and not args.symbols:
+    if feature_flags.enable_anomaly_capsule and args.legacy_allocator and not args.symbols:
         for extra in ["CTSI/USDT", "MAGIC/USDT", "OGN/USDT", "RLC/USDT"]:
             if extra not in symbols:
                 symbols.append(extra)
@@ -252,9 +314,12 @@ def main() -> None:
             logger.error(f"API credentials required in .env or environment for --{mode} mode.")
             sys.exit(1)
         kill_switch = EmergencyKillSwitch(
-            max_24h_drawdown_pct=0.12,
+            max_24h_drawdown_pct=float(getattr(args, "max_24h_dd", 0.065) or 0.065),
             max_net_exposure_pct=0.15,
             max_margin_ratio=0.50,
+            equity_floor_usd=(
+                feature_flags.equity_floor_usd if feature_flags.enable_hard_equity_floor else 0.0
+            ),
         )
         live_broker = BinanceLiveBroker(
             api_key=api_key,
@@ -375,49 +440,41 @@ def main() -> None:
             f"F6 Gate: {f6_tag} | Maker Priority: {args.anomaly_prefer_maker})"
         )
 
-    if args.enable_anomalies:
-        from src.strategies.extreme_anomaly import (
-            create_extreme_funding_harvester,
-            create_illiquid_early_breakout,
-            create_illiquid_funding_fade,
-            create_illiquid_oversold_bounce,
-        )
+    from src.strategies.extreme_anomaly import (
+        create_extreme_funding_harvester,
+        create_illiquid_early_breakout,
+        create_illiquid_funding_fade,
+        create_illiquid_oversold_bounce,
+    )
 
-        is_small_test = (args.anomaly_size <= 25.0 and effective_capital <= 1000.0)
-        bounce_strat = create_illiquid_oversold_bounce(test_mode=is_small_test)
-        bounce_strat.symbols_filter = None
-        bounce_strat.max_position_usd = args.anomaly_size
-        breakout_strat = create_illiquid_early_breakout(test_mode=is_small_test)
-        breakout_strat.symbols_filter = None
-        breakout_strat.max_position_usd = args.anomaly_size
-        fade_strat = create_illiquid_funding_fade(test_mode=is_small_test)
-        fade_strat.symbols_filter = None
-        fade_strat.max_position_usd = args.anomaly_size
+    is_small_test = (args.anomaly_size <= 25.0 and effective_capital <= 1000.0)
+    bounce_strat = create_illiquid_oversold_bounce(test_mode=is_small_test)
+    bounce_strat.symbols_filter = None
+    bounce_strat.max_position_usd = args.anomaly_size
+    breakout_strat = create_illiquid_early_breakout(test_mode=is_small_test)
+    breakout_strat.symbols_filter = None
+    breakout_strat.max_position_usd = args.anomaly_size
+    fade_strat = create_illiquid_funding_fade(test_mode=is_small_test)
+    fade_strat.symbols_filter = None
+    fade_strat.max_position_usd = args.anomaly_size
 
-        # Issue #64 (M15-4): Quarantine Extreme Funding Harvester from Mainnet until recalibrated
-        harvester_strat = None
-        if is_m13_experimental:
-            harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
-            harvester_strat.symbols_filter = None
-            harvester_strat.max_position_usd = args.anomaly_size
+    # Issue #64 (M15-4): Quarantine Extreme Funding Harvester from Mainnet until recalibrated
+    harvester_strat = None
+    if is_m13_experimental:
+        harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
+        harvester_strat.symbols_filter = None
+        harvester_strat.max_position_usd = args.anomaly_size
 
-        allocator = MetaStrategyAllocator(
-            pairs_strategy=pairs_strategy,
-            oversold_bounce_strategy=bounce_strat,
-            early_breakout_strategy=breakout_strat,
-            funding_fade_strategy=fade_strat,
-            funding_harvester_strategy=harvester_strat,
-            seven_factor_engine=seven_factor_engine,
-            stepped_leverage_controller=stepped_leverage_ctrl,
-            use_seven_factor_engine=use_seven_factor,
-        )
-    else:
-        allocator = MetaStrategyAllocator(
-            pairs_strategy=pairs_strategy,
-            seven_factor_engine=seven_factor_engine,
-            stepped_leverage_controller=stepped_leverage_ctrl,
-            use_seven_factor_engine=use_seven_factor,
-        )
+    allocator = MetaStrategyAllocator(
+        pairs_strategy=pairs_strategy,
+        oversold_bounce_strategy=bounce_strat,
+        early_breakout_strategy=breakout_strat,
+        funding_fade_strategy=fade_strat,
+        funding_harvester_strategy=harvester_strat,
+        seven_factor_engine=seven_factor_engine,
+        stepped_leverage_controller=stepped_leverage_ctrl,
+        use_seven_factor_engine=use_seven_factor,
+    )
 
     rate_limiter = ExchangeRateLimiter()
     ws_client = ResilientWebSocketClient(symbols=symbols)
@@ -433,6 +490,12 @@ def main() -> None:
         f"Trailing={'DISABLED' if not eff_trailing_trigger or eff_trailing_trigger <= 0 else f'{eff_trailing_trigger*100:.1f}%/{args.trailing_distance*100:.1f}%'}, "
         f"Initial SL={'DISABLED' if not eff_core_sl or eff_core_sl <= 0 else f'-{eff_core_sl*100:.1f}%'}"
     )
+    logger.info(
+        f"🚩 Feature Flags & 3 Reglas de Blindaje [{mode.upper()}]: "
+        f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
+        f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
+        f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"
+    )
 
     daemon = ShadowTradingDaemon(
         broker=broker,
@@ -445,25 +508,31 @@ def main() -> None:
         ws_client=ws_client,
         min_volume_24h_usd=args.min_volume,
         enable_market_scan=True,
-        enable_anomalies=args.enable_anomalies,
+        enable_anomalies=feature_flags.enable_anomaly_capsule,
         anomaly_size=args.anomaly_size,
         # Issue #65 (M15-5): Quarantine 4.5% dynamic anomaly equity sizing from Mainnet (keep $45 cap)
         anomaly_pct_equity=args.anomaly_pct_equity if is_m13_experimental else None,
         anomaly_prefer_maker=args.anomaly_prefer_maker,
-        enable_smart_money=is_m15_core,
-        enable_quarterly_basis=is_m15_core,
+        enable_smart_money=feature_flags.enable_smart_money,
+        enable_quarterly_basis=feature_flags.enable_quarterly_basis,
         profit_lock_trigger_pct=args.profit_lock_trigger,
         profit_lock_level_pct=args.profit_lock_level,
         trailing_trigger_pct=eff_trailing_trigger,
         trailing_distance_pct=args.trailing_distance,
         core_take_profit_pct=eff_core_tp,
         core_stop_loss_pct=eff_core_sl,
+        equity_floor_usd=feature_flags.equity_floor_usd,
+        enable_hard_equity_floor=feature_flags.enable_hard_equity_floor,
+        auto_close_anomalies_when_disabled=feature_flags.auto_close_anomalies_when_disabled,
+        enable_intracycle_rebalance=feature_flags.enable_intracycle_rebalance,
+        enable_invariant_audit=feature_flags.enable_invariant_audit,
+        feature_flags=feature_flags,
         min_rebalance_notional=(
             max(21.0, min(50.0, effective_capital * 0.01))
             if effective_capital >= 500.0
             else (
                 min(10.0, args.anomaly_size)
-                if args.enable_anomalies
+                if feature_flags.enable_anomaly_capsule
                 else max(10.0, min(50.0, effective_capital * 0.01))
             )
         ),

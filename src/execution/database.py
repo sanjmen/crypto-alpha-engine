@@ -254,6 +254,25 @@ class ShadowDatabase:
                 );
             """)
 
+            # 11. Runtime Feature Flags (Hot-Reloadable)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS feature_flags (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+            """)
+
+            # 12. Production Shield Invariants Telemetry (3 Reglas de Blindaje)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS shield_invariants_telemetry (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    details_json TEXT NOT NULL
+                );
+            """)
+
             # Indices
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_ts ON accounts(timestamp);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
@@ -1073,6 +1092,78 @@ class ShadowDatabase:
             res["factor_tstats"] = json.loads(res.get("factor_tstats_json") or "{}")
             return res
 
+    # -------------------------------------------------------------------------
+    # Feature Flags & Shield Invariants (3 Reglas de Blindaje)
+    # -------------------------------------------------------------------------
+
+    def save_feature_flags(self, flags: dict[str, Any]) -> None:
+        """Persists a dictionary of feature flags into SQLite."""
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cursor = self._conn.cursor()
+            for k, v in flags.items():
+                cursor.execute(
+                    """
+                    INSERT INTO feature_flags (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (str(k), json.dumps(v), ts),
+                )
+
+    def set_feature_flag(self, key: str, value: Any) -> None:
+        """Updates a single feature flag in SQLite."""
+        self.save_feature_flags({key: value})
+
+    def get_feature_flags(self) -> dict[str, Any]:
+        """Retrieves all stored feature flags as a dictionary."""
+        with self._lock:
+            rows = self._conn.cursor().execute(
+                "SELECT key, value_json FROM feature_flags;"
+            ).fetchall()
+            out: dict[str, Any] = {}
+            for r in rows:
+                try:
+                    out[str(r["key"])] = json.loads(r["value_json"])
+                except Exception:
+                    out[str(r["key"])] = r["value_json"]
+            return out
+
+    def save_shield_invariants_telemetry(
+        self,
+        status: str,
+        details: dict[str, Any],
+        timestamp: datetime | None = None,
+    ) -> None:
+        """Persists the latest production shield & 4 invariants audit telemetry."""
+        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        with self._lock:
+            self._conn.cursor().execute(
+                """
+                INSERT INTO shield_invariants_telemetry (id, timestamp, status, details_json)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    status = excluded.status,
+                    details_json = excluded.details_json;
+                """,
+                (ts, str(status), json.dumps(details)),
+            )
+
+    def get_latest_shield_invariants_telemetry(self) -> dict[str, Any] | None:
+        """Retrieves the latest production shield & 4 invariants telemetry snapshot."""
+        with self._lock:
+            row = self._conn.cursor().execute(
+                "SELECT * FROM shield_invariants_telemetry WHERE id = 1;"
+            ).fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res["details"] = json.loads(res.get("details_json") or "{}")
+            return res
+
     def prune_old_records(
         self,
         accounts_minute_res_days: float = 7.0,
@@ -1215,3 +1306,5 @@ class ShadowDatabase:
             cursor.execute("DELETE FROM daemon_heartbeat;")
             cursor.execute("DELETE FROM market_pulse;")
             cursor.execute("DELETE FROM seven_factor_telemetry;")
+            cursor.execute("DELETE FROM feature_flags;")
+            cursor.execute("DELETE FROM shield_invariants_telemetry;")

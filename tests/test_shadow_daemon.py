@@ -865,6 +865,112 @@ def test_nov15_zombie_stub_pruning_signflip_deadband_and_anomaly_guards():
     db.close()
 
 
+def test_three_shield_rules_feature_flags_and_hard_equity_floor():
+    """
+    Tests the 3 Reglas de Blindaje & Runtime Feature Flag system:
+    1) Regla #1: Feature flag `enable_anomaly_capsule` defaults to False in Mainnet and, when
+       disabled (at startup or via live SQLite hot-reload), automatically closes any open
+       satellite anomaly position (`TAC/USDT`) while leaving Core 7-Factor legs intact.
+    2) Regla #2: Hard Equity Floor (`equity_floor_usd = 2600.0`) flattens 100% of positions,
+       cancels open orders, and halts the daemon (`status='HALTED_EQUITY_FLOOR'`) when equity <= $2,600.
+    3) Regla #3: `evaluate_shield_invariants()` audits and persists the 4 production invariants
+       into SQLite `shield_invariants_telemetry`.
+    """
+    from src.execution.feature_flags import FeatureFlags
+
+    # 1. Verify FeatureFlags defaults for Mainnet vs Shadow
+    ff_mn = FeatureFlags.from_env_and_args(mode="mainnet", environ={})
+    assert ff_mn.enable_anomaly_capsule is False
+    assert ff_mn.auto_close_anomalies_when_disabled is True
+    assert ff_mn.enable_hard_equity_floor is True
+    assert ff_mn.equity_floor_usd == 2600.0
+
+    ff_shd = FeatureFlags.from_env_and_args(mode="shadow", environ={})
+    assert ff_shd.enable_anomaly_capsule is True
+    assert ff_shd.equity_floor_usd == 0.0
+
+    # 2. Verify Regla #1: Live feature flag hot-reload & automatic closure of open anomaly position
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=2750.0)
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        symbols=["LINK/USDT", "APT/USDT"],
+        enable_anomalies=True,
+        equity_floor_usd=2600.0,
+        enable_hard_equity_floor=True,
+        enable_warm_start=False,
+    )
+    # Open 1 Core LONG (LINK/USDT), 1 Core SHORT (APT/USDT), and 1 Satellite Anomaly SHORT (TAC/USDT)
+    broker.set_market_price("LINK/USDT", price=14.0)
+    broker.set_market_price("APT/USDT", price=2.0)
+    broker.set_market_price("TAC/USDT", price=0.0013)
+    broker.create_order(
+        symbol="LINK/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=50.0,
+        strategy="7Factor:F3_Fast_Swing_PB",
+    )
+    broker.create_order(
+        symbol="APT/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=350.0,
+        strategy="7Factor:F3_Fast_Swing_PB",
+    )
+    broker.create_order(
+        symbol="TAC/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=12000.0,
+        strategy="Pump & Funding Fade",
+    )
+    assert broker.portfolio.positions["TAC/USDT"].side == PositionSide.SHORT
+    assert broker.portfolio.positions["LINK/USDT"].side == PositionSide.LONG
+
+    # Toggle `enable_anomaly_capsule = False` in SQLite at runtime (zero-downtime hot reload)
+    db.set_feature_flag("enable_anomaly_capsule", False)
+    daemon.sync_feature_flags_from_db()
+    assert daemon.enable_anomalies is False
+
+    # Next fast cycle's trailing/bracket manager auto-closes TAC/USDT while keeping LINK & APT open
+    daemon.manage_trailing_and_profit_locks(
+        {
+            "LINK/USDT": {"price": 14.0},
+            "APT/USDT": {"price": 2.0},
+            "TAC/USDT": {"price": 0.0013},
+        }
+    )
+    assert broker.portfolio.positions["TAC/USDT"].side == PositionSide.FLAT
+    assert broker.portfolio.positions["LINK/USDT"].side == PositionSide.LONG
+    assert broker.portfolio.positions["APT/USDT"].side == PositionSide.SHORT
+
+    # 3. Verify Regla #3: Shield Invariants Audit passes when book is clean & dollar-neutral
+    inv_report = daemon.evaluate_shield_invariants()
+    assert inv_report["all_invariants_ok"] is True
+    assert inv_report["inv1_no_factor_flip_flop"] is True
+    assert inv_report["inv2_no_zombie_stubs"] is True
+    assert inv_report["inv3_no_spurious_intracycle"] is True
+    assert inv_report["inv4_dollar_neutrality"] is True
+    assert inv_report["inv5_anomaly_capsule_isolated"] is True
+    assert inv_report["inv6_above_equity_floor"] is True
+    saved_tel = db.get_latest_shield_invariants_telemetry()
+    assert saved_tel is not None and saved_tel["status"] == "ALL_OK"
+
+    # 4. Verify Regla #2: Hard Equity Floor ($2,600.00) flattens all positions and halts daemon
+    # Simulate an adverse price move that brings total equity to $2,590.00 (<= $2,600 floor)
+    broker.mark_to_market({"LINK/USDT": 10.5, "APT/USDT": 2.0})
+    assert broker.portfolio.total_equity < 2600.0
+    triggered = daemon.enforce_hard_equity_floor_and_kill_switch(broker.portfolio)
+    assert triggered is True
+    assert daemon.is_halted is True
+    assert "HARD_EQUITY_FLOOR_BREACH" in daemon.halt_reason
+    assert broker.portfolio.positions["LINK/USDT"].side == PositionSide.FLAT
+    assert broker.portfolio.positions["APT/USDT"].side == PositionSide.FLAT
+    db.close()
+
+
+
 
 
 

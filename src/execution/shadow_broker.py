@@ -916,6 +916,66 @@ class ShadowExecutionBroker(IExecutionClient):
             if o.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
                 self.db.update_order_status(o.id, OrderStatus.CANCELED)
 
+    def emergency_flatten_all(self) -> list[str]:
+        """
+        Emergency circuit-breaker flatten:
+        Cancels all open/pending orders and closes 100% of open positions
+        (using `reduceOnly=True` on Binance when running in live mode).
+        """
+        flattened: list[str] = []
+        if self.is_live and self.live_broker is not None:
+            for sym, pos in self.portfolio.positions.items():
+                if pos.side != PositionSide.FLAT and pos.quantity > 0 and sym not in self.live_broker.portfolio.positions:
+                    self.live_broker.portfolio.positions[sym] = Position(
+                        symbol=sym,
+                        side=pos.side,
+                        quantity=pos.quantity,
+                        entry_price=pos.entry_price,
+                        current_price=pos.current_price,
+                    )
+            try:
+                live_flat = self.live_broker.emergency_flatten_all()
+                for s in live_flat:
+                    if s not in flattened:
+                        flattened.append(s)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Live broker emergency_flatten_all error: {exc}")
+
+        for sym, pos in list(self.portfolio.positions.items()):
+            if pos.side == PositionSide.FLAT or pos.quantity <= 0:
+                continue
+            px = float(self.market_prices.get(sym, pos.current_price or pos.entry_price or 0.0))
+            qty = float(pos.quantity)
+            rpnl = 0.0
+            if not self.is_live and px > 0 and pos.entry_price > 0:
+                if pos.side == PositionSide.LONG:
+                    rpnl = qty * (px - pos.entry_price)
+                else:
+                    rpnl = qty * (pos.entry_price - px)
+                fee = qty * px * self.taker_fee_pct
+                self.portfolio.cash += rpnl - fee
+
+            for pend in self.db.get_pending_orders(symbol=sym):
+                self.db.update_order_status(pend.id, OrderStatus.CANCELED)
+
+            pos.quantity = 0.0
+            pos.side = PositionSide.FLAT
+            pos.take_profit = None
+            pos.stop_loss = None
+            pos.peak_price = 0.0
+            pos.strategy = None
+            pos.opened_at = None
+            self.db.save_position(pos, realized_pnl=rpnl)
+            if sym not in flattened:
+                flattened.append(sym)
+
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=True)
+        else:
+            self._record_account_snapshot()
+
+        return flattened
+
     def _update_portfolio_position(self, trade: Trade) -> float:
         """
         Updates in-memory portfolio position and deducts fee.

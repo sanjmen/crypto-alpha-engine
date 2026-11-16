@@ -25,6 +25,7 @@ from src.domain.enums import (
     PositionSide,
 )
 from src.execution.execution_router import ExecutionUrgency, SmartExecutionRouter
+from src.execution.feature_flags import FeatureFlags
 from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.ws_manager import PriceTick, ResilientWebSocketClient
@@ -126,6 +127,12 @@ class ShadowTradingDaemon:
         enable_subhourly_pullback: bool = True,
         enable_smart_money: bool = True,
         enable_quarterly_basis: bool = True,
+        equity_floor_usd: float = 0.0,
+        enable_hard_equity_floor: bool = True,
+        auto_close_anomalies_when_disabled: bool = True,
+        enable_intracycle_rebalance: bool = True,
+        enable_invariant_audit: bool = True,
+        feature_flags: FeatureFlags | None = None,
     ):
         self.broker = broker
         self.allocator = allocator or MetaStrategyAllocator()
@@ -179,6 +186,30 @@ class ShadowTradingDaemon:
         self.enable_subhourly_pullback = enable_subhourly_pullback
         self.enable_smart_money = bool(enable_smart_money)
         self.enable_quarterly_basis = bool(enable_quarterly_basis)
+        self.feature_flags = feature_flags or FeatureFlags(
+            enable_anomaly_capsule=bool(enable_anomalies),
+            auto_close_anomalies_when_disabled=bool(auto_close_anomalies_when_disabled),
+            enable_hard_equity_floor=bool(enable_hard_equity_floor and equity_floor_usd > 0.0),
+            equity_floor_usd=float(equity_floor_usd),
+            enable_intracycle_rebalance=bool(enable_intracycle_rebalance),
+            enable_invariant_audit=bool(enable_invariant_audit),
+            enable_smart_money=bool(enable_smart_money),
+            enable_quarterly_basis=bool(enable_quarterly_basis),
+        )
+        self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
+        self.auto_close_anomalies_when_disabled = bool(
+            self.feature_flags.auto_close_anomalies_when_disabled
+        )
+        self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
+        self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
+        self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
+        self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+        self.is_halted: bool = False
+        self.halt_reason: str = ""
+        self.intracycle_rebalance_count: int = 0
+        self.scheduled_rebalance_count: int = 0
+        self._prev_factor_weights: dict[str, float] = {}
+        self._last_factor_l1_delta: float = 0.0
 
         if self.ws_client:
             self.ws_client.on_tick_callback = self._on_ws_tick
@@ -204,6 +235,11 @@ class ShadowTradingDaemon:
         self.last_rebalance_time: datetime | None = None
         db_inst = getattr(self.broker, "db", None)
         if db_inst:
+            if hasattr(db_inst, "save_feature_flags"):
+                try:
+                    db_inst.save_feature_flags(self.feature_flags.to_dict())
+                except Exception:
+                    pass
             latest_reb = db_inst.get_latest_rebalance_snapshot()
             if latest_reb and latest_reb.get("timestamp"):
                 try:
@@ -1177,6 +1213,9 @@ class ShadowTradingDaemon:
         mark_prices = {sym: t["price"] for sym, t in ticks.items()}
         portfolio = self.broker.mark_to_market(mark_prices)
 
+        # 5b. Regla #2: Enforce Hard Equity Floor ($2,600) & Emergency Kill-Switch
+        self.enforce_hard_equity_floor_and_kill_switch(portfolio)
+
         # 6. Record Heartbeat and Market Pulse in database
         db = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
         if db:
@@ -1192,6 +1231,7 @@ class ShadowTradingDaemon:
             else:
                 next_reb = 0.0
 
+            hb_status = "HALTED_EQUITY_FLOOR" if self.is_halted else "ONLINE"
             db.update_market_pulse(self.latest_tickers)
             db.update_daemon_heartbeat(
                 ws_state=ws_state,
@@ -1201,7 +1241,7 @@ class ShadowTradingDaemon:
                 last_tick_time=last_tick_iso,
                 last_rebalance_time=last_reb_iso,
                 next_rebalance_in_sec=round(next_reb, 1),
-                status="ONLINE",
+                status=hb_status,
             )
 
             lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
@@ -1232,6 +1272,9 @@ class ShadowTradingDaemon:
                     factor_weights=sf_res.factor_weights if sf_res else dict(prev_tel.get("factor_weights") or {}),
                     factor_tstats=sf_res.factor_tstats if sf_res else dict(prev_tel.get("factor_tstats") or {}),
                 )
+
+            if self.enable_invariant_audit:
+                self.evaluate_shield_invariants(portfolio=portfolio)
 
         return portfolio, filled_orders
 
@@ -1361,6 +1404,30 @@ class ShadowTradingDaemon:
             # Determine candidate ratcheted stop-loss
             candidate_sl: float | None = None
             is_anomaly = pos.strategy in ANOMALY_STRATEGIES
+
+            # Regla #1 (Feature Flag): Auto-close open Anomaly positions when Anomaly Capsule is disabled
+            if (is_anomaly or pos.strategy == "Funding Harvester Hedge") and (
+                not self.enable_anomalies and self.auto_close_anomalies_when_disabled
+            ):
+                close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+                qty_to_close = pos.quantity
+                strat_name = pos.strategy or "Anomaly"
+                try:
+                    self.broker.set_market_price(sym, price=curr_p)
+                    self.broker.create_order(
+                        symbol=sym,
+                        side=close_side,
+                        order_type=OrderType.MARKET,
+                        quantity=qty_to_close,
+                        strategy=strat_name,
+                    )
+                    logger.info(
+                        f"🛡️ [Regla #1 - Feature Flag] Anomaly Capsule disabled: auto-closed satellite position "
+                        f"{sym} ({strat_name}) @ ${curr_p:,.4f}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error auto-closing disabled anomaly position {sym}: {e}")
 
             # Auto-close orphan Funding Harvester Hedge if no Extreme Funding Harvester position remains open
             if pos.strategy == "Funding Harvester Hedge":
@@ -1763,6 +1830,14 @@ class ShadowTradingDaemon:
 
         sf_res = getattr(self.allocator, "last_seven_factor_result", None)
         lev_snap = getattr(self.allocator, "last_leverage_snapshot", None)
+        if sf_res and sf_res.factor_weights:
+            cur_fw = {str(k): float(v) for k, v in sf_res.factor_weights.items()}
+            if self._prev_factor_weights:
+                all_k = set(cur_fw.keys()) | set(self._prev_factor_weights.keys())
+                self._last_factor_l1_delta = 0.5 * sum(
+                    abs(cur_fw.get(k, 0.0) - self._prev_factor_weights.get(k, 0.0)) for k in all_k
+                )
+            self._prev_factor_weights = cur_fw
         if sf_res and lev_snap and hasattr(self.broker.db, "save_seven_factor_telemetry"):
             self.broker.db.save_seven_factor_telemetry(
                 initial_capital=lev_snap.initial_capital,
@@ -1785,6 +1860,8 @@ class ShadowTradingDaemon:
         if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
             self.broker.sync_from_live_exchange(sync_positions=True)
         self.ensure_position_brackets()
+        if self.enable_invariant_audit:
+            self.evaluate_shield_invariants()
 
         self.last_rebalance_time = datetime.now(timezone.utc)
         if hasattr(self.broker, "db") and self.broker.db:
@@ -1859,12 +1936,187 @@ class ShadowTradingDaemon:
                 return True
         return False
 
+    def sync_feature_flags_from_db(self) -> FeatureFlags:
+        """
+        Hot-reloads runtime feature flags from SQLite (`feature_flags` table) so
+        features like Anomaly Capsule or Equity Floor can be toggled live without restart.
+        """
+        db_inst = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
+        if db_inst and hasattr(db_inst, "get_feature_flags"):
+            try:
+                raw = db_inst.get_feature_flags()
+                if raw:
+                    prev_anom = self.enable_anomalies
+                    prev_floor = self.equity_floor_usd
+                    self.feature_flags = FeatureFlags.from_dict(raw, fallback=self.feature_flags)
+                    self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
+                    self.auto_close_anomalies_when_disabled = bool(
+                        self.feature_flags.auto_close_anomalies_when_disabled
+                    )
+                    self.enable_hard_equity_floor = bool(
+                        self.feature_flags.enable_hard_equity_floor
+                    )
+                    self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
+                    self.enable_intracycle_rebalance = bool(
+                        self.feature_flags.enable_intracycle_rebalance
+                    )
+                    self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+                    self.enable_smart_money = bool(self.feature_flags.enable_smart_money)
+                    self.enable_quarterly_basis = bool(self.feature_flags.enable_quarterly_basis)
+                    if prev_anom != self.enable_anomalies or abs(prev_floor - self.equity_floor_usd) > 1e-6:
+                        logger.info(
+                            f"🚩 Runtime Feature Flags updated: enable_anomaly_capsule={self.enable_anomalies}, "
+                            f"equity_floor_usd=${self.equity_floor_usd:,.2f}, "
+                            f"enable_intracycle_rebalance={self.enable_intracycle_rebalance}"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Feature flag sync note: {exc}")
+        return self.feature_flags
+
+    def enforce_hard_equity_floor_and_kill_switch(self, portfolio: Portfolio) -> bool:
+        """
+        Regla #2 (Piso Duro de Capital):
+        Continuously monitors portfolio total equity against `self.equity_floor_usd` (e.g. $2,600)
+        and evaluates the live EmergencyKillSwitch. If breached, cancels all open orders,
+        flattens 100% of positions (`reduceOnly=True`), and halts the daemon.
+        """
+        if self.is_halted:
+            return True
+
+        raw_eq = float(portfolio.total_equity)
+        if self.enable_hard_equity_floor and self.equity_floor_usd > 0.0 and 100.0 < raw_eq <= self.equity_floor_usd:
+            confirmed_eq = raw_eq
+            if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
+                try:
+                    self.broker.sync_from_live_exchange(sync_positions=True)
+                    confirmed_eq = float(self.broker.get_portfolio().total_equity)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Live sync during equity floor verification note: {exc}")
+
+            if 100.0 < confirmed_eq <= self.equity_floor_usd:
+                self.is_halted = True
+                self.halt_reason = (
+                    f"HARD_EQUITY_FLOOR_BREACH (${confirmed_eq:,.2f} <= ${self.equity_floor_usd:,.2f})"
+                )
+                logger.critical(
+                    f"🚨 [Regla #2 - PISO DURO DE CAPITAL] {self.halt_reason} — "
+                    f"Flattening all positions and halting trading!"
+                )
+                if hasattr(self.broker, "emergency_flatten_all"):
+                    self.broker.emergency_flatten_all()
+                return True
+
+        live_b = getattr(self.broker, "live_broker", None)
+        ks = getattr(live_b, "kill_switch", None) if live_b is not None else None
+        if ks is not None:
+            ks.equity_floor_usd = self.equity_floor_usd if self.enable_hard_equity_floor else 0.0
+            ks_status = ks.evaluate_and_enforce(portfolio, broker=self.broker)
+            if ks_status.triggered and ks.is_locked():
+                self.is_halted = True
+                self.halt_reason = ks_status.reason
+                return True
+
+        return False
+
+    def evaluate_shield_invariants(self, portfolio: Portfolio | None = None) -> dict[str, Any]:
+        """
+        Regla #3 (Auditoría Continua de las 4 Invariantes):
+        Evaluates and persists the 4 production invariants into SQLite `shield_invariants_telemetry`:
+        1. `inv1_no_factor_flip_flop`: Factor L1 turnover across consecutive rebalances <= 0.50
+        2. `inv2_no_zombie_stubs`: 0 Core positions < $150 (when Core gross >= $2,000) & <= 5 legs per side
+        3. `inv3_no_spurious_intracycle`: Intracycle rebalance counter == 0
+        4. `inv4_dollar_neutrality`: Core net exposure drift <= 5.0%
+        Plus `inv5_anomaly_capsule_isolated` & `inv6_above_equity_floor`.
+        """
+        pf = portfolio or self.broker.get_portfolio()
+        core_long_usd = 0.0
+        core_short_usd = 0.0
+        core_long_count = 0
+        core_short_count = 0
+        zombie_stubs: list[str] = []
+        open_anomalies: list[str] = []
+
+        for sym, pos in pf.positions.items():
+            if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
+                continue
+            notional = abs(float(pos.market_value))
+            if pos.strategy in ANOMALY_STRATEGIES or pos.strategy == "Funding Harvester Hedge":
+                open_anomalies.append(f"{sym}:${notional:.1f}")
+            else:
+                if pos.side == PositionSide.LONG:
+                    core_long_usd += notional
+                    core_long_count += 1
+                elif pos.side == PositionSide.SHORT:
+                    core_short_usd += notional
+                    core_short_count += 1
+
+        core_gross_usd = core_long_usd + core_short_usd
+        if core_gross_usd >= 2000.0:
+            for sym, pos in pf.positions.items():
+                if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
+                    continue
+                if pos.strategy in ANOMALY_STRATEGIES or pos.strategy == "Funding Harvester Hedge":
+                    continue
+                notional = abs(float(pos.market_value))
+                if notional < 150.0:
+                    zombie_stubs.append(f"{sym}:${notional:.1f}")
+
+        eq = max(float(pf.total_equity), 1.0)
+        denom = max(core_gross_usd, eq, 1.0)
+        core_net_drift_pct = (abs(core_long_usd - core_short_usd) / denom) if core_gross_usd > 0 else 0.0
+
+        inv1_ok = self._last_factor_l1_delta <= 0.50
+        inv2_ok = len(zombie_stubs) == 0 and core_long_count <= 5 and core_short_count <= 5
+        inv3_ok = self.intracycle_rebalance_count == 0
+        inv4_ok = core_net_drift_pct <= 0.05
+        inv5_ok = (len(open_anomalies) == 0) if not self.enable_anomalies else True
+        inv6_ok = (not self.is_halted) and (
+            float(pf.total_equity) > self.equity_floor_usd
+            if (self.enable_hard_equity_floor and self.equity_floor_usd > 0)
+            else True
+        )
+
+        all_ok = inv1_ok and inv2_ok and inv3_ok and inv4_ok and inv5_ok and inv6_ok
+        status_str = "HALTED" if self.is_halted else ("ALL_OK" if all_ok else "WARN_CHECK")
+        report = {
+            "status": status_str,
+            "all_invariants_ok": all_ok,
+            "inv1_no_factor_flip_flop": inv1_ok,
+            "inv2_no_zombie_stubs": inv2_ok,
+            "inv3_no_spurious_intracycle": inv3_ok,
+            "inv4_dollar_neutrality": inv4_ok,
+            "inv5_anomaly_capsule_isolated": inv5_ok,
+            "inv6_above_equity_floor": inv6_ok,
+            "factor_l1_delta": round(self._last_factor_l1_delta, 4),
+            "core_long_count": core_long_count,
+            "core_short_count": core_short_count,
+            "core_long_usd": round(core_long_usd, 2),
+            "core_short_usd": round(core_short_usd, 2),
+            "core_net_drift_pct": round(core_net_drift_pct * 100.0, 2),
+            "zombie_stubs": zombie_stubs,
+            "open_anomalies": open_anomalies,
+            "intracycle_rebalance_count": self.intracycle_rebalance_count,
+            "equity_usd": round(float(pf.total_equity), 2),
+            "equity_floor_usd": round(self.equity_floor_usd, 2),
+            "equity_headroom_usd": round(float(pf.total_equity) - self.equity_floor_usd, 2),
+            "feature_flags": self.feature_flags.to_dict(),
+        }
+        db_inst = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
+        if db_inst and hasattr(db_inst, "save_shield_invariants_telemetry"):
+            try:
+                db_inst.save_shield_invariants_telemetry(status=status_str, details=report)
+            except Exception:
+                pass
+        return report
+
     def is_intracycle_rebalance_needed(self, now: datetime | None = None) -> bool:
         """
         Checks whether mid-cycle Take-Profit / Trailing-Stop fills have caused the
         Core 7-Factor book to drift beyond intracycle_drift_threshold_pct (default 25% of Equity)
         so an automatic neutrality re-centering rebalance should be triggered.
         """
+        if not self.enable_intracycle_rebalance:
+            return False
         if not getattr(self.allocator, "use_seven_factor_engine", False):
             return False
         now_dt = now or datetime.now(timezone.utc)
@@ -1901,6 +2153,7 @@ class ShadowTradingDaemon:
         denom = max(core_gross_usd, equity, 1.0)
         net_drift_pct = abs(core_long_usd - core_short_usd) / denom
         if net_drift_pct >= self.intracycle_drift_threshold_pct:
+            self.intracycle_rebalance_count += 1
             logger.info(
                 f"⚖️ Intra-cycle Core neutrality drift detected: "
                 f"Long=${core_long_usd:,.1f} vs Short=${core_short_usd:,.1f} "
@@ -2298,9 +2551,23 @@ class ShadowTradingDaemon:
         Useful for scheduled cron executions and unit tests.
         """
         now = datetime.now(timezone.utc)
+        self.sync_feature_flags_from_db()
 
-        # 1. Fast cycle (L1 quote update, pending limit/bracket fill check, MTM)
+        # 1. Fast cycle (L1 quote update, pending limit/bracket fill check, MTM, & Hard Equity Floor check)
         portfolio, filled_orders = self.run_fast_cycle()
+
+        if self.is_halted:
+            return {
+                "timestamp": now.isoformat(),
+                "total_equity": portfolio.total_equity,
+                "cash": portfolio.cash,
+                "filled_orders": len(filled_orders),
+                "anomaly_orders": 0,
+                "rebalance_orders": 0,
+                "funding_cashflows": {},
+                "halted": True,
+                "halt_reason": self.halt_reason,
+            }
 
         # 2. Event-driven Anomaly Scan (every 30s)
         anomaly_orders = []

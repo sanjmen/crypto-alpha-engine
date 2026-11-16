@@ -46,11 +46,13 @@ class EmergencyKillSwitch:
         max_net_exposure_pct: float = 0.15,
         max_margin_ratio: float = 0.50,
         lockout_hours: int = 24,
+        equity_floor_usd: float = 0.0,
     ) -> None:
         self.max_24h_drawdown_pct = float(max_24h_drawdown_pct)
         self.max_net_exposure_pct = float(max_net_exposure_pct)
         self.max_margin_ratio = float(max_margin_ratio)
         self.lockout_hours = int(lockout_hours)
+        self.equity_floor_usd = float(equity_floor_usd)
 
         self._equity_window_24h: Deque[Tuple[datetime, float]] = deque()
         self.halted_until: Optional[datetime] = None
@@ -176,7 +178,14 @@ class EmergencyKillSwitch:
             )
 
         trigger_reason = ""
-        if dd_24h >= self.max_24h_drawdown_pct:
+        is_floor_breach = False
+        raw_equity = float(portfolio.total_equity)
+        if self.equity_floor_usd > 0.0 and 100.0 < raw_equity <= self.equity_floor_usd:
+            trigger_reason = (
+                f"Hard Equity Floor breached: ${raw_equity:,.2f} <= ${self.equity_floor_usd:,.2f}"
+            )
+            is_floor_breach = True
+        elif dd_24h >= self.max_24h_drawdown_pct:
             trigger_reason = (
                 f"24h Drawdown {dd_24h*100:.2f}% breached limit {self.max_24h_drawdown_pct*100:.2f}%"
             )
@@ -187,7 +196,8 @@ class EmergencyKillSwitch:
 
         flattened: List[str] = []
         if trigger_reason:
-            self.halted_until = now_dt + timedelta(hours=self.lockout_hours)
+            lock_hrs = max(self.lockout_hours, 8760) if is_floor_breach else self.lockout_hours
+            self.halted_until = now_dt + timedelta(hours=lock_hrs)
             self.last_halt_reason = trigger_reason
             logger.critical(f"🚨 EMERGENCY KILL-SWITCH TRIGGERED: {trigger_reason}")
             if broker is not None and hasattr(broker, "emergency_flatten_all"):
