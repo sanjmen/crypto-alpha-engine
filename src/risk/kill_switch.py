@@ -57,6 +57,7 @@ class EmergencyKillSwitch:
         self._equity_window_24h: Deque[Tuple[datetime, float]] = deque()
         self.halted_until: Optional[datetime] = None
         self.last_halt_reason: str = ""
+        self._last_asymmetry_warn_ts: Optional[datetime] = None
 
     def is_locked(self, now: Optional[datetime] = None) -> bool:
         """Returns True if the kill-switch is currently in an emergency lockout window."""
@@ -164,8 +165,9 @@ class EmergencyKillSwitch:
         now_dt = timestamp or datetime.now(timezone.utc)
         equity = max(float(portfolio.total_equity), 1.0)
         dd_24h = self.record_equity(equity, timestamp=now_dt)
-        _, _, net_usd = self.compute_net_exposure(portfolio)
-        net_pct = abs(net_usd) / equity
+        long_usd, short_usd, net_usd = self.compute_net_exposure(portfolio)
+        gross_usd = long_usd + short_usd
+        net_pct = abs(net_usd) / max(gross_usd, equity, 1.0)
 
         if self.is_locked(now_dt):
             return KillSwitchStatus(
@@ -218,7 +220,12 @@ class EmergencyKillSwitch:
                 f"Net Exposure Asymmetry {net_pct*100:.2f}% (${net_usd:+,.2f}) "
                 f"exceeded {self.max_net_exposure_pct*100:.2f}% limit"
             )
-            logger.warning(f"⚠️ {asym_reason}")
+            if (
+                self._last_asymmetry_warn_ts is None
+                or (now_dt - self._last_asymmetry_warn_ts).total_seconds() >= 300.0
+            ):
+                logger.warning(f"⚠️ {asym_reason}")
+                self._last_asymmetry_warn_ts = now_dt
             if broker is not None and hasattr(broker, "hedge_excess_exposure"):
                 broker.hedge_excess_exposure(net_usd)
             return KillSwitchStatus(

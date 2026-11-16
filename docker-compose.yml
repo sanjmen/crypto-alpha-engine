@@ -13,11 +13,12 @@ services:
       - FF_AUTO_CLOSE_ANOMALIES_WHEN_DISABLED=true
       - FF_ENABLE_HARD_EQUITY_FLOOR=true
       - FF_EQUITY_FLOOR_USD=2600.0
-      - FF_ENABLE_INTRACYCLE_REBALANCE=true
+      - FF_ENABLE_INTRACYCLE_REBALANCE=false
       - FF_ENABLE_INVARIANT_AUDIT=true
       - FF_ENABLE_CHOP_RANGE_ARB=true
       - FF_ENABLE_DYNAMIC_BARRIERS=true
-    command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "3000", "--start-leverage", "5.0", "--max-leverage", "5.0", "--disable-anomalies", "--equity-floor-usd", "2600.0"]
+      - FF_ENABLE_HOLISTIC_REGIME_SHIELDS=true
+    command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "3000", "--start-leverage", "3.5", "--max-leverage", "5.0", "--disable-anomalies", "--equity-floor-usd", "2600.0"]
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

@@ -395,10 +395,35 @@ class ShadowTradingDaemon:
         if not blocked_any:
             return filtered
 
+        orig_long_sum = sum(v for v in target_dollars.values() if v > 0)
+        orig_short_sum = sum(abs(v) for v in target_dollars.values() if v < 0)
+        orig_leg_target = max(orig_long_sum, orig_short_sum)
+
         long_sum = sum(v for v in filtered.values() if v > 0)
         short_sum = sum(abs(v) for v in filtered.values() if v < 0)
         if long_sum <= 1e-6 or short_sum <= 1e-6:
             return {k: 0.0 for k in filtered}
+
+        # Water-fill remaining unblocked positions when >=50% of a leg is on cooldown
+        # so multi-TP exits do not collapse total book gross leverage or shrink the opposing leg into <$150 stubs.
+        max_per_pos = 0.35 * orig_leg_target
+        if 0 < long_sum < 0.50 * orig_leg_target and max_per_pos > 0:
+            pos_keys = [k for k, v in filtered.items() if v > 0]
+            target_l = min(orig_leg_target, len(pos_keys) * max_per_pos)
+            if target_l > long_sum:
+                scale_up = target_l / long_sum
+                for k in pos_keys:
+                    filtered[k] = min(max_per_pos, filtered[k] * scale_up)
+                long_sum = sum(v for v in filtered.values() if v > 0)
+
+        if 0 < short_sum < 0.50 * orig_leg_target and max_per_pos > 0:
+            neg_keys = [k for k, v in filtered.items() if v < 0]
+            target_s = min(orig_leg_target, len(neg_keys) * max_per_pos)
+            if target_s > short_sum:
+                scale_up = target_s / short_sum
+                for k in neg_keys:
+                    filtered[k] = -min(max_per_pos, abs(filtered[k]) * scale_up)
+                short_sum = sum(abs(v) for v in filtered.values() if v < 0)
 
         balanced_side = min(long_sum, short_sum)
         long_scale = balanced_side / long_sum if long_sum > balanced_side else 1.0
@@ -409,6 +434,21 @@ class ShadowTradingDaemon:
                 filtered[sym_key] = val * long_scale
             elif val < 0 and short_scale < 1.0:
                 filtered[sym_key] = val * short_scale
+
+        # Prune any <$160 zombie stub created by leg scaling (when gross >= $2,000) and redistribute within the same leg
+        if balanced_side * 2.0 >= 2000.0:
+            for sign in (1.0, -1.0):
+                leg_keys = [k for k, v in filtered.items() if (v * sign) > 1e-6]
+                if len(leg_keys) > 1:
+                    stubs = [k for k in leg_keys if abs(filtered[k]) < 160.0]
+                    keep = [k for k in leg_keys if abs(filtered[k]) >= 160.0]
+                    if stubs and keep:
+                        for sk in stubs:
+                            filtered[sk] = 0.0
+                        keep_sum = sum(abs(filtered[k]) for k in keep)
+                        if keep_sum > 1e-6:
+                            for kk in keep:
+                                filtered[kk] = filtered[kk] * (balanced_side / keep_sum)
 
         return filtered
 
@@ -2072,6 +2112,9 @@ class ShadowTradingDaemon:
                     sf_eng = getattr(self.allocator, "seven_factor_engine", None)
                     if sf_eng is not None:
                         sf_eng.enable_chop_range_arb = bool(self.feature_flags.enable_chop_range_arb)
+                        sf_eng.enable_holistic_regime_shields = bool(
+                            getattr(self.feature_flags, "enable_holistic_regime_shields", True)
+                        )
                     if prev_anom != self.enable_anomalies or abs(prev_floor - self.equity_floor_usd) > 1e-6:
                         logger.info(
                             f"🚩 Runtime Feature Flags updated: enable_anomaly_capsule={self.enable_anomalies}, "

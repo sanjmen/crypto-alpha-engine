@@ -1067,6 +1067,47 @@ def test_chop_range_arb_specialist_and_adaptive_chop_tp():
     assert pytest.approx(trend_tp, abs=1e-4) == 0.0500
     assert pytest.approx(trend_trig, abs=1e-4) == 0.0350
     assert pytest.approx(trend_lock, abs=1e-4) == 0.0150
+
+    # Verify Holistic Regime Shields (`enable_holistic_regime_shields=True`) & Cooldown Water-Fill / Stub Pruning
+    eng_hol = SevenFactorOnlineEngine(
+        f6_min_tstat=0.75,
+        f5_min_tstat=1.25,
+        enable_chop_range_arb=True,
+        enable_holistic_regime_shields=True,
+    )
+    res_hol = eng_hol.allocate_latest(bars_1h=bars_1h)
+    assert pytest.approx(sum(res_hol.unit_weights.values()), abs=1e-5) == 0.0
+
+    # Verify `_apply_core_bracket_cooldowns` water-fills remaining Longs and prunes <$160 Short stubs
+    now_dt = datetime.now(timezone.utc)
+    daemon.core_bracket_last_exit = {
+        "ADAUSDT": (now_dt, PositionSide.LONG),
+        "ARBUSDT": (now_dt, PositionSide.LONG),
+        "AVAXUSDT": (now_dt, PositionSide.LONG),
+    }
+    raw_targets = {
+        "ADA/USDT": 400.0,
+        "ARB/USDT": 1200.0,
+        "AVAX/USDT": 1200.0,
+        "SOL/USDT": 500.0,
+        "BNB/USDT": 500.0,
+        "ETH/USDT": -1100.0,
+        "NEAR/USDT": -1000.0,
+        "LINK/USDT": -1000.0,
+        "DOGE/USDT": -500.0,
+        "BTC/USDT": -200.0,
+    }
+    adj_targets = daemon._apply_core_bracket_cooldowns(raw_targets, now=now_dt)
+    long_after = sum(v for v in adj_targets.values() if v > 0)
+    short_after = sum(abs(v) for v in adj_targets.values() if v < 0)
+    assert pytest.approx(long_after, abs=1e-2) == short_after
+    # Remaining 2 Longs (SOL, BNB) must be water-filled to 2 * 35% * $3,800 = $2,660 (not left at $1,000!)
+    assert pytest.approx(long_after, abs=1.0) == 2660.0
+    # And zero active positions < $150 (BTC/USDT stub must be pruned and redistributed!)
+    for v in adj_targets.values():
+        if abs(v) > 1e-6:
+            assert abs(v) >= 160.0
+
     db.close()
 
 

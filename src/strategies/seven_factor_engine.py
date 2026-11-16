@@ -234,6 +234,7 @@ class SevenFactorOnlineEngine:
         min_tstat_by_factor: Optional[Dict[str, float]] = None,
         enable_chop_range_arb: bool = False,
         chop_max_alpha: float = 0.75,
+        enable_holistic_regime_shields: bool = False,
     ) -> None:
         self.lookbacks = lookbacks
         self.priors = pd.Series(priors or DEFAULT_PRIORS)
@@ -250,6 +251,7 @@ class SevenFactorOnlineEngine:
         self.f5_min_tstat = f5_min_tstat
         self.enable_chop_range_arb = bool(enable_chop_range_arb)
         self.chop_max_alpha = float(chop_max_alpha)
+        self.enable_holistic_regime_shields = bool(enable_holistic_regime_shields)
         self.min_tstat_by_factor: Dict[str, float] = dict(min_tstat_by_factor or {})
         if f6_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
             self.min_tstat_by_factor["liq"] = float(f6_min_tstat)
@@ -1303,6 +1305,118 @@ class SevenFactorOnlineEngine:
                 np.where(alpha_chop_overlay >= 0.25, np.maximum(conviction, spec_conv * alpha_chop_overlay + conviction * (1.0 - alpha_chop_overlay)), conviction),
                 index=idx,
             )
+
+            # Unified Holistic Regime Shields (`enable_holistic_regime_shields`):
+            # 1) Lone-Macro Horizon-Divergence & Flight-to-Quality Guard:
+            #    When 7-14d `F1_Macro` monopolizes the book (`fw_macro > 0.50`) while BOTH 48-96h `t_med <= 0.10`
+            #    and 4-12h `t_fast <= -0.05` (`t_med + t_fast <= -0.15`), Macro is lagging a multi-day reversal.
+            #    Rotates up to 80% of the diverging weight into the 7d-14d Whipsaw / Defensive Sector-RV Specialist.
+            # 2) Bull-Surge Laggard Short-Squeeze & Positive-Beta Guard:
+            #    When `btc_ret_24h > +1.6%` in active Trend, dampens shorting coiled oversold laggards, scales down
+            #    post-surge exhaustion, and enforces non-negative portfolio beta (`port_beta >= +0.03`).
+            if self.enable_holistic_regime_shields and btc_col in close.columns:
+                btc_ret_24h = close[btc_col].pct_change(24, fill_method=None).fillna(0.0)
+                mkt_ret_24h = close.pct_change(24, fill_method=None).mean(axis=1).fillna(0.0)
+                alt_bleed_24h = mkt_ret_24h - btc_ret_24h
+
+                t_med_s = t_df["med"]
+                t_fst_s = t_df["fast"]
+                is_lone_macro = (
+                    (fw_norm["macro"] > 0.50)
+                    & (t_med_s <= 0.10)
+                    & (t_fst_s <= -0.05)
+                    & ((t_med_s + t_fst_s) <= -0.15)
+                )
+                w_whip_spec = make_continuous_neutral_weights(
+                    0.35 * w_range_u + 0.25 * w_sect_u + 0.40 * w_whip_u,
+                    ones_df,
+                    gross_leverage=1.0,
+                    power=1.2,
+                )
+                w_defensive = make_continuous_neutral_weights(
+                    0.70 * w_whip_u + 0.30 * w_sect_u,
+                    ones_df,
+                    gross_leverage=1.0,
+                    power=1.2,
+                )
+                if has_wf or has_cl:
+                    w_whip_spec = cap_side_weights_waterfill(
+                        w_whip_spec,
+                        max_side_share=self.trend_waterfill_cap if has_wf else None,
+                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                    )
+                    w_defensive = cap_side_weights_waterfill(
+                        w_defensive,
+                        max_side_share=self.trend_waterfill_cap if has_wf else None,
+                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                    )
+                is_bleeding_breakdown = is_lone_macro & ((mkt_ret_24h < -0.005) | (alt_bleed_24h < -0.006))
+                w_target_spec = pd.DataFrame(
+                    np.where(is_bleeding_breakdown.values[:, None], w_defensive.values, w_whip_spec.values),
+                    index=idx,
+                    columns=cols,
+                )
+                div_strength = (
+                    ((-0.10 - (t_med_s + t_fst_s)) / 0.70).clip(0.0, 1.0)
+                    * ((fw_norm["macro"] - 0.45) / 0.45).clip(0.0, 1.0)
+                )
+                blend_lm = (div_strength * 0.80).where(is_lone_macro, 0.0)
+                w_base_1x = (
+                    w_base_1x.mul(1.0 - blend_lm, axis=0)
+                    + w_target_spec.mul(0.55 * blend_lm, axis=0)
+                )
+                if has_wf or has_cl:
+                    w_base_1x = cap_side_weights_waterfill(
+                        w_base_1x,
+                        max_side_share=self.trend_waterfill_cap if has_wf else None,
+                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                    )
+                alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lm)
+
+                is_bull_surge = (btc_ret_24h > 0.016) & (max_tr_t > 0.0) & (alpha_chop_overlay < 0.25)
+                coiled_laggard_short = (
+                    is_bull_surge.values[:, None]
+                    & (w_base_1x < 0.0)
+                    & ((zi[24] < -0.20) | (zi[12] < -0.20) | (zi[72] < -0.25))
+                    & (zr[4] > -0.60)
+                )
+                w_adj_b = w_base_1x.where(~coiled_laggard_short, 0.20 * w_base_1x)
+                bull_exhaustion_scale = pd.Series(
+                    np.where(
+                        is_bull_surge & (btc_ret_24h > 0.018),
+                        np.clip(1.0 - ((btc_ret_24h - 0.016) / 0.022) * 0.70, 0.30, 1.0),
+                        1.0,
+                    ),
+                    index=idx,
+                )
+                pos_b0 = w_adj_b.clip(lower=0.0)
+                neg_b0 = (-w_adj_b).clip(lower=0.0)
+                gross_t = w_base_1x.abs().sum(axis=1) * bull_exhaustion_scale
+                p_sum0 = pos_b0.sum(axis=1).replace(0, 1.0)
+                n_sum0 = neg_b0.sum(axis=1).replace(0, 1.0)
+                w_base_1x = (
+                    pos_b0.div(p_sum0, axis=0).mul(gross_t / 2.0, axis=0)
+                    - neg_b0.div(n_sum0, axis=0).mul(gross_t / 2.0, axis=0)
+                )
+
+                port_beta_s = (w_base_1x * beta_72).sum(axis=1)
+                b_mean_s = beta_72.mean(axis=1)
+                b_cent_s = beta_72.sub(b_mean_s, axis=0)
+                b_var_s = (b_cent_s ** 2).sum(axis=1).replace(0, 1.0)
+                need_beta_fix = is_bull_surge & (port_beta_s < 0.03) & (gross_t > 1e-8)
+                if need_beta_fix.any():
+                    excess_b = port_beta_s - 0.05
+                    adj_f = (excess_b / b_var_s).where(need_beta_fix, 0.0)
+                    w_b_fix = w_base_1x.sub(b_cent_s.mul(adj_f, axis=0), axis=0)
+                    pos_b1 = w_b_fix.clip(lower=0.0)
+                    neg_b1 = (-w_b_fix).clip(lower=0.0)
+                    ps_b1 = pos_b1.sum(axis=1).replace(0, 1.0)
+                    ns_b1 = neg_b1.sum(axis=1).replace(0, 1.0)
+                    w_fixed = (
+                        pos_b1.div(ps_b1, axis=0).mul(gross_t / 2.0, axis=0)
+                        - neg_b1.div(ns_b1, axis=0).mul(gross_t / 2.0, axis=0)
+                    )
+                    w_base_1x.loc[need_beta_fix] = w_fixed.loc[need_beta_fix]
 
         unit_ret_1h = (w_base_1x.shift(1).fillna(0.0) * rets_1h).sum(axis=1)
         port_vol_72h = (

@@ -413,6 +413,7 @@ def main() -> None:
             f6_min_tstat=f6_gate_cfg,
             f5_min_tstat=1.25 if feature_flags.enable_chop_range_arb else None,
             enable_chop_range_arb=feature_flags.enable_chop_range_arb,
+            enable_holistic_regime_shields=feature_flags.enable_holistic_regime_shields,
         )
         if use_seven_factor
         else None
@@ -499,6 +500,7 @@ def main() -> None:
         f"🚩 Feature Flags & 3 Reglas de Blindaje [{mode.upper()}]: "
         f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
         f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct*100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
+        f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
         f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"
     )
@@ -556,8 +558,9 @@ def main() -> None:
             float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < 0.0
             for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
-        if has_legacy_prior_weights:
-            logger.info("🚀 [M15 Upgrade] Legacy static-prior weights detected in Mainnet DB — scheduling immediate M15 rebalance.")
+        tier_changed = abs(float(sf_prev.get("unlocked_tier") or start_lev) - start_lev) > 0.1
+        if has_legacy_prior_weights or tier_changed:
+            logger.info("🚀 [M15 Upgrade] Legacy static-prior weights or base leverage tier change detected — scheduling immediate rebalance.")
             daemon.last_rebalance_time = None
 
     if args.once:

@@ -54,6 +54,7 @@ class FeatureFlags:
     enable_quarterly_basis: bool = True
     enable_chop_range_arb: bool = True
     enable_dynamic_barriers: bool = True
+    enable_holistic_regime_shields: bool = True
     chop_take_profit_pct: float = 0.035
     chop_min_tp_pct: float = 0.028
     chop_max_tp_pct: float = 0.036
@@ -111,6 +112,10 @@ class FeatureFlags:
         if "enable_dynamic_barriers" in data:
             merged["enable_dynamic_barriers"] = _parse_bool(
                 data["enable_dynamic_barriers"], merged["enable_dynamic_barriers"]
+            )
+        if "enable_holistic_regime_shields" in data:
+            merged["enable_holistic_regime_shields"] = _parse_bool(
+                data["enable_holistic_regime_shields"], merged["enable_holistic_regime_shields"]
             )
         if "chop_min_tp_pct" in data:
             merged["chop_min_tp_pct"] = _parse_float(
@@ -208,6 +213,10 @@ class FeatureFlags:
             env.get("FF_ENABLE_DYNAMIC_BARRIERS"),
             default=True,
         )
+        enable_holistic = _parse_bool(
+            env.get("FF_ENABLE_HOLISTIC_REGIME_SHIELDS"),
+            default=True,
+        )
         chop_min_tp = _parse_float(
             env.get("FF_CHOP_MIN_TP_PCT"),
             default=0.028,
@@ -228,6 +237,7 @@ class FeatureFlags:
             enable_quarterly_basis=enable_qb,
             enable_chop_range_arb=enable_chop,
             enable_dynamic_barriers=enable_dyn_b,
+            enable_holistic_regime_shields=enable_holistic,
             chop_take_profit_pct=chop_tp,
             chop_min_tp_pct=chop_min_tp,
             chop_max_tp_pct=chop_max_tp,
@@ -258,6 +268,9 @@ class FeatureFlags:
             "enable_chop_range_arb": "enable_chop_range_arb",
             "dynamic_barriers": "enable_dynamic_barriers",
             "enable_dynamic_barriers": "enable_dynamic_barriers",
+            "holistic_shields": "enable_holistic_regime_shields",
+            "holistic_regime_shields": "enable_holistic_regime_shields",
+            "enable_holistic_regime_shields": "enable_holistic_regime_shields",
             "chop_tp": "chop_take_profit_pct",
             "chop_take_profit_pct": "chop_take_profit_pct",
             "chop_min_tp": "chop_min_tp_pct",
