@@ -1278,12 +1278,102 @@ class ShadowTradingDaemon:
 
         return portfolio, filled_orders
 
+    def compute_dynamic_barrier_profile(
+        self,
+        symbol: str,
+    ) -> tuple[float | None, float | None, float | None]:
+        """
+        Computes the dynamic Volatility- & Regime-Scaled Triple-Barrier profile
+        `(eff_take_profit_pct, eff_profit_lock_trigger_pct, eff_profit_lock_level_pct)`
+        for a Core 7-Factor position:
+        - In Active Trend (`max_trend_t > 0` and `chop_overlay_weight < 0.25`):
+          Returns `(self.core_take_profit_pct, self.profit_lock_trigger_pct, self.profit_lock_level_pct)`
+          (e.g. +5.0% TP, +3.5% -> +1.5% Profit-Lock).
+        - In Sideways Chop / Range-Arb Regime (`max_trend_t <= 0` or `chop_overlay_weight >= 0.25`):
+          Scales TP dynamically to `clip(2 * sigma_1h_24h * chop_mult, chop_min_tp_pct, chop_max_tp_pct)`
+          (in `[2.8%, 3.6%]`) and Profit-Lock to `(0.72 * eff_tp -> 0.40 * eff_tp)` (e.g. `+2.02% -> +1.12%`).
+        """
+        eff_tp = self.core_take_profit_pct
+        eff_lock_trig = self.profit_lock_trigger_pct
+        eff_lock_lvl = self.profit_lock_level_pct
+
+        sf_eng = getattr(self.allocator, "seven_factor_engine", None)
+        if not (
+            sf_eng is not None
+            and getattr(sf_eng, "enable_chop_range_arb", False)
+            and getattr(self.feature_flags, "enable_chop_range_arb", False)
+        ):
+            return eff_tp, eff_lock_trig, eff_lock_lvl
+
+        sf_res = getattr(self.allocator, "last_seven_factor_result", None)
+        t_map: dict[str, Any] = {}
+        chop_w = 0.0
+        vol_map: dict[str, float] = {}
+
+        if sf_res is not None:
+            t_map = getattr(sf_res, "factor_tstats", None) or {}
+            chop_w = float(getattr(sf_res, "chop_overlay_weight", 0.0) or 0.0)
+            vol_map = getattr(sf_res, "asset_vol_24h", None) or {}
+        else:
+            db = getattr(self.broker, "db", None)
+            if db and hasattr(db, "get_latest_seven_factor_telemetry"):
+                try:
+                    tel = db.get_latest_seven_factor_telemetry() or {}
+                    t_map = tel.get("factor_tstats") or {}
+                except Exception:
+                    t_map = {}
+
+        if not t_map and chop_w < 0.25:
+            return eff_tp, eff_lock_trig, eff_lock_lvl
+
+        max_tr = (
+            max((float(t_map.get(k, 0.0)) for k in ("macro", "med", "fast")), default=1.0)
+            if t_map
+            else 1.0
+        )
+        if not (chop_w >= 0.25 or max_tr <= 0.0):
+            return eff_tp, eff_lock_trig, eff_lock_lvl
+
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        use_dyn = bool(getattr(self.feature_flags, "enable_dynamic_barriers", True))
+        sigma_1h = float(vol_map.get(clean_sym) or vol_map.get(symbol) or 0.0)
+
+        if use_dyn and sigma_1h <= 0.0 and self.enable_warm_start:
+            try:
+                p_bar = self.cache_dir / "bars" / "1h" / f"{clean_sym}.parquet"
+                if p_bar.exists():
+                    df_v = pd.read_parquet(p_bar).tail(26)
+                    if len(df_v) >= 6 and "close" in df_v.columns:
+                        sigma_1h = float(df_v["close"].astype(float).pct_change().dropna().std())
+            except Exception:
+                sigma_1h = 0.0
+
+        if use_dyn and sigma_1h > 0.0:
+            sigma_4h = 2.0 * min(0.035, max(0.004, sigma_1h))
+            chop_mult = 1.95 - 0.35 * min(1.0, max(0.0, chop_w / 0.75))
+            c_min = float(getattr(self.feature_flags, "chop_min_tp_pct", 0.028) or 0.028)
+            c_max = float(getattr(self.feature_flags, "chop_max_tp_pct", 0.036) or 0.036)
+            eff_tp = min(c_max, max(c_min, round(sigma_4h * chop_mult, 4)))
+        else:
+            chop_tp_val = float(getattr(self.feature_flags, "chop_take_profit_pct", 0.035) or 0.035)
+            if chop_tp_val > 0.0:
+                eff_tp = chop_tp_val
+
+        if eff_tp and eff_tp > 0.0:
+            if self.profit_lock_trigger_pct and self.profit_lock_trigger_pct > 0:
+                eff_lock_trig = min(self.profit_lock_trigger_pct, max(0.020, round(0.72 * eff_tp, 4)))
+            if self.profit_lock_level_pct and self.profit_lock_level_pct > 0:
+                eff_lock_lvl = min(self.profit_lock_level_pct, max(0.010, round(0.40 * eff_tp, 4)))
+
+        return eff_tp, eff_lock_trig, eff_lock_lvl
+
     def ensure_position_brackets(self) -> None:
         """
         Ensures active positions have appropriate bracket orders:
         - Anomaly strategies: both Take-Profit and initial Stop-Loss brackets.
-        - Core / 7-Factor strategies: passive Maker Take-Profit (+8.0% default) and
-          protective initial Stop-Loss (-2.5% default, `core_stop_loss_pct`), with
+        - Core / 7-Factor strategies: passive Maker Take-Profit (dynamically scaled by
+          regime & coin volatility via `compute_dynamic_barrier_profile`) and
+          protective initial Stop-Loss (`core_stop_loss_pct`), with
           dynamic Stop-Profit / Trailing Stop ratcheted via manage_trailing_and_profit_locks().
         """
         portfolio = self.broker.get_portfolio()
@@ -1313,11 +1403,13 @@ class ShadowTradingDaemon:
             else:
                 tp = pos.take_profit
                 sl = pos.stop_loss
-                if self.core_take_profit_pct and self.core_take_profit_pct > 0:
+                eff_core_tp, _, _ = self.compute_dynamic_barrier_profile(sym)
+
+                if eff_core_tp and eff_core_tp > 0:
                     if pos.side == PositionSide.LONG:
-                        tp = round(entry * (1.0 + self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                        tp = round(entry * (1.0 + eff_core_tp), 6 if entry < 1.0 else 2)
                     else:  # SHORT
-                        tp = round(entry * (1.0 - self.core_take_profit_pct), 6 if entry < 1.0 else 2)
+                        tp = round(entry * (1.0 - eff_core_tp), 6 if entry < 1.0 else 2)
                 else:
                     tp = None
 
@@ -1332,7 +1424,18 @@ class ShadowTradingDaemon:
                     if sl is not None and not pos.is_profit_locked:
                         sl = None
 
-                needs_refresh = (pos.take_profit != tp) or (pos.stop_loss != sl)
+                tp_changed = (
+                    (pos.take_profit is None and tp is not None)
+                    or (pos.take_profit is not None and tp is None)
+                    or (
+                        pos.take_profit is not None
+                        and tp is not None
+                        and abs(pos.take_profit - tp) / max(entry, 1e-8) >= 0.0015
+                    )
+                )
+                if not tp_changed and pos.take_profit is not None and tp is not None:
+                    tp = pos.take_profit
+                needs_refresh = tp_changed or (pos.stop_loss != sl)
                 if not needs_refresh and db and hasattr(db, "get_pending_orders"):
                     try:
                         pend = db.get_pending_orders(symbol=sym)
@@ -1501,8 +1604,11 @@ class ShadowTradingDaemon:
 
             trail_trig = self.anomaly_trailing_trigger_pct if is_anomaly else self.trailing_trigger_pct
             trail_dist = self.anomaly_trailing_distance_pct if is_anomaly else self.trailing_distance_pct
-            lock_trig = self.anomaly_profit_lock_trigger_pct if is_anomaly else self.profit_lock_trigger_pct
-            lock_lvl = self.anomaly_profit_lock_level_pct if is_anomaly else self.profit_lock_level_pct
+            if is_anomaly:
+                lock_trig = self.anomaly_profit_lock_trigger_pct
+                lock_lvl = self.anomaly_profit_lock_level_pct
+            else:
+                _, lock_trig, lock_lvl = self.compute_dynamic_barrier_profile(sym)
 
             # Phase 3: Trailing Stop (only active when trail_trig > 0)
             if trail_trig is not None and trail_trig > 0 and peak_ret >= trail_trig:
@@ -1963,6 +2069,9 @@ class ShadowTradingDaemon:
                     self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
                     self.enable_smart_money = bool(self.feature_flags.enable_smart_money)
                     self.enable_quarterly_basis = bool(self.feature_flags.enable_quarterly_basis)
+                    sf_eng = getattr(self.allocator, "seven_factor_engine", None)
+                    if sf_eng is not None:
+                        sf_eng.enable_chop_range_arb = bool(self.feature_flags.enable_chop_range_arb)
                     if prev_anom != self.enable_anomalies or abs(prev_floor - self.equity_floor_usd) > 1e-6:
                         logger.info(
                             f"🚩 Runtime Feature Flags updated: enable_anomaly_capsule={self.enable_anomalies}, "

@@ -52,6 +52,11 @@ class FeatureFlags:
     enable_invariant_audit: bool = True
     enable_smart_money: bool = True
     enable_quarterly_basis: bool = True
+    enable_chop_range_arb: bool = True
+    enable_dynamic_barriers: bool = True
+    chop_take_profit_pct: float = 0.035
+    chop_min_tp_pct: float = 0.028
+    chop_max_tp_pct: float = 0.036
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,6 +99,26 @@ class FeatureFlags:
         if "enable_quarterly_basis" in data:
             merged["enable_quarterly_basis"] = _parse_bool(
                 data["enable_quarterly_basis"], merged["enable_quarterly_basis"]
+            )
+        if "enable_chop_range_arb" in data:
+            merged["enable_chop_range_arb"] = _parse_bool(
+                data["enable_chop_range_arb"], merged["enable_chop_range_arb"]
+            )
+        if "chop_take_profit_pct" in data:
+            merged["chop_take_profit_pct"] = _parse_float(
+                data["chop_take_profit_pct"], merged["chop_take_profit_pct"]
+            )
+        if "enable_dynamic_barriers" in data:
+            merged["enable_dynamic_barriers"] = _parse_bool(
+                data["enable_dynamic_barriers"], merged["enable_dynamic_barriers"]
+            )
+        if "chop_min_tp_pct" in data:
+            merged["chop_min_tp_pct"] = _parse_float(
+                data["chop_min_tp_pct"], merged["chop_min_tp_pct"]
+            )
+        if "chop_max_tp_pct" in data:
+            merged["chop_max_tp_pct"] = _parse_float(
+                data["chop_max_tp_pct"], merged["chop_max_tp_pct"]
             )
         return cls(**merged)
 
@@ -166,6 +191,31 @@ class FeatureFlags:
             env.get("FF_ENABLE_QUARTERLY_BASIS"),
             default=bool(is_m15_core),
         )
+        cli_chop = getattr(args, "enable_chop_range_arb", None) if args is not None else None
+        env_chop = env.get("FF_ENABLE_CHOP_RANGE_ARB")
+        if env_chop is not None:
+            enable_chop = _parse_bool(env_chop, default=True)
+        elif cli_chop is not None:
+            enable_chop = bool(cli_chop)
+        else:
+            enable_chop = True
+
+        chop_tp = _parse_float(
+            env.get("FF_CHOP_TAKE_PROFIT_PCT", getattr(args, "chop_tp", None) if args is not None else None),
+            default=0.035,
+        )
+        enable_dyn_b = _parse_bool(
+            env.get("FF_ENABLE_DYNAMIC_BARRIERS"),
+            default=True,
+        )
+        chop_min_tp = _parse_float(
+            env.get("FF_CHOP_MIN_TP_PCT"),
+            default=0.028,
+        )
+        chop_max_tp = _parse_float(
+            env.get("FF_CHOP_MAX_TP_PCT"),
+            default=0.036,
+        )
 
         return cls(
             enable_anomaly_capsule=enable_anom,
@@ -176,6 +226,11 @@ class FeatureFlags:
             enable_invariant_audit=enable_invariants,
             enable_smart_money=enable_sm,
             enable_quarterly_basis=enable_qb,
+            enable_chop_range_arb=enable_chop,
+            enable_dynamic_barriers=enable_dyn_b,
+            chop_take_profit_pct=chop_tp,
+            chop_min_tp_pct=chop_min_tp,
+            chop_max_tp_pct=chop_max_tp,
         )
 
     def apply_override(self, key: str, raw_value: Any) -> tuple[str, Any]:
@@ -199,14 +254,24 @@ class FeatureFlags:
             "enable_smart_money": "enable_smart_money",
             "quarterly_basis": "enable_quarterly_basis",
             "enable_quarterly_basis": "enable_quarterly_basis",
+            "chop_range_arb": "enable_chop_range_arb",
+            "enable_chop_range_arb": "enable_chop_range_arb",
+            "dynamic_barriers": "enable_dynamic_barriers",
+            "enable_dynamic_barriers": "enable_dynamic_barriers",
+            "chop_tp": "chop_take_profit_pct",
+            "chop_take_profit_pct": "chop_take_profit_pct",
+            "chop_min_tp": "chop_min_tp_pct",
+            "chop_min_tp_pct": "chop_min_tp_pct",
+            "chop_max_tp": "chop_max_tp_pct",
+            "chop_max_tp_pct": "chop_max_tp_pct",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:
             valid = ", ".join(sorted(asdict(self).keys()))
             raise ValueError(f"Unknown feature flag '{key}'. Valid flags: {valid}")
 
-        if norm_key == "equity_floor_usd":
-            parsed: Any = _parse_float(raw_value, self.equity_floor_usd)
+        if norm_key in ("equity_floor_usd", "chop_take_profit_pct", "chop_min_tp_pct", "chop_max_tp_pct"):
+            parsed: Any = _parse_float(raw_value, getattr(self, norm_key))
         else:
             parsed = _parse_bool(raw_value, getattr(self, norm_key))
 

@@ -970,6 +970,107 @@ def test_three_shield_rules_feature_flags_and_hard_equity_floor():
     db.close()
 
 
+def test_chop_range_arb_specialist_and_adaptive_chop_tp():
+    """
+    Tests the Unified Chop & Whipsaw Intra-Sector Range-Arb Specialist:
+    1) `SevenFactorOnlineEngine(enable_chop_range_arb=True, f5_min_tstat=1.25)` computes
+       causal `chop_specialist_tstat` and `chop_overlay_weight` while preserving strict
+       100% dollar neutrality (`sum(unit_weights) == 0.0`).
+    2) When the engine is in Chop Regime (`max(t_macro, t_med, t_fast) <= 0` or `chop_overlay_weight >= 0.25`),
+       `ShadowTradingDaemon.ensure_position_brackets()` tightens Core passive Maker Take-Profit
+       from `+5.0%` (`core_take_profit_pct`) to `+3.5%` (`chop_take_profit_pct`).
+    """
+    from src.strategies.seven_factor_engine import SevenFactorAllocationResult, SevenFactorOnlineEngine
+
+    idx = pd.date_range("2026-10-01", periods=400, freq="1h", tz="UTC")
+    rng = np.random.default_rng(116)
+    syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "FETUSDT", "RENDERUSDT", "APTUSDT", "NEARUSDT"]
+    bars_1h = {}
+    for i, s in enumerate(syms):
+        # Generate mean-reverting range-bound prices (Ornstein-Uhlenbeck chop)
+        x = np.zeros(400)
+        for t in range(1, 400):
+            x[t] = 0.85 * x[t - 1] + rng.normal(0.0, 0.012)
+        c = (100.0 + i * 10.0) * np.exp(x)
+        bars_1h[s] = pd.DataFrame(
+            {
+                "open": c * 0.999,
+                "high": c * 1.005,
+                "low": c * 0.995,
+                "close": c,
+                "volume": np.full(400, 10_000.0),
+            },
+            index=idx,
+        )
+
+    eng = SevenFactorOnlineEngine(
+        f6_min_tstat=0.75,
+        f5_min_tstat=1.25,
+        enable_chop_range_arb=True,
+    )
+    res = eng.allocate_latest(bars_1h=bars_1h)
+    assert pytest.approx(sum(res.unit_weights.values()), abs=1e-5) == 0.0
+    assert isinstance(res.chop_specialist_tstat, float)
+    assert 0.0 <= res.chop_overlay_weight <= 0.75
+
+    # Verify adaptive Chop Take-Profit (+3.5%) in ShadowTradingDaemon.ensure_position_brackets()
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    allocator = MetaStrategyAllocator(seven_factor_engine=eng, use_seven_factor_engine=True)
+    allocator.last_seven_factor_result = SevenFactorAllocationResult(
+        unit_weights={"BTCUSDT": 0.25, "APTUSDT": -0.25},
+        vol_scalar=1.0,
+        port_vol_72h=0.003,
+        median_vol=0.003,
+        conviction=0.60,
+        factor_weights={"macro": 0.0, "med": 0.0, "fast": 0.0, "rev": 0.65, "carry": 0.0, "liq": 0.0, "size": 0.35},
+        factor_tstats={"macro": -0.60, "med": -0.55, "fast": -0.40, "rev": 0.50, "carry": -0.20, "liq": -0.30, "size": 0.10},
+        asset_betas={"BTCUSDT": 1.0, "APTUSDT": 1.1},
+        portfolio_beta=0.0,
+        chop_specialist_tstat=1.45,
+        chop_overlay_weight=0.55,
+    )
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        allocator=allocator,
+        symbols=["BTC/USDT", "APT/USDT"],
+        core_take_profit_pct=0.050,
+        enable_warm_start=False,
+    )
+    broker.set_market_price("APT/USDT", price=1.0000)
+    broker.create_order(
+        symbol="APT/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=500.0,
+        strategy="F4_Rev_24_72h (MeanRev)",
+    )
+    daemon.ensure_position_brackets()
+    # In Chop Regime without symbol vol override, SHORT @ ~1.0000 gets +3.5% TP (~0.9649) instead of +5.0% TP (~0.9499)
+    assert pytest.approx(broker.portfolio.positions["APT/USDT"].take_profit, abs=1e-3) == 0.965
+
+    # Now supply per-asset 24h 1h-return volatility (`asset_vol_24h`) and verify dynamic scaling:
+    # Low-vol symbol (sigma_1h = 0.0020 -> clipped to chop_min_tp_pct = 2.80%)
+    allocator.last_seven_factor_result.asset_vol_24h = {"BTCUSDT": 0.0020, "APTUSDT": 0.0100}
+    btc_tp, btc_trig, btc_lock = daemon.compute_dynamic_barrier_profile("BTC/USDT")
+    apt_tp, apt_trig, apt_lock = daemon.compute_dynamic_barrier_profile("APT/USDT")
+    assert pytest.approx(btc_tp, abs=1e-4) == 0.0280
+    assert pytest.approx(btc_trig, abs=1e-4) == 0.0202
+    assert pytest.approx(btc_lock, abs=1e-4) == 0.0112
+    # Higher-vol symbol (sigma_1h = 0.0100 -> 2*0.0100*1.6933 = 3.39%, within [2.8%, 3.6%])
+    assert pytest.approx(apt_tp, abs=1e-4) == 0.0339
+
+    # In Active Trend Regime, TP stays at +5.0% so winning trends are never cut early
+    allocator.last_seven_factor_result.factor_tstats["macro"] = 1.20
+    allocator.last_seven_factor_result.chop_overlay_weight = 0.0
+    trend_tp, trend_trig, trend_lock = daemon.compute_dynamic_barrier_profile("BTC/USDT")
+    assert pytest.approx(trend_tp, abs=1e-4) == 0.0500
+    assert pytest.approx(trend_trig, abs=1e-4) == 0.0350
+    assert pytest.approx(trend_lock, abs=1e-4) == 0.0150
+    db.close()
+
+
+
 
 
 

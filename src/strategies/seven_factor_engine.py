@@ -83,6 +83,9 @@ class SevenFactorAllocationResult:
     quarterly_basis_apr: float = 0.0
     basis_regime_scalar: float = 1.0
     basis_regime_label: str = "NEUTRAL"
+    chop_specialist_tstat: float = 0.0
+    chop_overlay_weight: float = 0.0
+    asset_vol_24h: Dict[str, float] = field(default_factory=dict)
 
 
 def make_continuous_neutral_weights(
@@ -227,7 +230,10 @@ class SevenFactorOnlineEngine:
         trend_waterfill_threshold: float = 0.20,
         alt_cluster_cap: Optional[float] = 0.48,
         f6_min_tstat: Optional[float] = 0.75,
+        f5_min_tstat: Optional[float] = None,
         min_tstat_by_factor: Optional[Dict[str, float]] = None,
+        enable_chop_range_arb: bool = False,
+        chop_max_alpha: float = 0.75,
     ) -> None:
         self.lookbacks = lookbacks
         self.priors = pd.Series(priors or DEFAULT_PRIORS)
@@ -241,9 +247,14 @@ class SevenFactorOnlineEngine:
         self.trend_waterfill_threshold = trend_waterfill_threshold
         self.alt_cluster_cap = alt_cluster_cap
         self.f6_min_tstat = f6_min_tstat
+        self.f5_min_tstat = f5_min_tstat
+        self.enable_chop_range_arb = bool(enable_chop_range_arb)
+        self.chop_max_alpha = float(chop_max_alpha)
         self.min_tstat_by_factor: Dict[str, float] = dict(min_tstat_by_factor or {})
         if f6_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
             self.min_tstat_by_factor["liq"] = float(f6_min_tstat)
+        if f5_min_tstat is not None and "carry" not in self.min_tstat_by_factor:
+            self.min_tstat_by_factor["carry"] = float(f5_min_tstat)
 
     @staticmethod
     def _find_btc_column(columns: List[str]) -> Optional[str]:
@@ -855,8 +866,15 @@ class SevenFactorOnlineEngine:
         priors_aligned = self.priors.reindex(t_df.columns).fillna(0.10)
         raw_fw = np.maximum(0.0, t_df.add(priors_aligned, axis=1)) ** 2.0
 
-        # Lever #1 (Issue #52): High-Conviction t-stat Activation Gate on F6_Liq_Surge (t_stat >= +0.75)
-        for f_name, min_t in self.min_tstat_by_factor.items():
+        # Ensure dynamic F5_Carry gate is synchronized with `self.enable_chop_range_arb` / `self.f5_min_tstat`
+        eff_gates = dict(self.min_tstat_by_factor)
+        if self.enable_chop_range_arb and "carry" not in eff_gates:
+            eff_gates["carry"] = float(self.f5_min_tstat if self.f5_min_tstat is not None else 1.25)
+        elif self.f5_min_tstat is not None and "carry" not in eff_gates:
+            eff_gates["carry"] = float(self.f5_min_tstat)
+
+        # Lever #1 (Issue #52): High-Conviction t-stat Activation Gate on F6_Liq_Surge (t_stat >= +0.75) & F5_Carry
+        for f_name, min_t in eff_gates.items():
             if f_name in raw_fw.columns and min_t is not None:
                 gate_mask = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
                 raw_fw[f_name] = raw_fw[f_name].where(gate_mask, 0.0)
@@ -868,7 +886,7 @@ class SevenFactorOnlineEngine:
         if "size" in raw_fw.columns:
             raw_fw["size"] = raw_fw["size"].ewm(span=6, min_periods=1).mean()
 
-        for f_name, min_t in self.min_tstat_by_factor.items():
+        for f_name, min_t in eff_gates.items():
             if f_name in raw_fw.columns and min_t is not None:
                 gate_mask = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
                 raw_fw[f_name] = raw_fw[f_name].where(gate_mask, 0.0)
@@ -1194,6 +1212,98 @@ class SevenFactorOnlineEngine:
         else:
             w_base_1x = w_raw_1x
 
+        # Unified Chop & Whipsaw Intra-Sector Range-Arb Specialist Overlay (`enable_chop_range_arb`):
+        # When Macro/Medium trend is dead (`0.5 * (t_macro + t_med) <= 0` or `max(t_macro, t_med, t_fast) <= 0.10`)
+        # and the Range-Arb Specialist (50% Multi-Horizon Range Reversion 12h-72h + 25% Intra-Sector Cluster
+        # Relative-Value StatArb + 25% 7d-14d Whipsaw Reversion) exhibits positive causal rolling t-stat
+        # outperforming the base book, smoothly rotates up to `chop_max_alpha` (75%) into Range-Arb.
+        t_chop_spec = pd.Series(0.0, index=idx, dtype=float)
+        alpha_chop_overlay = pd.Series(0.0, index=idx, dtype=float)
+        if self.enable_chop_range_arb and len(cols) >= 4:
+            clusters_full = dict(ALT_SECTOR_CLUSTERS)
+            clusters_full["MAJORS"] = ("BTCUSDT", "ETHUSDT", "BNBUSDT")
+            clean_to_col = {str(c).split(":")[0].replace("/", ""): c for c in cols}
+            c_sector_rv = pd.DataFrame(0.0, index=idx, columns=cols)
+            z_blend_rv = 0.30 * zi[8] + 0.45 * zi[24] + 0.25 * zi[48]
+            for _, syms in clusters_full.items():
+                valid_cols = [clean_to_col[s] for s in syms if s in clean_to_col]
+                if len(valid_cols) >= 2:
+                    c_mean = z_blend_rv[valid_cols].mean(axis=1)
+                    for vc in valid_cols:
+                        c_sector_rv[vc] = -(z_blend_rv[vc] - c_mean)
+
+            f_range_rev = (
+                -(0.25 * zi[12] + 0.35 * zi[24] + 0.25 * zi[48] + 0.15 * zi[72])
+                - 0.20 * zr[4]
+                + 0.40 * c_sector_rv
+            ) * (1.20 / vol_surge.clip(0.65, 1.80))
+            f_whipsaw_rev = -(0.45 * zi[168] + 0.35 * zi[336] + 0.20 * zi[72]) + 0.35 * c_sector_rv
+
+            w_range_u = make_continuous_neutral_weights(
+                f_range_rev.ewm(span=3, min_periods=1).mean(), inv_vol, gross_leverage=1.0, power=1.5
+            )
+            w_whip_u = make_continuous_neutral_weights(
+                f_whipsaw_rev.ewm(span=3, min_periods=1).mean(), inv_vol, gross_leverage=1.0, power=1.5
+            )
+            w_sect_u = make_continuous_neutral_weights(
+                c_sector_rv.ewm(span=3, min_periods=1).mean(), inv_vol, gross_leverage=1.0, power=1.5
+            )
+            w_chop_spec = make_continuous_neutral_weights(
+                0.50 * w_range_u + 0.25 * w_sect_u + 0.25 * w_whip_u,
+                ones_df,
+                gross_leverage=1.0,
+                power=1.2,
+            )
+            if has_wf or has_cl:
+                w_chop_spec = cap_side_weights_waterfill(
+                    w_chop_spec,
+                    max_side_share=self.trend_waterfill_cap if has_wf else None,
+                    max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                )
+
+            def _fast_rolling_tstat(w_u: pd.DataFrame, lbs: Tuple[int, ...]) -> pd.Series:
+                w_ex = w_u.shift(1).fillna(0.0)
+                turn_s = w_ex.diff().abs().sum(axis=1).fillna(0.0)
+                r_s = (w_ex * rets_1h).sum(axis=1) - (w_ex * funding).sum(axis=1) - turn_s * self.factor_turnover_penalty
+                t_out = pd.Series(0.0, index=idx, dtype=float)
+                for lb_w in lbs:
+                    mp = max(6, lb_w // 4)
+                    mn = r_s.rolling(lb_w, min_periods=mp).mean()
+                    sd = r_s.rolling(lb_w, min_periods=mp).std().replace(0, 1e-8)
+                    t_out += (mn / sd * np.sqrt(lb_w)).fillna(0.0) / float(len(lbs))
+                return t_out
+
+            t_chop_spec = _fast_rolling_tstat(w_chop_spec, (24, 48, 96))
+            t_base_fast = _fast_rolling_tstat(w_base_1x, (24, 48))
+
+            max_tr_t = t_df[["macro", "med", "fast"]].max(axis=1)
+            mm_mean_t = 0.5 * (t_df["macro"] + t_df["med"])
+            macro_chop_gate = ((0.0 - mm_mean_t) / 0.50).clip(0.0, 1.0)
+            pure_chop_gate = ((0.10 - max_tr_t) / 0.30).clip(0.0, 1.0) * ((t_chop_spec + 0.10) / 0.50).clip(0.0, 1.0)
+            whipsaw_gate = (
+                macro_chop_gate
+                * ((t_chop_spec - 0.15) / 0.50).clip(0.0, 1.0)
+                * ((t_chop_spec - t_base_fast - 0.15) / 0.60).clip(0.0, 1.0)
+            )
+            raw_chop_gate = np.maximum(pure_chop_gate * 0.55, whipsaw_gate)
+            alpha_chop_overlay = (raw_chop_gate * self.chop_max_alpha).clip(0.0, self.chop_max_alpha)
+
+            spec_conv = (0.45 + 0.25 * t_chop_spec.clip(0.0, 1.5)).clip(0.45, 0.75)
+            w_base_1x = (
+                w_base_1x.mul(1.0 - alpha_chop_overlay, axis=0)
+                + w_chop_spec.mul(spec_conv, axis=0).mul(alpha_chop_overlay, axis=0)
+            )
+            if has_wf or has_cl:
+                w_base_1x = cap_side_weights_waterfill(
+                    w_base_1x,
+                    max_side_share=self.trend_waterfill_cap if has_wf else None,
+                    max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                )
+            conviction = pd.Series(
+                np.where(alpha_chop_overlay >= 0.25, np.maximum(conviction, spec_conv * alpha_chop_overlay + conviction * (1.0 - alpha_chop_overlay)), conviction),
+                index=idx,
+            )
+
         unit_ret_1h = (w_base_1x.shift(1).fillna(0.0) * rets_1h).sum(axis=1)
         port_vol_72h = (
             unit_ret_1h.rolling(72, min_periods=12).std().bfill().fillna(0.003)
@@ -1229,6 +1339,9 @@ class SevenFactorOnlineEngine:
             "alpha_sm_dyn": alpha_sm_dyn,
             "quarterly_basis_apr": q_basis_apr if q_basis_apr is not None else pd.Series(0.0, index=idx),
             "basis_regime_scalar": basis_regime_scalar,
+            "t_chop_spec": t_chop_spec,
+            "alpha_chop_overlay": alpha_chop_overlay,
+            "vol_24h": vol_24h,
         }
 
     def allocate_latest(
@@ -1321,4 +1434,7 @@ class SevenFactorOnlineEngine:
             quarterly_basis_apr=q_apr_latest,
             basis_regime_scalar=b_scalar_latest,
             basis_regime_label=b_label,
+            chop_specialist_tstat=float(mats["t_chop_spec"].iloc[-1]),
+            chop_overlay_weight=float(mats["alpha_chop_overlay"].iloc[-1]),
+            asset_vol_24h={str(k): float(v) for k, v in mats["vol_24h"].iloc[-1].items()},
         )

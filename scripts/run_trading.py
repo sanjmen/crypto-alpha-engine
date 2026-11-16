@@ -408,7 +408,12 @@ def main() -> None:
     pairs_strategy = CointegratedPairsStrategy() if args.enable_pairs else None
     use_seven_factor = not args.legacy_allocator
     seven_factor_engine = (
-        SevenFactorOnlineEngine(priors=priors_cfg, f6_min_tstat=f6_gate_cfg)
+        SevenFactorOnlineEngine(
+            priors=priors_cfg,
+            f6_min_tstat=f6_gate_cfg,
+            f5_min_tstat=1.25 if feature_flags.enable_chop_range_arb else None,
+            enable_chop_range_arb=feature_flags.enable_chop_range_arb,
+        )
         if use_seven_factor
         else None
     )
@@ -493,6 +498,7 @@ def main() -> None:
     logger.info(
         f"🚩 Feature Flags & 3 Reglas de Blindaje [{mode.upper()}]: "
         f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
+        f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct*100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
         f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"
     )
