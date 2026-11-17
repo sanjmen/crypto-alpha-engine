@@ -365,3 +365,144 @@ def test_crit_b4_c2_c3_stub_pruning_killswitch_hydration_and_seven_factor_backte
     )
     assert bt_res.final_equity > 0.0
     assert np.isfinite(bt_res.sharpe_ratio)
+
+
+def test_novymarx_bhs_hysteresis_two_phase_safe_ramp_and_8h_funding_clock():
+    """
+    Verifies Multi-Year Champion Mechanisms (2024-2026 Walk-Forward Validated):
+    1. Novy-Marx & Velikov (2016) Buy/Hold Rank Hysteresis (`bhs_enter_top_k=3, bhs_hold_top_k=6`):
+       blocks fresh entries at rank #4-#6, retains existing same-side legs through rank #6 without
+       cliff-eviction, and evicts rank #7+ while preserving 100% dollar neutrality.
+    2. Two-Phase Safe Post-Recovery Ramp (`recovery_boost_equity=3050.0, recovery_boost_leverage=3.2`):
+       holds 2.5x below $3,050 (protecting $2,500 floor), unlocks 3.2x at $3,050, compounds +0.5x
+       steps up to 5.0x, and steps down on drawdowns.
+    3. 8h UTC Funding-Clock Alignment (`00:00:15, 08:00:15, 16:00:15 UTC`) in ShadowTradingDaemon.
+    4. Strict zero-lookahead causality of optional `enable_btc_lead_lag=True` in SevenFactorOnlineEngine.
+    """
+    # 1. Novy-Marx BHS(3, 6) Rank Hysteresis
+    ctrl_bhs = SteppedLeverageController(
+        initial_capital=3000.0,
+        start_leverage=2.5,
+        max_leverage=5.0,
+        dd_bracket=0.06,
+        base_deadband_ratio=(0.04 / 2.2) * 1.25,
+        bhs_enter_top_k=3,
+        bhs_hold_top_k=6,
+        recovery_boost_equity=3050.0,
+        recovery_boost_leverage=3.2,
+    )
+    unit_scores = {
+        "BTCUSDT": 0.14,  # Long rank 0
+        "ETHUSDT": 0.12,  # Long rank 1
+        "SOLUSDT": 0.10,  # Long rank 2 (Top 3 cutoff for fresh entry)
+        "LINKUSDT": 0.06,  # Long rank 3 (4th -> blocked if flat, held if already long!)
+        "AVAXUSDT": 0.05,  # Long rank 4 (5th -> blocked if flat, held if already long!)
+        "ADAUSDT": 0.03,  # Long rank 5 (6th -> held if already long and >=5% leg share)
+        "NEARUSDT": 0.02,  # Long rank 6 (7th -> outside hold_top_k=6 -> evicted!)
+        "XRPUSDT": -0.14,  # Short rank 0
+        "DOGEUSDT": -0.12,  # Short rank 1
+        "BNBUSDT": -0.10,  # Short rank 2
+        "SUIUSDT": -0.06,  # Short rank 3
+        "APTUSDT": -0.04,  # Short rank 4
+        "ARBUSDT": -0.02,
+        "FETUSDT": -0.01,
+        "RENDERUSDT": -0.01,
+    }
+    # Cold start (flat): ONLY Top 3 Longs and Top 3 Shorts may enter
+    w_cold, snap_rec = ctrl_bhs.scale_and_deadband_weights(
+        unit_weights=unit_scores,
+        current_weights=None,
+        current_equity=2721.0,
+        vol_scalar=1.0,
+    )
+    assert set(k for k, v in w_cold.items() if v > 0) == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    assert set(k for k, v in w_cold.items() if v < 0) == {"XRPUSDT", "DOGEUSDT", "BNBUSDT"}
+    assert pytest.approx(sum(w_cold.values()), abs=1e-6) == 0.0
+
+    # Warm hold: LINKUSDT (rank 4th Long) and SUIUSDT (rank 4th Short) are ALREADY open -> retained!
+    # NEARUSDT (rank 7th Long, index 6 >= hold_top_k=6) -> evicted!
+    curr_held = {
+        "BTCUSDT": 0.30,
+        "ETHUSDT": 0.25,
+        "SOLUSDT": 0.20,
+        "LINKUSDT": 0.20,
+        "NEARUSDT": 0.15,
+        "XRPUSDT": -0.35,
+        "DOGEUSDT": -0.30,
+        "BNBUSDT": -0.25,
+        "SUIUSDT": -0.20,
+    }
+    w_warm, _ = ctrl_bhs.scale_and_deadband_weights(
+        unit_weights=unit_scores,
+        current_weights=curr_held,
+        current_equity=2900.0,
+        vol_scalar=1.0,
+    )
+    assert w_warm.get("LINKUSDT", 0.0) > 0.0
+    assert w_warm.get("SUIUSDT", 0.0) < 0.0
+    assert "NEARUSDT" not in w_warm
+    assert pytest.approx(sum(w_warm.values()), abs=1e-6) == 0.0
+
+    # 2. Two-Phase Safe Post-Recovery Ramp ($2,721 -> $3,050 -> $3,510 -> DD step-down)
+    # At $2,721 (HWM=$3,000 < $3,050, DD=9.3% >= 6% bracket): unlocked=2.5x, active_base=2.0x
+    assert pytest.approx(snap_rec.unlocked_tier) == 2.5
+    assert pytest.approx(snap_rec.active_base_leverage) == 2.0
+    assert pytest.approx(snap_rec.next_tier_leverage) == 3.2
+    assert pytest.approx(snap_rec.next_tier_hwm_target) == 3050.0
+
+    # At $2,950 (HWM=$3,000 < $3,050, DD=1.67% < 6%): unlocked=2.5x, active_base=2.5x
+    snap_mid = ctrl_bhs.update_state(current_equity=2950.0, vol_scalar=1.0)
+    assert pytest.approx(snap_mid.unlocked_tier) == 2.5
+    assert pytest.approx(snap_mid.active_base_leverage) == 2.5
+
+    # Crossing $3,050 ($3,060): automatically unlocks Phase 2 base 3.2x!
+    snap_boost = ctrl_bhs.update_state(current_equity=3060.0, vol_scalar=1.0)
+    assert pytest.approx(snap_boost.unlocked_tier) == 3.2
+    assert pytest.approx(snap_boost.active_base_leverage) == 3.2
+
+    # +15% above $3,050 ($3,510): unlocks 3.7x!
+    snap_step1 = ctrl_bhs.update_state(current_equity=3510.0, vol_scalar=1.0)
+    assert pytest.approx(snap_step1.unlocked_tier) == 3.7
+    # A 7% pullback from $3,510 ($3,264) steps down by -0.5x to 3.2x
+    snap_dd = ctrl_bhs.update_state(current_equity=3264.0, vol_scalar=1.0)
+    assert pytest.approx(snap_dd.active_base_leverage) == 3.2
+
+    # 3. 8h UTC Funding-Clock Alignment in ShadowTradingDaemon
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        symbols=["BTC/USDT"],
+        rebalance_interval_sec=28800.0,
+        align_rebalance_to_funding_utc=True,
+        enable_warm_start=False,
+    )
+    t_16_02 = datetime(2026, 11, 17, 16, 2, 0, tzinfo=timezone.utc)
+    daemon.last_rebalance_time = t_16_02
+    # At 19:30 UTC (same 16:00-00:00 window), rebalance is NOT due; countdown points to 00:00:15 UTC
+    t_19_30 = datetime(2026, 11, 17, 19, 30, 0, tzinfo=timezone.utc)
+    assert daemon._is_scheduled_rebalance_due(t_19_30) is False
+    assert pytest.approx(daemon._seconds_until_next_rebalance(t_19_30)) == 4.5 * 3600.0 + 15.0
+    # At 00:00:16 UTC next day, boundary 00:00:15 > 16:02:00 -> rebalance IS due!
+    t_00_00_16 = datetime(2026, 11, 18, 0, 0, 16, tzinfo=timezone.utc)
+    assert daemon._is_scheduled_rebalance_due(t_00_00_16) is True
+    db.close()
+
+    # 4. Strict causality of optional `enable_btc_lead_lag=True`
+    bars_full = _make_bars(n_bars=140, seed=909)
+    eng_ll = SevenFactorOnlineEngine(
+        priors=None,
+        enable_chop_range_arb=True,
+        enable_holistic_regime_shields=True,
+        enable_btc_lead_lag=True,
+    )
+    mats_full = eng_ll.compute_matrices(bars_1h=bars_full)
+    bars_trunc = {k: v.iloc[:100].copy() for k, v in bars_full.items()}
+    # Shock future bars [100:] by +50% and verify bar [99] weights are 100% invariant (0.00e+00 leakage)
+    for k in bars_full:
+        bars_full[k].loc[bars_full[k].index[100:], "close"] *= 1.50
+    mats_shocked = eng_ll.compute_matrices(bars_1h=bars_full)
+    mats_trunc = eng_ll.compute_matrices(bars_1h=bars_trunc)
+    max_diff = float((mats_shocked["w_base_1x"].iloc[99] - mats_trunc["w_base_1x"].iloc[-1]).abs().max())
+    assert max_diff < 1e-12
+    assert pytest.approx(float(mats_full["w_base_1x"].iloc[-1].sum()), abs=1e-6) == 0.0

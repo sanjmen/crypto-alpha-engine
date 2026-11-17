@@ -7,7 +7,7 @@ triggers 8h multi-strategy rebalancing, and settles real funding cashflows in SQ
 
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import threading
@@ -203,6 +203,7 @@ class ShadowTradingDaemon:
         auto_close_anomalies_when_disabled: bool = True,
         enable_intracycle_rebalance: bool = True,
         enable_invariant_audit: bool = True,
+        align_rebalance_to_funding_utc: bool = False,
         feature_flags: FeatureFlags | None = None,
     ):
         self.broker = broker
@@ -211,6 +212,7 @@ class ShadowTradingDaemon:
         self.symbols = symbols or DEFAULT_SHADOW_SYMBOLS
         self.fast_interval_sec = fast_interval_sec
         self.rebalance_interval_sec = rebalance_interval_sec
+        self.align_rebalance_to_funding_utc = bool(align_rebalance_to_funding_utc)
         self.min_rebalance_notional = min_rebalance_notional
         self.turnover_deadband = turnover_deadband
         self.rate_limiter = rate_limiter or ExchangeRateLimiter()
@@ -1470,11 +1472,8 @@ class ShadowTradingDaemon:
             last_tick_iso = self.last_tick_time.isoformat() if self.last_tick_time else ""
             last_reb_iso = self.last_rebalance_time.isoformat() if self.last_rebalance_time else None
 
-            if self.last_rebalance_time:
-                time_since_reb = (datetime.now(timezone.utc) - self.last_rebalance_time).total_seconds()
-                next_reb = max(0.0, self.rebalance_interval_sec - time_since_reb)
-            else:
-                next_reb = 0.0
+            now_hb = datetime.now(timezone.utc)
+            next_reb = self._seconds_until_next_rebalance(now_hb)
 
             hb_status = "HALTED_EQUITY_FLOOR" if self.is_halted else "ONLINE"
             db.update_market_pulse(dict(self.latest_tickers))
@@ -2259,10 +2258,54 @@ class ShadowTradingDaemon:
                 ticks_per_sec=round(tps, 2),
                 last_tick_time=last_tick_iso,
                 last_rebalance_time=self.last_rebalance_time.isoformat(),
-                next_rebalance_in_sec=round(self.rebalance_interval_sec, 1),
+                next_rebalance_in_sec=round(self._seconds_until_next_rebalance(self.last_rebalance_time), 1),
                 status="ONLINE" if self.is_running else "IDLE_ONCE",
             )
         return executed_orders
+
+    @staticmethod
+    def most_recent_funding_aligned_boundary(now_dt: datetime, offset_sec: int = 15) -> datetime:
+        """
+        Returns the most recent Binance 8h funding settlement boundary (`00:00`, `08:00`, `16:00` UTC
+        plus `offset_sec` so closed 1h klines and settled 8h funding rates are finalized) `<= now_dt`.
+        """
+        utc_now = now_dt.astimezone(timezone.utc) if now_dt.tzinfo is not None else now_dt.replace(tzinfo=timezone.utc)
+        slot_hour = (utc_now.hour // 8) * 8
+        candidate = utc_now.replace(hour=slot_hour, minute=0, second=0, microsecond=0) + timedelta(seconds=offset_sec)
+        if candidate > utc_now:
+            candidate -= timedelta(hours=8)
+        return candidate
+
+    @classmethod
+    def next_funding_aligned_rebalance_time(cls, now_dt: datetime, offset_sec: int = 15) -> datetime:
+        """Returns the next upcoming `00:00`, `08:00`, or `16:00` UTC (+ `offset_sec`) boundary `> now_dt`."""
+        return cls.most_recent_funding_aligned_boundary(now_dt, offset_sec=offset_sec) + timedelta(hours=8)
+
+    def _is_scheduled_rebalance_due(self, now_dt: datetime) -> bool:
+        if self.last_rebalance_time is None:
+            return True
+        if self.align_rebalance_to_funding_utc:
+            recent_boundary = self.most_recent_funding_aligned_boundary(now_dt)
+            last_utc = (
+                self.last_rebalance_time.astimezone(timezone.utc)
+                if self.last_rebalance_time.tzinfo is not None
+                else self.last_rebalance_time.replace(tzinfo=timezone.utc)
+            )
+            return last_utc < recent_boundary
+        return (now_dt - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec
+
+    def _seconds_until_next_rebalance(self, now_dt: datetime) -> float:
+        if self.last_rebalance_time is None:
+            return 0.0
+        if self.align_rebalance_to_funding_utc:
+            if self._is_scheduled_rebalance_due(now_dt):
+                return 0.0
+            nxt = self.next_funding_aligned_rebalance_time(now_dt)
+            utc_now = (
+                now_dt.astimezone(timezone.utc) if now_dt.tzinfo is not None else now_dt.replace(tzinfo=timezone.utc)
+            )
+            return max(0.0, (nxt - utc_now).total_seconds())
+        return max(0.0, self.rebalance_interval_sec - (now_dt - self.last_rebalance_time).total_seconds())
 
     def run_funding_cycle(self) -> dict[str, float]:
         """
@@ -2945,20 +2988,7 @@ class ShadowTradingDaemon:
             if anomaly_due:
                 anomaly_orders = self.run_anomaly_scan()
 
-        # 3. Check if rebalance is due (scheduled 4h interval or intra-cycle neutrality drift)
-        rebalance_due = False
-        if self.last_rest_tickers_ok and (
-            self.last_rebalance_time is None
-            or (now - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec
-            or self.is_intracycle_rebalance_needed(now)
-        ):
-            rebalance_due = True
-
-        rebalance_orders = []
-        if rebalance_due:
-            rebalance_orders = self.run_rebalance_cycle()
-
-        # 4. Check if funding settlement is due (00:00, 08:00, 16:00 UTC)
+        # 3. Check if funding settlement is due (00:00, 08:00, 16:00 UTC) BEFORE scheduled rebalance
         funding_due = False
         if (
             now.minute in (0, 1)
@@ -2970,6 +3000,17 @@ class ShadowTradingDaemon:
         funding_cashflows = {}
         if funding_due:
             funding_cashflows = self.run_funding_cycle()
+
+        # 4. Check if rebalance is due (8h UTC funding-aligned clock, fixed interval, or intra-cycle drift)
+        rebalance_due = False
+        if self.last_rest_tickers_ok and (
+            self._is_scheduled_rebalance_due(now) or self.is_intracycle_rebalance_needed(now)
+        ):
+            rebalance_due = True
+
+        rebalance_orders = []
+        if rebalance_due:
+            rebalance_orders = self.run_rebalance_cycle()
 
         # 5. Periodic SQLite TTL Pruning & WAL Compaction (every 6h)
         if (

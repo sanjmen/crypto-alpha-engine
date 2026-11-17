@@ -184,7 +184,59 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast-interval", type=float, default=10.0, help="Fast loop interval in seconds (default: 10.0)"
     )
     parser.add_argument(
-        "--rebalance-interval", type=float, default=14400.0, help="Rebalance interval in seconds (default: 14400 = 4h)"
+        "--rebalance-interval",
+        type=float,
+        default=28800.0,
+        help="Rebalance interval in seconds (default: 28800 = 8h funding-aligned cadence)",
+    )
+    parser.add_argument(
+        "--align-funding-clock",
+        dest="align_funding_clock",
+        action="store_true",
+        default=True,
+        help="Align scheduled rebalances to Binance 8h funding boundaries (00:00, 08:00, 16:00 UTC)",
+    )
+    parser.add_argument(
+        "--no-align-funding-clock",
+        dest="align_funding_clock",
+        action="store_false",
+        help="Use elapsed-seconds rebalance interval instead of UTC funding clock alignment",
+    )
+    parser.add_argument(
+        "--bhs-enter-top-k",
+        type=int,
+        default=3,
+        help="Novy-Marx & Velikov Buy/Hold Spread: top rank required to open a new leg (default: 3)",
+    )
+    parser.add_argument(
+        "--bhs-hold-top-k",
+        type=int,
+        default=6,
+        help="Novy-Marx & Velikov Buy/Hold Spread: rank buffer to retain an open leg without cliff-eviction (default: 6)",
+    )
+    parser.add_argument(
+        "--deadband-mult",
+        type=float,
+        default=1.25,
+        help="Multiplier on proportional turnover deadband (default: 1.25)",
+    )
+    parser.add_argument(
+        "--recovery-boost-equity",
+        type=float,
+        default=3050.0,
+        help="Two-Phase Safe Ramp: HWM equity threshold to unlock post-recovery base leverage (0 disables, default: 3050.0)",
+    )
+    parser.add_argument(
+        "--recovery-boost-leverage",
+        type=float,
+        default=3.2,
+        help="Two-Phase Safe Ramp: base leverage unlocked once HWM >= recovery-boost-equity (default: 3.2x)",
+    )
+    parser.add_argument(
+        "--enable-btc-lead-lag",
+        action="store_true",
+        default=False,
+        help="Enable optional Makarov & Schoar 6h BTC -> Alt lead-lag catch-up tilt inside 7-Factor engine",
     )
     parser.add_argument("--start-leverage", type=float, default=2.5, help="Initial gross leverage tier (default: 2.5x)")
     parser.add_argument(
@@ -698,10 +750,13 @@ def main() -> None:
             f5_min_tstat=1.25 if feature_flags.enable_chop_range_arb else None,
             enable_chop_range_arb=feature_flags.enable_chop_range_arb,
             enable_holistic_regime_shields=feature_flags.enable_holistic_regime_shields,
+            enable_btc_lead_lag=getattr(args, "enable_btc_lead_lag", False),
         )
         if use_seven_factor
         else None
     )
+    eff_rec_eq = getattr(args, "recovery_boost_equity", 0.0)
+    eff_rec_lev = getattr(args, "recovery_boost_leverage", 0.0)
     stepped_leverage_ctrl = (
         SteppedLeverageController(
             initial_capital=effective_capital,
@@ -710,6 +765,13 @@ def main() -> None:
             step_leverage=args.step_leverage,
             gain_per_step=args.milestone_gain,
             dd_bracket=dd_bracket_val,
+            base_deadband_ratio=(0.04 / 2.2) * max(0.5, float(getattr(args, "deadband_mult", 1.25))),
+            bhs_enter_top_k=getattr(args, "bhs_enter_top_k", 3),
+            bhs_hold_top_k=getattr(args, "bhs_hold_top_k", 6),
+            recovery_boost_equity=eff_rec_eq if (eff_rec_eq and eff_rec_eq > 0) else None,
+            recovery_boost_leverage=(
+                eff_rec_lev if (eff_rec_eq and eff_rec_eq > 0 and eff_rec_lev and eff_rec_lev > start_lev) else None
+            ),
         )
         if use_seven_factor
         else None
@@ -719,15 +781,21 @@ def main() -> None:
         if enable_experimental_satellites:
             suite_tag = "Experimental Full Suite"
         elif enable_dynamic_factor_ic:
-            suite_tag = "Dynamic Online IC Core + 100% Maker Priority"
+            suite_tag = "Dynamic Online IC + 8h Funding-Clock + Novy-Marx BHS(3,6)"
         else:
             suite_tag = "Baseline 20d + 100% Maker Priority"
         f6_tag = f"t>={f6_gate_cfg:.2f}" if f6_gate_cfg is not None else "Baseline"
+        ramp_tag = (
+            f" | SafeRamp: {start_lev:.1f}x (<${eff_rec_eq:,.0f}) -> {eff_rec_lev:.1f}x"
+            if (eff_rec_eq and eff_rec_eq > 0 and eff_rec_lev and eff_rec_lev > start_lev)
+            else ""
+        )
         logger.info(
             f"7-Factor Causal Online Engine ENABLED [{mode.upper()} | {suite_tag}] | Capital: ${effective_capital:,.2f} | "
-            f"Stepped Leverage: {start_lev:.1f}x -> {args.max_leverage:.1f}x "
+            f"Stepped Leverage: {start_lev:.1f}x -> {args.max_leverage:.1f}x{ramp_tag} "
             f"(+{args.step_leverage:.1f}x per +{args.milestone_gain * 100:.0f}% HWM | "
-            f"F6 Gate: {f6_tag} | Maker Priority: {args.anomaly_prefer_maker})"
+            f"BHS({getattr(args, 'bhs_enter_top_k', 3)},{getattr(args, 'bhs_hold_top_k', 6)}) | "
+            f"DBx{getattr(args, 'deadband_mult', 1.25):.2f} | F6 Gate: {f6_tag})"
         )
 
     from src.strategies.extreme_anomaly import (
@@ -818,6 +886,7 @@ def main() -> None:
         auto_close_anomalies_when_disabled=feature_flags.auto_close_anomalies_when_disabled,
         enable_intracycle_rebalance=feature_flags.enable_intracycle_rebalance,
         enable_invariant_audit=feature_flags.enable_invariant_audit,
+        align_rebalance_to_funding_utc=bool(use_seven_factor and getattr(args, "align_funding_clock", True)),
         feature_flags=feature_flags,
         min_rebalance_notional=(
             max(21.0, min(50.0, effective_capital * 0.01))

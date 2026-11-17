@@ -319,6 +319,11 @@ def load_drive_market_data(
                     unit_val = "s" if float(f_df[ts_col].iloc[0]) < 1e11 else "ms"
                     f_df["timestamp"] = pd.to_datetime(f_df[ts_col], unit=unit_val, utc=True)
                 f_df.set_index("timestamp", inplace=True)
+            if "funding_rate" not in f_df.columns:
+                for alt_c in ("fundingRate", "rate"):
+                    if alt_c in f_df.columns:
+                        f_df["funding_rate"] = f_df[alt_c].astype(float)
+                        break
             f_df.sort_index(inplace=True)
             funding_dict[sym] = f_df
 
@@ -377,8 +382,12 @@ def run_simulation(
     anomaly_size: float = 15.0,
     enable_chop_arb: bool = True,
     enable_holistic_shields: bool = True,
-    start_leverage: float = 3.5,
+    start_leverage: float = 2.5,
     max_leverage: float = 5.0,
+    bhs_enter_top_k: int | None = 3,
+    bhs_hold_top_k: int | None = 6,
+    deadband_mult: float = 1.25,
+    enable_btc_lead_lag: bool = False,
 ) -> BacktestResult:
     """
     Executes historical portfolio simulation across any supported strategy (`seven_factor`,
@@ -418,15 +427,56 @@ def run_simulation(
     funding_df = pd.DataFrame(funding_dfs)
 
     if strategy_name == "seven_factor":
-        volume_dfs = {sym: bars_dict[sym]["volume"].reindex(master_idx).ffill().fillna(0.0) for sym in valid_symbols}
-        volume_df = pd.DataFrame(volume_dfs)
-        raw_funding_dfs = {}
+        full_anchor_idx = bars_dict[anchor_sym].index
+        warmup_start_ts = (
+            (pd.Timestamp(start_date, tz="UTC") - pd.Timedelta(hours=960)) if start_date else full_anchor_idx.min()
+        )
+        end_bound_ts = master_idx.max()
+        calc_idx = full_anchor_idx[(full_anchor_idx >= warmup_start_ts) & (full_anchor_idx <= end_bound_ts)]
+
+        bars_1h_in: dict[str, pd.DataFrame] = {}
+        fnd_in: dict[str, pd.DataFrame] = {}
+        tf_in: dict[str, pd.DataFrame] = {}
+        present_mask = pd.DataFrame(False, index=calc_idx, columns=valid_symbols)
+        open_mat = pd.DataFrame(index=calc_idx, columns=valid_symbols, dtype=float)
+        high_mat = pd.DataFrame(index=calc_idx, columns=valid_symbols, dtype=float)
+        low_mat = pd.DataFrame(index=calc_idx, columns=valid_symbols, dtype=float)
+
         for sym in valid_symbols:
+            d_s = bars_dict[sym]
+            d_s = d_s[~d_s.index.duplicated(keep="last")].sort_index()
+            sub_s = d_s.loc[(d_s.index >= warmup_start_ts) & (d_s.index <= end_bound_ts)].copy()
+            if sub_s.empty:
+                continue
+            s_close_re = sub_s["close"].reindex(calc_idx)
+            min_list_bars = min(168, max(12, len(calc_idx) // 4))
+            present_mask[sym] = (
+                s_close_re.notna().rolling(min_list_bars, min_periods=min_list_bars).sum() >= min_list_bars
+            ).fillna(False)
+            open_mat[sym] = sub_s["open"].reindex(calc_idx).ffill().bfill()
+            high_mat[sym] = sub_s["high"].reindex(calc_idx).ffill().bfill()
+            low_mat[sym] = sub_s["low"].reindex(calc_idx).ffill().bfill()
+
+            sub_df = sub_s.reset_index().rename(columns={sub_s.index.name or "index": "timestamp"})
+            bars_1h_in[sym] = sub_df
+            if "taker_buy_vol" in sub_s.columns and sub_s["taker_buy_vol"].notna().mean() > 0.80:
+                tf_in[sym] = pd.DataFrame(
+                    {
+                        "timestamp": sub_s.index,
+                        "quote_volume": (sub_s["close"].astype(float) * sub_s["volume"].astype(float)).values,
+                        "taker_buy_quote_volume": (
+                            sub_s["close"].astype(float) * sub_s["taker_buy_vol"].astype(float)
+                        ).values,
+                    }
+                )
             if sym in funding_dict and not funding_dict[sym].empty:
-                raw_funding_dfs[sym] = funding_dict[sym]["funding_rate"].reindex(master_idx, method="ffill").fillna(0.0)
-            else:
-                raw_funding_dfs[sym] = pd.Series(0.0, index=master_idx)
-        raw_funding_df = pd.DataFrame(raw_funding_dfs)
+                fd_s = funding_dict[sym]
+                fd_s = fd_s[~fd_s.index.duplicated(keep="last")].sort_index()
+                fd_sub = fd_s.loc[(fd_s.index >= warmup_start_ts) & (fd_s.index <= end_bound_ts)]
+                if not fd_sub.empty:
+                    fnd_in[sym] = pd.DataFrame(
+                        {"timestamp": fd_sub.index, "fundingRate": fd_sub["funding_rate"].values}
+                    )
 
         engine = SevenFactorOnlineEngine(
             priors=None,
@@ -434,18 +484,35 @@ def run_simulation(
             f5_min_tstat=1.25 if enable_chop_arb else None,
             enable_chop_range_arb=enable_chop_arb,
             enable_holistic_regime_shields=enable_holistic_shields,
+            enable_btc_lead_lag=enable_btc_lead_lag,
         )
-        high_df = pd.DataFrame({sym: bars_dict[sym]["high"].reindex(master_idx).ffill() for sym in valid_symbols})
-        low_df = pd.DataFrame({sym: bars_dict[sym]["low"].reindex(master_idx).ffill() for sym in valid_symbols})
-        unit_weights_df, mats = engine.compute_weights_matrix(
-            close=close_df,
-            volume=volume_df,
-            raw_funding=raw_funding_df,
-            funding_settlement=funding_df,
-            high=high_df,
-            low=low_df,
+        mats = engine.compute_matrices(
+            bars_1h=bars_1h_in,
+            funding_rates=fnd_in if fnd_in else None,
+            taker_flow=tf_in if tf_in else None,
         )
-        vol_scalar_s = mats["vol_scalar"]
+        w_raw = mats["w_base_1x"].reindex(index=calc_idx, columns=valid_symbols).fillna(0.0).where(present_mask, 0.0)
+        og_s = mats["w_base_1x"].reindex(calc_idx).abs().sum(axis=1).fillna(0.0)
+        pos_w = w_raw.clip(lower=0.0)
+        neg_w = (-w_raw).clip(lower=0.0)
+        ps_w = pos_w.sum(axis=1)
+        ns_w = neg_w.sum(axis=1)
+        vld_w = (ps_w > 1e-10) & (ns_w > 1e-10) & (og_s > 1e-10)
+        w_clean = (
+            pos_w.div(ps_w.replace(0, 1.0), axis=0).mul(og_s / 2.0, axis=0)
+            - neg_w.div(ns_w.replace(0, 1.0), axis=0).mul(og_s / 2.0, axis=0)
+        ).mul(vld_w.astype(float), axis=0)
+
+        eval_idx = master_idx if start_date else master_idx[min(72, len(master_idx) // 5) :]
+        w1x_sh = w_clean.shift(1).fillna(0.0).reindex(eval_idx).values.astype(float)
+        vol_sh = mats["vol_scalar"].shift(1).fillna(1.0).reindex(eval_idx).values.astype(float)
+        chop_sh = mats["alpha_chop_overlay"].shift(1).fillna(0.0).reindex(eval_idx).values.astype(float)
+        c_arr = mats["close"].reindex(index=eval_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+        o_arr = open_mat.reindex(index=eval_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+        h_arr = high_mat.reindex(index=eval_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+        l_arr = low_mat.reindex(index=eval_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+        f_arr = funding_df.reindex(index=eval_idx, columns=valid_symbols).fillna(0.0).values.astype(float)
+
         ctrl = SteppedLeverageController(
             initial_capital=initial_capital,
             start_leverage=start_leverage,
@@ -453,39 +520,174 @@ def run_simulation(
             step_leverage=0.5,
             gain_per_step=0.15,
             dd_bracket=0.06,
+            base_deadband_ratio=(0.04 / 2.2) * max(0.5, float(deadband_mult)),
+            bhs_enter_top_k=bhs_enter_top_k,
+            bhs_hold_top_k=bhs_hold_top_k,
         )
-        lookback = min(720, max(72, len(master_idx) // 5))
-        current_w = {sym: 0.0 for sym in valid_symbols}
-        weights_records = {}
+
+        n_b, n_s = len(eval_idx), len(valid_symbols)
+        curr_w = np.zeros(n_s, dtype=float)
+        entry_px = np.zeros(n_s, dtype=float)
+        lock_armed = np.zeros(n_s, dtype=bool)
+        cooldown_until = np.zeros((n_s, 2), dtype=int)
+        net_rets = np.zeros(n_b, dtype=float)
+        gross_rets = np.zeros(n_b, dtype=float)
+        fee_rets = np.zeros(n_b, dtype=float)
+        fnd_rets = np.zeros(n_b, dtype=float)
+        eq_arr = np.zeros(n_b, dtype=float)
+        turn_bars = np.zeros(n_b, dtype=float)
         sim_eq = initial_capital
+        hrs_utc = eval_idx.hour.values
 
-        for i in range(len(master_idx)):
-            ts = master_idx[i]
-            if i >= lookback:
-                bar_ret = float(sum(current_w.get(sym, 0.0) * float(returns_df[sym].iloc[i]) for sym in valid_symbols))
-                sim_eq = max(100.0, sim_eq * (1.0 + bar_ret))
-                if (i - lookback) % rebalance_freq_bars == 0:
-                    w_unit = {sym: float(unit_weights_df[sym].iloc[i]) for sym in valid_symbols}
-                    v_sc = float(vol_scalar_s.iloc[i])
-                    scaled_w, _ = ctrl.scale_and_deadband_weights(
-                        unit_weights=w_unit,
-                        current_weights=current_w,
-                        current_equity=sim_eq,
-                        vol_scalar=v_sc,
+        base_maker_cost = 0.0002 if execution_mode == "maker" else (0.0006 if execution_mode == "taker" else 0.0001)
+        fallback_cost = 0.0002 if execution_mode == "maker" else (0.0006 if execution_mode == "taker" else 0.00085)
+
+        for t in range(n_b):
+            prev_c = c_arr[t - 1] if t > 0 else o_arr[0]
+            cur_o, cur_h, cur_l, cur_c = o_arr[t], h_arr[t], l_arr[t], c_arr[t]
+            gap_ret = np.where(prev_c > 0, (cur_o - prev_c) / prev_c, 0.0)
+            bar_gross = float(np.sum(curr_w * gap_ret))
+            bar_fee = 0.0
+            bar_turn = 0.0
+
+            is_reb = (hrs_utc[t] % 8 == 0) if rebalance_freq_bars == 8 else (t % max(1, rebalance_freq_bars) == 0)
+            if is_reb:
+                raw_u = w1x_sh[t].copy()
+                for s_i in range(n_s):
+                    if raw_u[s_i] > 0 and t < cooldown_until[s_i, 0] or raw_u[s_i] < 0 and t < cooldown_until[s_i, 1]:
+                        raw_u[s_i] = 0.0
+                pl = float(np.maximum(raw_u, 0.0).sum())
+                nl = float(np.maximum(-raw_u, 0.0).sum())
+                og = float(np.abs(w1x_sh[t]).sum())
+                if pl > 1e-9 and nl > 1e-9 and og > 1e-9:
+                    raw_u = np.where(
+                        raw_u > 0, raw_u * ((og / 2.0) / pl), np.where(raw_u < 0, raw_u * ((og / 2.0) / nl), 0.0)
                     )
-                    current_w = scaled_w
-            weights_records[ts] = current_w.copy()
+                else:
+                    raw_u[:] = 0.0
+                u_dict = {valid_symbols[s_i]: float(raw_u[s_i]) for s_i in range(n_s)}
+                prev_dict = (
+                    {valid_symbols[s_i]: float(curr_w[s_i]) for s_i in range(n_s)}
+                    if np.any(np.abs(curr_w) > 1e-8)
+                    else None
+                )
+                scaled_d, _ = ctrl.scale_and_deadband_weights(
+                    unit_weights=u_dict,
+                    current_weights=prev_dict,
+                    current_equity=sim_eq,
+                    vol_scalar=float(vol_sh[t]),
+                )
+                desired_w = np.array([scaled_d.get(sym, 0.0) for sym in valid_symbols], dtype=float)
+                for s_i in range(n_s):
+                    dw = desired_w[s_i] - curr_w[s_i]
+                    if abs(dw) < 1e-6:
+                        continue
+                    touched = (
+                        (cur_l[s_i] <= cur_o[s_i] * (1.0 - 0.0002))
+                        if dw > 0
+                        else (cur_h[s_i] >= cur_o[s_i] * (1.0 + 0.0002))
+                    )
+                    bar_turn += abs(dw)
+                    if touched:
+                        bar_fee += abs(dw) * base_maker_cost
+                    else:
+                        reducing = (curr_w[s_i] * desired_w[s_i] < -1e-9) or (abs(desired_w[s_i]) < abs(curr_w[s_i]))
+                        bar_fee += abs(dw) * (0.00060 if (reducing and execution_mode == "hybrid") else fallback_cost)
+                    if abs(desired_w[s_i]) < 1e-8:
+                        entry_px[s_i] = 0.0
+                        lock_armed[s_i] = False
+                    elif abs(curr_w[s_i]) < 1e-8 or (curr_w[s_i] * desired_w[s_i] < 0):
+                        entry_px[s_i] = cur_o[s_i]
+                        lock_armed[s_i] = False
+                    elif abs(desired_w[s_i]) > abs(curr_w[s_i]) + 1e-6:
+                        add_w = abs(desired_w[s_i]) - abs(curr_w[s_i])
+                        entry_px[s_i] = (abs(curr_w[s_i]) * entry_px[s_i] + add_w * cur_o[s_i]) / abs(desired_w[s_i])
+                curr_w = desired_w
 
-        weights_df = pd.DataFrame.from_dict(weights_records, orient="index").reindex(master_idx).fillna(0.0)
-        backtester = VectorizedBacktester(
-            initial_capital=initial_capital,
-            taker_fee=0.0005,
-            maker_fee=0.0002,
-            slippage_bps=1.0,
-            execution_mode=execution_mode,
-            turnover_deadband=0.0,  # Already applied proportionally by SteppedLeverageController
+            tp_tgt = 0.032 if chop_sh[t] >= 0.35 else 0.050
+            for s_i in range(n_s):
+                w_i = curr_w[s_i]
+                if abs(w_i) < 1e-8 or entry_px[s_i] <= 0:
+                    continue
+                sgn = 1.0 if w_i > 0 else -1.0
+                ep = entry_px[s_i]
+                pnl_open = sgn * (cur_o[s_i] - ep) / ep
+                fav_pnl = sgn * ((cur_h[s_i] if sgn > 0 else cur_l[s_i]) - ep) / ep
+                adv_pnl = sgn * ((cur_l[s_i] if sgn > 0 else cur_h[s_i]) - ep) / ep
+                exited = False
+                exit_px = cur_c[s_i]
+                exit_fee = 0.0002
+                if lock_armed[s_i]:
+                    if pnl_open <= 0.015:
+                        exit_px, exit_fee, exited = cur_o[s_i], 0.00055, True
+                    elif adv_pnl <= 0.015:
+                        exit_px, exit_fee, exited = ep * (1.0 + sgn * 0.015), 0.00055, True
+                    elif fav_pnl >= tp_tgt:
+                        exit_px = cur_o[s_i] if pnl_open >= tp_tgt else ep * (1.0 + sgn * tp_tgt)
+                        exit_fee, exited = 0.00020, True
+                else:
+                    if pnl_open >= tp_tgt:
+                        exit_px, exit_fee, exited = cur_o[s_i], 0.00020, True
+                    elif fav_pnl >= tp_tgt:
+                        exit_px, exit_fee, exited = ep * (1.0 + sgn * tp_tgt), 0.00020, True
+                    elif fav_pnl >= 0.035:
+                        lock_armed[s_i] = True
+                if exited:
+                    bar_gross += w_i * ((exit_px - cur_o[s_i]) / cur_o[s_i])
+                    bar_fee += abs(w_i) * exit_fee
+                    bar_turn += abs(w_i)
+                    cooldown_until[s_i, 0 if sgn > 0 else 1] = t + 4
+                    curr_w[s_i] = 0.0
+                    entry_px[s_i] = 0.0
+                    lock_armed[s_i] = False
+                else:
+                    bar_gross += w_i * ((cur_c[s_i] - cur_o[s_i]) / cur_o[s_i])
+
+            bar_fnd = -float(np.sum(curr_w * f_arr[t]))
+            nr_t = bar_gross - bar_fee + bar_fnd
+            sim_eq = max(0.0, sim_eq * (1.0 + nr_t))
+            eq_arr[t] = sim_eq
+            net_rets[t] = nr_t
+            gross_rets[t] = bar_gross
+            fee_rets[t] = bar_fee
+            fnd_rets[t] = bar_fnd
+            turn_bars[t] = bar_turn
+
+        eq_s = pd.Series(eq_arr, index=eval_idx)
+        nr_s = pd.Series(net_rets, index=eval_idx)
+        dd_s = ((eq_s - eq_s.cummax().replace(0.0, np.nan)) / eq_s.cummax().replace(0.0, np.nan)).fillna(0.0)
+        tot_ret_pct = float((eq_s.iloc[-1] / initial_capital - 1.0) * 100.0) if len(eq_s) > 0 else 0.0
+        cagr_v = (
+            float(((eq_s.iloc[-1] / initial_capital) ** (8760.0 / max(1, len(nr_s))) - 1.0) * 100.0)
+            if len(eq_s) > 0 and eq_s.iloc[-1] > 0
+            else -100.0
         )
-        return backtester.run(returns_df=returns_df, weights_df=weights_df, funding_rates_df=funding_df)
+        mu_r = float(nr_s.mean())
+        sd_r = max(float(nr_s.std()), 1e-8)
+        neg_r = nr_s[nr_s < 0]
+        dsd_r = max(float(neg_r.std()) if len(neg_r) > 1 else 1e-8, 1e-8)
+        max_dd_v = float(abs(dd_s.min()) * 100.0)
+        act_cnt = int((nr_s != 0).sum())
+        win_pct = float((nr_s > 0).sum() / act_cnt * 100.0) if act_cnt > 0 else 0.0
+        pf_v = float(nr_s[nr_s > 0].sum() / max(abs(float(neg_r.sum())), 1e-8))
+        return BacktestResult(
+            total_return_pct=tot_ret_pct,
+            cagr_pct=cagr_v,
+            annualized_vol_pct=float(sd_r * np.sqrt(8760.0) * 100.0),
+            sharpe_ratio=float((mu_r / sd_r) * np.sqrt(8760.0)),
+            sortino_ratio=float((mu_r / dsd_r) * np.sqrt(8760.0)),
+            max_drawdown_pct=max_dd_v,
+            calmar_ratio=float(cagr_v / max_dd_v) if max_dd_v > 0 else 0.0,
+            total_trades=int((turn_bars > 0.01).sum()),
+            win_rate_pct=win_pct,
+            profit_factor=pf_v,
+            gross_return_pct=float(gross_rets.sum() * 100.0),
+            total_fees_pct=float(fee_rets.sum() * 100.0),
+            total_funding_pnl_pct=float(fnd_rets.sum() * 100.0),
+            total_turnover=float(turn_bars.sum()),
+            equity_curve=eq_s,
+            drawdown_curve=dd_s,
+        )
 
     # Legacy & Satellite Strategies (`meta`, `momentum`, `stat_arb`, `carry`, `anomalies`)
     use_anoms = enable_anomalies or (strategy_name == "anomalies")
@@ -841,26 +1043,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Path to local Parquet cache."
     )
-    parser.add_argument("--rebalance-freq", type=int, default=4, help="Rebalancing frequency in 1h bars (default: 4).")
+    parser.add_argument(
+        "--rebalance-freq",
+        type=int,
+        default=8,
+        help="Rebalancing frequency in 1h bars (default: 8h funding-aligned UTC).",
+    )
     parser.add_argument(
         "--execution-mode",
         choices=["taker", "maker", "hybrid"],
-        default="maker",
-        help="Execution mode (maker=0.02%% passive, taker=0.04%% market+slip, hybrid).",
+        default="hybrid",
+        help="Execution mode (maker=0.02%% passive, taker=0.05%% market+slip, hybrid=75%% maker / 25%% taker).",
     )
     parser.add_argument(
         "--turnover-deadband", type=float, default=0.04, help="Turnover deadband threshold (default: 0.04)."
     )
     parser.add_argument(
-        "--capital", type=float, default=1000.0, help="Initial portfolio capital in USDT (default: 1000.0)."
+        "--deadband-mult",
+        type=float,
+        default=1.25,
+        help="Proportional deadband multiplier for seven_factor (default: 1.25).",
+    )
+    parser.add_argument(
+        "--bhs-enter-top-k",
+        type=int,
+        default=3,
+        help="Novy-Marx Buy/Hold Spread entry rank cutoff (default: 3).",
+    )
+    parser.add_argument(
+        "--bhs-hold-top-k",
+        type=int,
+        default=6,
+        help="Novy-Marx Buy/Hold Spread hold rank buffer (default: 6).",
+    )
+    parser.add_argument(
+        "--enable-btc-lead-lag",
+        action="store_true",
+        default=False,
+        help="Enable optional 6h BTC -> Alt lead-lag catch-up tilt inside seven_factor.",
+    )
+    parser.add_argument(
+        "--capital", type=float, default=3000.0, help="Initial portfolio capital in USDT (default: 3000.0)."
     )
     parser.add_argument("--start", type=str, default=None, help="Backtest start date (YYYY-MM-DD).")
     parser.add_argument("--end", type=str, default=None, help="Backtest end date (YYYY-MM-DD).")
     parser.add_argument(
         "--start-leverage",
         type=float,
-        default=3.5,
-        help="Initial gross leverage tier for seven_factor (default: 3.5x).",
+        default=2.5,
+        help="Initial gross leverage tier for seven_factor (default: 2.5x).",
     )
     parser.add_argument(
         "--max-leverage",
@@ -965,6 +1196,10 @@ def main() -> None:
         enable_holistic_shields=args.enable_holistic_shields,
         start_leverage=args.start_leverage,
         max_leverage=args.max_leverage,
+        bhs_enter_top_k=args.bhs_enter_top_k,
+        bhs_hold_top_k=args.bhs_hold_top_k,
+        deadband_mult=args.deadband_mult,
+        enable_btc_lead_lag=args.enable_btc_lead_lag,
     )
 
     print("\n📈 Portfolio Equity Curve:")

@@ -243,6 +243,8 @@ class SevenFactorOnlineEngine:
         chop_max_alpha: float = 0.75,
         enable_holistic_regime_shields: bool = False,
         enable_no_edge_gate: bool | None = None,
+        enable_btc_lead_lag: bool = False,
+        btc_lead_lag_strength: float = 0.16,
     ) -> None:
         self.lookbacks = lookbacks
         if priors is _UNSET_PRIORS:
@@ -277,6 +279,8 @@ class SevenFactorOnlineEngine:
             if enable_no_edge_gate is not None
             else bool(self._zero_priors or self.enable_holistic_regime_shields)
         )
+        self.enable_btc_lead_lag = bool(enable_btc_lead_lag)
+        self.btc_lead_lag_strength = float(btc_lead_lag_strength)
         self.min_tstat_by_factor: dict[str, float] = dict(min_tstat_by_factor or {})
         if eff_liq_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
             self.min_tstat_by_factor["liq"] = float(eff_liq_min_tstat)
@@ -1121,6 +1125,19 @@ class SevenFactorOnlineEngine:
                 .where(~((comb_w > 0.0) & retail_long_trap), 0.55 * comb_w)
                 .where(~((comb_w < 0.0) & retail_long_trap), 1.10 * comb_w)
             )
+
+        # Optional Literature Overlay (Makarov & Schoar / Dobrynskaya): BTC -> Alt 6h Lead-Lag Spillover Catch-Up
+        if self.enable_btc_lead_lag and self.btc_lead_lag_strength > 0.0 and len(cols) >= 3:
+            btc_r6 = btc_ret.rolling(6, min_periods=2).sum()
+            btc_v24 = vol_24h[btc_col] if btc_col in vol_24h.columns else vol_24h.mean(axis=1)
+            btc_v6 = (btc_v24 * np.sqrt(6.0)).clip(lower=1e-4)
+            btc_impulse = (btc_r6 / btc_v6).clip(-4.0, 4.0)
+            alt_r6 = rets_1h.rolling(6, min_periods=2).sum()
+            catchup_gap = (beta_72.mul(btc_r6, axis=0) - alt_r6) / (vol_24h * np.sqrt(6.0)).clip(lower=1e-4)
+            impulse_gate = ((btc_impulse.abs() - 0.90) / 1.20).clip(0.0, 1.0)
+            w_ll = make_continuous_neutral_weights(catchup_gap, inv_vol, gross_leverage=1.0, power=1.5)
+            alpha_ll = (impulse_gate * self.btc_lead_lag_strength).clip(0.0, 0.25)
+            comb_w = comb_w.mul(1.0 - alpha_ll, axis=0) + w_ll.mul(alpha_ll, axis=0)
 
         # Retoque 1C (Nov 1): Causal Cross-Sectional Composite Score Smoothing (EMA span=3h)
         # Prevents single-bar 24h return oscillations from flipping individual coins Long <-> Short
