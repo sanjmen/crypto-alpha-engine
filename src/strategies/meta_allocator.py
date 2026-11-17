@@ -10,7 +10,7 @@ Nets overlapping position requests to minimize transaction turnover and exchange
 import pandas as pd
 
 from src.domain.entities import Portfolio
-from src.domain.enums import MarketRegime
+from src.domain.enums import MarketRegime, PositionSide
 from src.models.regime_classifier import MarketRegimeClassifier
 from src.risk.hrp_allocator import HierarchicalRiskParity
 from src.risk.stepped_leverage import LeverageStateSnapshot, SteppedLeverageController
