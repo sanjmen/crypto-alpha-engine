@@ -249,8 +249,9 @@ class SteppedLeverageController:
             if pos_updated.sum() > 1e-10 and np.abs(neg_updated.sum()) > 1e-10:
                 net_drift = abs(float(pos_updated.sum()) - float(np.abs(neg_updated.sum())))
                 gross_updated = float(pos_updated.sum()) + float(np.abs(neg_updated.sum()))
-                if net_drift > 0.025 or gross_updated > effective_leverage + 1e-6:
-                    avg_leg = min(effective_leverage / 2.0, 0.5 * gross_updated)
+                eff_gross_cap = target_gross if initial_gross > 1e-8 else effective_leverage
+                if net_drift > 0.025 or gross_updated > eff_gross_cap + 1e-6:
+                    avg_leg = min(eff_gross_cap / 2.0, 0.5 * gross_updated)
                     pos_updated = pos_updated * (avg_leg / pos_updated.sum())
                     neg_updated = neg_updated * (avg_leg / np.abs(neg_updated.sum()))
                     updated = pos_updated + neg_updated

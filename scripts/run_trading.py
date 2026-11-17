@@ -842,9 +842,13 @@ def main() -> None:
             float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < 0.0
             for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
-        has_unshielded_concentration = (
-            feature_flags.enable_holistic_regime_shields
-            and max((float(v) for v in prev_w.values()), default=0.0) > 0.60
+        has_unshielded_concentration = feature_flags.enable_holistic_regime_shields and (
+            max((float(v) for v in prev_w.values()), default=0.0) > 0.50
+            or (
+                float(sf_prev.get("vol_scalar") or 0.0) > 0.75
+                and float(prev_t.get("macro", 0.0)) <= 0.10
+                and float(prev_t.get("fast", 0.0)) <= 0.10
+            )
         )
         tier_changed = abs(float(sf_prev.get("unlocked_tier") or start_lev) - start_lev) > 0.1
         if has_legacy_prior_weights or has_unshielded_concentration or tier_changed:

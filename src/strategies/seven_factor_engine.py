@@ -1293,6 +1293,70 @@ class SevenFactorOnlineEngine:
                     )
                 alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lm)
 
+                # 3) Lone-Rev Concentration Cap & Active Bleed/Squeeze Guard:
+                #    When `F4_Rev` monopolizes the book (`fw_rev > 0.50`) while both `t_macro <= 0.15` and `t_fast <= 0.10`,
+                #    caps `fw_rev <= 0.45`, rotates >= 55% into Intra-Sector Relative-Value (`w_sect_u + w_range_u`),
+                #    dampens catching falling knives (e.g. bleeding laggards) or shorting rising leaders, and scales
+                #    down gross conviction to 0.65.
+                t_mac_s = t_df["macro"]
+                is_lone_rev = (fw_norm["rev"] > 0.50) & (t_mac_s <= 0.15) & (t_fst_s <= 0.10)
+                if is_lone_rev.any():
+                    w_sect_rv_spec = make_continuous_neutral_weights(
+                        0.55 * w_sect_u + 0.45 * w_range_u,
+                        ones_df,
+                        gross_leverage=1.0,
+                        power=1.2,
+                    )
+                    if has_wf or has_cl:
+                        w_sect_rv_spec = cap_side_weights_waterfill(
+                            w_sect_rv_spec,
+                            max_side_share=0.22,
+                            max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                        )
+                    blend_lr = (((fw_norm["rev"] - 0.40) / 0.40).clip(0.45, 0.65)).where(is_lone_rev, 0.0)
+                    w_blended_lr = w_base_1x.mul(1.0 - blend_lr, axis=0) + w_sect_rv_spec.mul(0.60 * blend_lr, axis=0)
+                    active_bleed_long = (
+                        is_lone_rev.values[:, None]
+                        & (w_blended_lr > 0.0)
+                        & (zi[24] < -0.20)
+                        & ((zi[12] < -0.15) | (zr[4] < -0.05))
+                        & (cmf_24 <= 0.02)
+                    )
+                    active_leader_short = (
+                        is_lone_rev.values[:, None]
+                        & (w_blended_lr < 0.0)
+                        & (zi[24] > 0.20)
+                        & ((zi[12] > 0.15) | (zr[4] > 0.05))
+                    )
+                    w_guarded_lr = w_blended_lr.where(~active_bleed_long, 0.15 * w_blended_lr).where(
+                        ~active_leader_short, 0.15 * w_blended_lr
+                    )
+                    pos_lr = w_guarded_lr.clip(lower=0.0)
+                    neg_lr = (-w_guarded_lr).clip(lower=0.0)
+                    ps_lr = pos_lr.sum(axis=1).replace(0, 1.0)
+                    ns_lr = neg_lr.sum(axis=1).replace(0, 1.0)
+                    lr_gross_scale = pd.Series(np.where(is_lone_rev, 0.65, 1.0), index=idx)
+                    target_g_lr = w_base_1x.abs().sum(axis=1) * lr_gross_scale
+                    w_norm_lr = pos_lr.div(ps_lr, axis=0).mul(target_g_lr / 2.0, axis=0) - neg_lr.div(
+                        ns_lr, axis=0
+                    ).mul(target_g_lr / 2.0, axis=0)
+                    if has_wf or has_cl:
+                        w_norm_lr = cap_side_weights_waterfill(
+                            w_norm_lr,
+                            max_side_share=0.22,
+                            max_cluster_share=self.alt_cluster_cap if has_cl else None,
+                        )
+                    w_base_1x.loc[is_lone_rev] = w_norm_lr.loc[is_lone_rev]
+                    conviction = conviction.where(~is_lone_rev, np.minimum(conviction, 0.65))
+                    alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lr)
+                    excess_rev = (fw_norm["rev"] - 0.45).clip(lower=0.0).where(is_lone_rev, 0.0)
+                    fw_norm = fw_norm.copy()
+                    fw_norm["rev"] = fw_norm["rev"] - excess_rev
+                    other_cols = [c for c in fw_norm.columns if c != "rev"]
+                    other_sum = fw_norm[other_cols].sum(axis=1).replace(0, 1.0)
+                    for oc in other_cols:
+                        fw_norm[oc] = fw_norm[oc] + excess_rev * (fw_norm[oc] / other_sum)
+
                 is_bull_surge = (btc_ret_24h > 0.016) & (max_tr_t > 0.0) & (alpha_chop_overlay < 0.25)
                 coiled_laggard_short = (
                     is_bull_surge.values[:, None]
@@ -1347,6 +1411,13 @@ class SevenFactorOnlineEngine:
             .clip(self.vol_scalar_bounds[0], self.vol_scalar_bounds[1])
             .fillna(1.0)
         )
+        if self.enable_holistic_regime_shields and all(k in t_df.columns for k in ("macro", "fast", "rev")):
+            is_weak_trend_chop = (t_df["macro"] <= 0.10) & (t_df["fast"] <= 0.10)
+            vol_scalar = pd.Series(
+                np.where(is_weak_trend_chop, np.minimum(vol_scalar, 0.68), vol_scalar),
+                index=idx,
+                dtype=float,
+            )
 
         return {
             "close": close,
