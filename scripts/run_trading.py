@@ -275,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--equity-floor-usd",
         type=float,
         default=None,
-        help="Regla #2: Hard capital floor in USDT that flattens all positions and halts trading (default: 2600.0 in --mainnet)",
+        help="Regla #2: Hard capital floor in USDT that flattens all positions and halts trading (default: 2500.0 in --mainnet)",
     )
     parser.add_argument(
         "--max-24h-dd",
@@ -829,31 +829,23 @@ def main() -> None:
             )
         ),
     )
-    # In --shadow mode, automatically trigger an immediate rebalance on startup so new experimental changes apply right away
+    # In --shadow mode (or when --rebalance-now is explicitly requested), trigger an immediate rebalance on startup.
+    # In --mainnet mode, preserve the scheduled 4h cadence (`daemon.last_rebalance_time` from SQLite) so container
+    # restarts / deployments never induce spurious mid-bar portfolio churn, EXCEPT a one-time migration when
+    # upgrading a DB that still carries legacy static-prior weights (weight > 5% on a negative-tstat factor).
     if getattr(args, "rebalance_now", False) or (mode == "shadow"):
         daemon.last_rebalance_time = None
     elif mode == "mainnet" and priors_cfg is None and hasattr(db, "get_latest_seven_factor_telemetry"):
-        # Issue #61: Auto-trigger a one-time rebalance when upgrading Mainnet from static
-        # BASELINE_20D_PRIORS or from pre-shield single-factor concentration (>60% in a single factor)
         sf_prev = db.get_latest_seven_factor_telemetry() or {}
         prev_w = sf_prev.get("factor_weights") or {}
         prev_t = sf_prev.get("factor_tstats") or {}
         has_legacy_prior_weights = any(
-            float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < 0.0
+            float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < -0.05
             for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
-        has_unshielded_concentration = feature_flags.enable_holistic_regime_shields and (
-            max((float(v) for v in prev_w.values()), default=0.0) > 0.50
-            or (
-                float(sf_prev.get("vol_scalar") or 0.0) > 0.75
-                and float(prev_t.get("macro", 0.0)) <= 0.10
-                and float(prev_t.get("fast", 0.0)) <= 0.10
-            )
-        )
-        tier_changed = abs(float(sf_prev.get("unlocked_tier") or start_lev) - start_lev) > 0.1
-        if has_legacy_prior_weights or has_unshielded_concentration or tier_changed:
+        if has_legacy_prior_weights:
             logger.info(
-                "🚀 [Holistic Shields / Dynamic IC Upgrade] Unshielded factor concentration (>60%) or tier change detected — scheduling immediate rebalance."
+                "🚀 [Dynamic Online IC Migration] Legacy static-prior factor weights detected — scheduling one-time rebalance."
             )
             daemon.last_rebalance_time = None
 
@@ -874,7 +866,8 @@ def main() -> None:
         def handle_sigint(sig, frame):
             logger.info("Termination signal received. Shutting down daemon...")
             daemon.stop()
-            db.close()
+            if not (daemon._thread and daemon._thread.is_alive()):
+                db.close()
             sys.exit(0)
 
         signal.signal(signal.SIGINT, handle_sigint)

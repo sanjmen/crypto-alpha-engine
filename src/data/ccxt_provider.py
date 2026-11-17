@@ -102,8 +102,21 @@ class CCXTMarketDataProvider:
             return []
 
         bars: list[Bar] = []
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        tf_val = timeframe.value
+        if tf_val.endswith("m"):
+            tf_ms = max(1, int(tf_val[:-1] or 1)) * 60_000
+        elif tf_val.endswith("h"):
+            tf_ms = max(1, int(tf_val[:-1] or 1)) * 3_600_000
+        elif tf_val.endswith("d"):
+            tf_ms = max(1, int(tf_val[:-1] or 1)) * 86_400_000
+        else:
+            tf_ms = 3_600_000
+
         for row in ohlcv:
             timestamp_ms, open_price, high_price, low_price, close_price, volume = row
+            if len(ohlcv) > 1 and (int(timestamp_ms) + tf_ms) > now_ms:
+                continue
             bars.append(
                 Bar(
                     timestamp=datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc),

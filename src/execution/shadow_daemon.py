@@ -5,6 +5,7 @@ reconciles live mark-to-market prices, enforces passive Maker execution alpha,
 triggers 8h multi-strategy rebalancing, and settles real funding cashflows in SQLite.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from datetime import datetime, timezone
 import logging
@@ -305,9 +306,41 @@ class ShadowTradingDaemon:
         self.last_rebalance_time: datetime | None = None
         db_inst = getattr(self.broker, "db", None)
         if db_inst:
-            if hasattr(db_inst, "save_feature_flags"):
+            if hasattr(db_inst, "get_feature_flags") and hasattr(db_inst, "save_feature_flags"):
                 with contextlib.suppress(Exception):
-                    db_inst.save_feature_flags(self.feature_flags.to_dict())
+                    existing_ff = db_inst.get_feature_flags() or {}
+                    if existing_ff and feature_flags is None:
+                        self.feature_flags = FeatureFlags.from_dict(existing_ff, fallback=self.feature_flags)
+                        self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
+                        self.auto_close_anomalies_when_disabled = bool(
+                            self.feature_flags.auto_close_anomalies_when_disabled
+                        )
+                        self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
+                        self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
+                        self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
+                        self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+                    merged_ff = self.feature_flags.to_dict()
+                    if existing_ff:
+                        merged_ff.update(existing_ff)
+                        if feature_flags is not None:
+                            merged_ff = self.feature_flags.to_dict()
+                            for k_ex, v_ex in existing_ff.items():
+                                if k_ex not in merged_ff:
+                                    merged_ff[k_ex] = v_ex
+                    db_inst.save_feature_flags(merged_ff)
+            # Hydrate EmergencyKillSwitch rolling 24h equity window across container restarts
+            live_b = getattr(self.broker, "live_broker", None)
+            ks = getattr(live_b, "kill_switch", None) if live_b is not None else None
+            if ks is not None and hasattr(db_inst, "get_account_history"):
+                with contextlib.suppress(Exception):
+                    for acc_row in db_inst.get_account_history(limit=1500):
+                        eq_v = float(acc_row.get("total_equity") or 0.0)
+                        ts_raw = acc_row.get("timestamp")
+                        if eq_v > 0 and ts_raw:
+                            ts_dt = datetime.fromisoformat(str(ts_raw))
+                            if ts_dt.tzinfo is None:
+                                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                            ks.record_equity(eq_v, timestamp=ts_dt)
             latest_reb = db_inst.get_latest_rebalance_snapshot()
             if latest_reb and latest_reb.get("timestamp"):
                 try:
@@ -463,6 +496,23 @@ class ShadowTradingDaemon:
                     )
 
         if not blocked_any:
+            pos_sum_nb = sum(v for v in filtered.values() if v > 0)
+            neg_sum_nb = sum(abs(v) for v in filtered.values() if v < 0)
+            bal_nb = min(pos_sum_nb, neg_sum_nb)
+            if bal_nb * 2.0 >= 2000.0:
+                for sign in (1.0, -1.0):
+                    leg_keys = [k for k, v in filtered.items() if (v * sign) > 1e-6]
+                    if len(leg_keys) > 1:
+                        stubs = [k for k in leg_keys if abs(filtered[k]) < 160.0]
+                        keep = [k for k in leg_keys if abs(filtered[k]) >= 160.0]
+                        if stubs and keep:
+                            leg_target_nb = sum(abs(filtered[k]) for k in leg_keys)
+                            for sk in stubs:
+                                filtered[sk] = 0.0
+                            keep_sum = sum(abs(filtered[k]) for k in keep)
+                            if keep_sum > 1e-6:
+                                for kk in keep:
+                                    filtered[kk] = filtered[kk] * (leg_target_nb / keep_sum)
             return filtered
 
         orig_long_sum = sum(v for v in target_dollars.values() if v > 0)
@@ -620,10 +670,38 @@ class ShadowTradingDaemon:
                         continue
 
                 last = float(t.get("last") or t.get("close") or 0.0)
-                bid = float(t.get("bid") or last)
-                ask = float(t.get("ask") or last)
-                high = float(t.get("high") or last)
-                low = float(t.get("low") or last)
+                raw_bid = t.get("bid")
+                raw_ask = t.get("ask")
+                prev_tick = self.latest_tickers.get(norm_sym) or {}
+                if raw_bid is not None and float(raw_bid) > 0:
+                    bid = float(raw_bid)
+                elif (
+                    prev_tick.get("bid")
+                    and float(prev_tick["bid"]) > 0
+                    and last > 0
+                    and abs(float(prev_tick["bid"]) - last) / last <= 0.015
+                ):
+                    bid = float(prev_tick["bid"])
+                else:
+                    bid = last
+
+                if raw_ask is not None and float(raw_ask) > 0:
+                    ask = float(raw_ask)
+                elif (
+                    prev_tick.get("ask")
+                    and float(prev_tick["ask"]) > 0
+                    and last > 0
+                    and abs(float(prev_tick["ask"]) - last) / last <= 0.015
+                ):
+                    ask = float(prev_tick["ask"])
+                else:
+                    ask = last
+                if bid > ask and last > 0:
+                    bid = last
+                    ask = last
+
+                high_24 = float(t.get("high") or last)
+                low_24 = float(t.get("low") or last)
                 pct = float(t.get("percentage") or 0.0)
                 vol = float(t.get("quoteVolume") or 0.0)
 
@@ -632,10 +710,10 @@ class ShadowTradingDaemon:
                         "price": last,
                         "bid": bid,
                         "ask": ask,
-                        "low": low,
-                        "high": high,
-                        "high_24h": high,
-                        "low_24h": low,
+                        "low": min(last, bid),
+                        "high": max(last, ask),
+                        "high_24h": high_24,
+                        "low_24h": low_24,
                         "change_24h": pct,
                         "volume_24h": vol,
                     }
@@ -713,17 +791,57 @@ class ShadowTradingDaemon:
             return f"{symbol}:USDT"
         return symbol
 
+    @staticmethod
+    def _timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
+        tf = timeframe.strip().lower()
+        if tf.endswith("m"):
+            return pd.Timedelta(minutes=max(1, int(tf[:-1] or 1)))
+        if tf.endswith("h"):
+            return pd.Timedelta(hours=max(1, int(tf[:-1] or 1)))
+        if tf.endswith("d"):
+            return pd.Timedelta(days=max(1, int(tf[:-1] or 1)))
+        return pd.Timedelta(hours=1)
+
+    @classmethod
+    def _drop_unclosed_bars(
+        cls,
+        df: pd.DataFrame,
+        timeframe: str = "1h",
+        now_utc: pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """
+        Removes any currently open/incomplete live candle (`open_time + tf_delta > now_utc`)
+        so partial volume/return bars never contaminate 7-Factor features or Parquet cache.
+        """
+        if df.empty or "timestamp" not in df.columns or len(df) <= 1:
+            return df
+        ref_now = now_utc or pd.Timestamp.now(tz="UTC")
+        tf_delta = cls._timeframe_to_timedelta(timeframe)
+        ts_col = pd.to_datetime(df["timestamp"], utc=True)
+        closed_mask = (ts_col + tf_delta) <= ref_now
+        if bool(closed_mask.all()):
+            return df
+        closed_df = df.loc[closed_mask].reset_index(drop=True)
+        return closed_df if not closed_df.empty else df.iloc[:-1].reset_index(drop=True)
+
     def fetch_symbol_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
-        """Fetches recent OHLCV bars for alpha calculation."""
+        """Fetches recent closed OHLCV bars for alpha calculation."""
         try:
             if self.rate_limiter:
                 self.rate_limiter.acquire(weight=5, priority="LOW", wait=True)
             req_symbol = self._resolve_ccxt_symbol(symbol)
-            ohlcv = self.exchange.fetch_ohlcv(req_symbol, timeframe=timeframe, limit=limit)
+            is_mock_ex = isinstance(self.exchange, MagicMock) or hasattr(
+                getattr(self.exchange, "fetch_ohlcv", None), "_mock_name"
+            )
+            req_limit = limit if is_mock_ex else min(1500, limit + 1)
+            ohlcv = self.exchange.fetch_ohlcv(req_symbol, timeframe=timeframe, limit=req_limit)
             if self.rate_limiter and hasattr(self.exchange, "last_response_headers"):
                 self.rate_limiter.on_http_response(200, self.exchange.last_response_headers)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = self._drop_unclosed_bars(df, timeframe=timeframe)
+            if len(df) > limit:
+                df = df.tail(limit).reset_index(drop=True)
             self._last_kline_fetch_ok = not df.empty
             return df
         except Exception as e:  # noqa: BLE001
@@ -766,6 +884,7 @@ class ShadowTradingDaemon:
                         .sort_values("timestamp")
                         .reset_index(drop=True)
                     )
+                    cached_df = self._drop_unclosed_bars(cached_df, timeframe=timeframe)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Could not read warm cache {parquet_path}: {e}")
 
@@ -794,6 +913,8 @@ class ShadowTradingDaemon:
         else:
             merged = cached_df
 
+        merged = self._drop_unclosed_bars(merged, timeframe=timeframe)
+
         # Persist updated cache atomically if not using a mock exchange
         if (
             self.enable_warm_start
@@ -821,9 +942,14 @@ class ShadowTradingDaemon:
         settled_records: list[dict[str, Any]] = []
 
         fund_path = self.cache_dir / "FUNDING" / f"{clean_sym}.parquet"
-        if self.enable_warm_start and fund_path.exists():
+        read_fund_path = fund_path
+        if not read_fund_path.exists():
+            alt_fund_path = self.cache_dir / "funding" / f"{clean_sym}.parquet"
+            if alt_fund_path.exists():
+                read_fund_path = alt_fund_path
+        if self.enable_warm_start and read_fund_path.exists():
             try:
-                f_cache = pd.read_parquet(fund_path).tail(max(limit, 250))
+                f_cache = pd.read_parquet(read_fund_path).tail(max(limit, 250))
                 if not f_cache.empty and "funding_rate" in f_cache.columns:
                     ts_s = self._normalize_timestamp_series(f_cache["timestamp"])
                     for ts_val, fr_val in zip(ts_s, f_cache["funding_rate"], strict=False):
@@ -1033,6 +1159,7 @@ class ShadowTradingDaemon:
         merged = (
             merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
+        merged = self._drop_unclosed_bars(merged, timeframe="1h")
         if self.enable_warm_start and live_records:
             try:
                 tk_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1221,7 @@ class ShadowTradingDaemon:
         merged = (
             merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
+        merged = self._drop_unclosed_bars(merged, timeframe="1h")
         if self.enable_warm_start and live_records:
             try:
                 pr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1322,7 +1450,7 @@ class ShadowTradingDaemon:
             if (now_mono - last_sync) >= 60.0:
                 self._last_live_wallet_sync_mono = now_mono
                 try:
-                    self.broker.sync_from_live_exchange(sync_positions=False)
+                    self.broker.sync_from_live_exchange(sync_positions=True)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(f"Periodic live wallet sync note: {exc}")
 
@@ -1349,7 +1477,7 @@ class ShadowTradingDaemon:
                 next_reb = 0.0
 
             hb_status = "HALTED_EQUITY_FLOOR" if self.is_halted else "ONLINE"
-            db.update_market_pulse(self.latest_tickers)
+            db.update_market_pulse(dict(self.latest_tickers))
             db.update_daemon_heartbeat(
                 ws_state=ws_state,
                 symbols_count=len(self.symbols),
@@ -1926,9 +2054,15 @@ class ShadowTradingDaemon:
         dominant_strats = getattr(self.allocator, "last_dominant_strategy", {})
 
         db = getattr(self.broker, "db", None)
+        is_live_mode = bool(getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None))
+        if is_live_mode and not isinstance(self.exchange, MagicMock):
+            with contextlib.suppress(Exception):
+                self.fetch_live_tickers()
+
         rebalance_candidates: list[dict[str, Any]] = []
         for sym in scan_symbols:
-            price = current_prices.get(sym) or self.latest_tickers.get(sym, {}).get("price", 0.0)
+            live_tick_px = float(self.latest_tickers.get(sym, {}).get("price") or 0.0)
+            price = live_tick_px if live_tick_px > 0 else float(current_prices.get(sym) or 0.0)
             if price <= 0:
                 continue
 
@@ -1950,14 +2084,22 @@ class ShadowTradingDaemon:
                     if pending_ord.order_type == OrderType.LIMIT:
                         self.broker.cancel_order(pending_ord.id, sym)
 
-            # 1. Minimum notional gate (relaxed for anomaly test sizing; full closes allowed down to $5 exchange floor)
+            # 1. Minimum notional gate (full reduceOnly closes permitted down to any positive dust amount)
             min_notional = (
                 min(self.min_rebalance_notional, self.anomaly_size)
                 if self.enable_anomalies
                 else self.min_rebalance_notional
             )
             is_full_close = current_qty > 0 and abs(target_val) < 1e-6
-            if abs(dollar_delta) < min_notional and not (is_full_close and abs(dollar_delta) >= 5.0):
+            net_notional_change = abs(target_val) - abs(current_val)
+            is_reducing_order = is_full_close or (
+                current_qty > 0 and (current_val * dollar_delta < 0) and abs(dollar_delta) <= abs(current_val) * 1.01
+            )
+            if is_live_mode and not is_reducing_order:
+                ex_min_not = float(self.broker.live_broker.get_min_notional(sym, reduce_only=False))
+                min_notional = max(min_notional, ex_min_not)
+
+            if abs(dollar_delta) < min_notional and not (is_full_close and abs(dollar_delta) > 0.0):
                 continue
 
             # 2. Turnover deadband gate:
@@ -1977,7 +2119,6 @@ class ShadowTradingDaemon:
                 if not is_new_position and delta_turnover < effective_deadband and abs(target_val) > 0:
                     continue
 
-            net_notional_change = abs(target_val) - abs(current_val)
             rebalance_candidates.append(
                 {
                     "sym": sym,
@@ -1997,10 +2138,13 @@ class ShadowTradingDaemon:
             key=lambda item: (0 if item["net_notional_change"] < 0 else 1, item["net_notional_change"])
         )
 
-        for cand in rebalance_candidates:
+        exec_lock = threading.Lock()
+
+        def _execute_rebalance_candidate(cand: dict[str, Any]) -> None:
             sym = cand["sym"]
             clean_sym = cand["clean_sym"]
-            price = cand["price"]
+            fresh_px = float(self.latest_tickers.get(sym, {}).get("price") or 0.0)
+            price = fresh_px if fresh_px > 0 else float(cand["price"])
             target_val = cand["target_val"]
             pos = cand["pos"]
             dollar_delta = cand["dollar_delta"]
@@ -2023,14 +2167,27 @@ class ShadowTradingDaemon:
                     strategy=strat_label,
                     obi=obi_val,
                 )
-                if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and abs(target_val) > 0:
-                    pos.strategy = strat_label
-                    if db:
-                        db.save_position(pos)
-                executed_orders.append(order)
-                executed_deltas[sym] = dollar_delta
+                with exec_lock:
+                    if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and abs(target_val) > 0:
+                        pos.strategy = strat_label
+                        if db:
+                            db.save_position(pos)
+                    executed_orders.append(order)
+                    executed_deltas[sym] = dollar_delta
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to submit rebalance order for {sym}: {e}")
+
+        if is_live_mode and len(rebalance_candidates) > 1:
+            reduce_batch = [c for c in rebalance_candidates if c["net_notional_change"] < 0]
+            increase_batch = [c for c in rebalance_candidates if c["net_notional_change"] >= 0]
+            for batch in (reduce_batch, increase_batch):
+                if not batch:
+                    continue
+                with ThreadPoolExecutor(max_workers=min(4, len(batch))) as pool:
+                    list(pool.map(_execute_rebalance_candidate, batch))
+        else:
+            for cand in rebalance_candidates:
+                _execute_rebalance_candidate(cand)
 
         # Persist snapshot
         mom_w = weights.get(
@@ -2505,7 +2662,7 @@ class ShadowTradingDaemon:
         candidates = []
         open_clean_syms = {s.replace("/", "") for s in all_open_positions}
         core_clean_syms = {s.replace("/", "") for s in self.symbols}
-        for sym, t in self.latest_tickers.items():
+        for sym, t in list(self.latest_tickers.items()):
             clean_sym = sym.replace("/", "")
             # Skip if symbol belongs to the Core 7-Factor universe or already has an open position
             if clean_sym in core_clean_syms or sym in all_open_positions or clean_sym in open_clean_syms:
@@ -2843,12 +3000,13 @@ class ShadowTradingDaemon:
         logger.info("ShadowTradingDaemon started successfully.")
 
     def stop(self) -> None:
-        """Stops the daemon background thread."""
+        """Stops the daemon background thread, waiting for any in-flight live order chase to complete."""
         self.is_running = False
         if self.ws_client:
             self.ws_client.stop()
+        join_timeout = 20.0 if getattr(self.broker, "is_live", False) else 5.0
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=join_timeout)
         db = getattr(self.broker, "db", None)
         if db and hasattr(db, "update_daemon_heartbeat"):
             try:

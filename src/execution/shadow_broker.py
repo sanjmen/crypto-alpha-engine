@@ -40,7 +40,7 @@ class ShadowExecutionBroker(IExecutionClient):
         self,
         database: ShadowDatabase | None = None,
         initial_cash: float = 100_000.0,
-        taker_fee_pct: float = 0.0004,  # 0.04% taker
+        taker_fee_pct: float = 0.0005,  # 0.05% Binance USDS-M VIP0 taker
         maker_fee_pct: float = 0.0002,  # 0.02% maker
         slippage_bps: float = 1.0,  # 1 bp slippage for market orders
         max_gross_leverage: float = 2.5,  # Hard circuit breaker
@@ -164,8 +164,6 @@ class ShadowExecutionBroker(IExecutionClient):
                 self.live_broker.portfolio.cash = wallet_bal
                 if not self.portfolio.positions and abs(self.portfolio.initial_cash - 100_000.0) < 1e-6:
                     self.portfolio.initial_cash = wallet_bal
-                self.peak_equity = max(self.peak_equity, self.portfolio.total_equity)
-                self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Live USDT/BFUSD/LDUSDT balance sync note: {e}")
 
@@ -198,6 +196,8 @@ class ShadowExecutionBroker(IExecutionClient):
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Live position reconciliation note: {e}")
 
+        self.peak_equity = max(self.peak_equity, self.portfolio.total_equity)
+        self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
         self._record_account_snapshot()
         return self.portfolio.cash
 
@@ -259,13 +259,20 @@ class ShadowExecutionBroker(IExecutionClient):
                 fallback_price=fallback_price,
                 reduce_only=reduce_only,
             )
-            filled_q = float(live_ord.filled_quantity or exec_qty)
+            filled_q = float(live_ord.filled_quantity if live_ord.filled_quantity is not None else exec_qty)
             avg_px = float(live_ord.average_fill_price or fallback_price)
-            was_maker = self.live_broker.maker_fills_count > prev_maker_cnt
+            any_maker = self.live_broker.maker_fills_count > prev_maker_cnt
+            maker_q = float(getattr(live_ord, "_maker_filled_qty", filled_q if any_maker else 0.0))
+            was_maker = maker_q >= 0.5 * max(filled_q, 1e-12)
+            live_fee = float(getattr(live_ord, "_fee_paid", 0.0) or 0.0)
+            if live_fee > 0:
+                order._live_fee_override = live_fee  # type: ignore[attr-defined]
             return filled_q, avg_px, was_maker
 
         ccxt_side = "buy" if order.side == OrderSide.BUY else "sell"
-        params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
+        params: dict[str, Any] = {"newOrderRespType": "RESULT"}
+        if reduce_only:
+            params["reduceOnly"] = True
         res = self.live_broker.client.create_order(
             symbol=symbol,
             type="market",
@@ -273,8 +280,27 @@ class ShadowExecutionBroker(IExecutionClient):
             amount=exec_qty,
             params=params,
         )
-        filled_q = float(res.get("filled") or res.get("amount") or exec_qty)
-        avg_px = float(res.get("average") or res.get("price") or fallback_price)
+        filled_q = float(res.get("filled") or 0.0)
+        avg_px = float(res.get("average") or res.get("price") or 0.0)
+        ord_id = str(res.get("id") or "")
+        if (filled_q <= 0 or avg_px <= 0) and ord_id and hasattr(self.live_broker.client, "fetch_order"):
+            try:
+                chk_m = self.live_broker.client.fetch_order(ord_id, symbol)
+                if isinstance(chk_m, dict) and str(chk_m.get("id", ord_id)) == ord_id:
+                    filled_q = float(chk_m.get("filled") or filled_q)
+                    avg_px = float(chk_m.get("average") or chk_m.get("price") or avg_px)
+                    res = chk_m
+            except Exception:
+                pass
+        if filled_q <= 0:
+            filled_q = float(res.get("amount") or exec_qty)
+        if avg_px <= 0:
+            avg_px = fallback_price
+        live_fee = BinanceLiveBroker._extract_order_fee_usd(res, filled_q, avg_px, self.taker_fee_pct)
+        if live_fee > 0:
+            order._live_fee_override = live_fee  # type: ignore[attr-defined]
+        if hasattr(self.live_broker, "_apply_fill_to_portfolio") and filled_q > 0:
+            self.live_broker._apply_fill_to_portfolio(symbol, order.side, filled_q, avg_px)
         return filled_q, avg_px, False
 
     def set_market_price(
@@ -406,7 +432,12 @@ class ShadowExecutionBroker(IExecutionClient):
         )
         if not is_reducing:
             current_gross = sum(abs(p.market_value) for p in self.portfolio.positions.values())
-            new_gross = current_gross + order_notional
+            if side is not None and pos is not None and pos.side != PositionSide.FLAT and pos.quantity > 0:
+                existing_signed = pos.market_value if pos.side == PositionSide.LONG else -pos.market_value
+                order_signed = order_notional if side == OrderSide.BUY else -order_notional
+                new_gross = (current_gross - abs(pos.market_value)) + abs(existing_signed + order_signed)
+            else:
+                new_gross = current_gross + order_notional
             new_leverage = new_gross / max(current_equity, 1.0)
             if new_leverage > self.max_gross_leverage:
                 raise MaxLeverageExceededError(
@@ -538,7 +569,8 @@ class ShadowExecutionBroker(IExecutionClient):
                 return
             order.quantity = exec_qty
 
-        fee = fill_price * order.quantity * self.taker_fee_pct
+        fee_override = float(getattr(order, "_live_fee_override", 0.0) or 0.0)
+        fee = fee_override if fee_override > 0 else (fill_price * order.quantity * self.taker_fee_pct)
 
         trade = Trade(
             id=f"shd_trd_{uuid.uuid4().hex[:10]}",
@@ -613,7 +645,8 @@ class ShadowExecutionBroker(IExecutionClient):
 
         fee_rate = self.maker_fee_pct if is_maker_fill else self.taker_fee_pct
         role_label = "MAKER" if is_maker_fill else "TAKER"
-        fee = fill_price * order.quantity * fee_rate
+        fee_override = float(getattr(order, "_live_fee_override", 0.0) or 0.0)
+        fee = fee_override if fee_override > 0 else (fill_price * order.quantity * fee_rate)
 
         trade = Trade(
             id=f"shd_trd_{uuid.uuid4().hex[:10]}",
@@ -762,8 +795,6 @@ class ShadowExecutionBroker(IExecutionClient):
             current = float(tick.get("price", limit_price))
             bid = float(tick.get("bid", current))
             ask = float(tick.get("ask", current))
-            low = float(tick.get("low", tick.get("bid", limit_price)))
-            high = float(tick.get("high", tick.get("ask", limit_price)))
 
             should_fill = False
             if order.order_type == OrderType.TAKE_PROFIT:
@@ -786,20 +817,27 @@ class ShadowExecutionBroker(IExecutionClient):
                     should_fill = True
             else:
                 # Standard passive LIMIT order:
-                # Buy limit fills when market ask, current, or low drops to or crosses limit
-                # Sell limit fills when market bid, current, or high rises to or crosses limit
+                # Must genuinely touch/cross real-time top-of-book (never 24h rolling high/low)
+                has_real_spread = ask > bid
                 if (
                     order.side == OrderSide.BUY
-                    and (ask <= limit_price or current <= limit_price or low <= limit_price)
+                    and (ask <= limit_price or (not has_real_spread and current <= limit_price))
                     or order.side == OrderSide.SELL
-                    and (bid >= limit_price or current >= limit_price or high >= limit_price)
+                    and (bid >= limit_price or (not has_real_spread and current >= limit_price))
                 ):
                     should_fill = True
 
             if should_fill:
                 try:
                     if order.order_type == OrderType.STOP_LOSS:
-                        self._fill_taker_order(order, fill_price=limit_price)
+                        if self.is_live:
+                            self._fill_taker_order(order, fill_price=limit_price)
+                        else:
+                            if order.side == OrderSide.SELL:
+                                sl_fill = min(limit_price, bid) * (1.0 - self.slippage)
+                            else:
+                                sl_fill = max(limit_price, ask) * (1.0 + self.slippage)
+                            self._fill_taker_order(order, fill_price=sl_fill)
                     else:
                         self._fill_maker_order(order, fill_price=limit_price)
                 except Exception as exc:  # noqa: BLE001
@@ -1012,6 +1050,37 @@ class ShadowExecutionBroker(IExecutionClient):
             self._record_account_snapshot()
 
         return flattened
+
+    def hedge_excess_exposure(self, net_exposure_usd: float) -> Order | None:
+        """
+        Reduces the largest active position on the overweight side when net exposure asymmetry
+        exceeds the EmergencyKillSwitch threshold.
+        """
+        if abs(net_exposure_usd) <= 1.0 or not self.portfolio.positions:
+            return None
+
+        target_side = PositionSide.LONG if net_exposure_usd > 0 else PositionSide.SHORT
+        candidates = [p for p in self.portfolio.positions.values() if p.side == target_side and p.quantity > 0]
+        if not candidates:
+            return None
+
+        largest = max(candidates, key=lambda p: p.quantity * (p.current_price or p.entry_price))
+        px = float(self.market_prices.get(largest.symbol, largest.current_price or largest.entry_price))
+        if px <= 0:
+            return None
+
+        reduce_qty = min(largest.quantity, abs(net_exposure_usd) / px)
+        if reduce_qty <= 0:
+            return None
+        order_side = OrderSide.SELL if target_side == PositionSide.LONG else OrderSide.BUY
+        return self.create_order(
+            symbol=largest.symbol,
+            side=order_side,
+            order_type=OrderType.LIMIT,
+            quantity=reduce_qty,
+            price=px,
+            strategy=largest.strategy,
+        )
 
     def _update_portfolio_position(self, trade: Trade) -> float:
         """

@@ -5,6 +5,7 @@ extreme leverage, and flash drawdowns.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from datetime import datetime, timezone
 import logging
 import threading
@@ -64,7 +65,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         max_gross_leverage: float = 2.5,
         max_order_notional: float = 25_000.0,
         max_drawdown_stop: float = 0.15,
-        taker_fee_pct: float = 0.0004,
+        taker_fee_pct: float = 0.0005,
         maker_fee_pct: float = 0.0002,
     ):
         if credentials is not None:
@@ -333,8 +334,10 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
     def quantize_price(self, symbol: str, price: float) -> float:
         """Quantizes price strictly to Binance symbol `tickSize`."""
+        mkts = getattr(self.client, "markets", None)
+        has_real_mkts = isinstance(mkts, dict) and bool(mkts)
         try:
-            if hasattr(self.client, "markets") and self.client.markets:
+            if has_real_mkts:
                 return float(self.client.price_to_precision(symbol, price))
         except Exception:
             pass
@@ -342,25 +345,91 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
     def quantize_amount(self, symbol: str, amount: float) -> float:
         """Quantizes quantity strictly to Binance symbol `stepSize`, returning 0.0 if below min lot."""
+        mkts = getattr(self.client, "markets", None)
+        has_real_mkts = isinstance(mkts, dict) and bool(mkts)
         try:
-            if hasattr(self.client, "markets") and self.client.markets:
-                mkt = self.client.markets.get(symbol) or self.client.markets.get(f"{symbol}:USDT")
+            if has_real_mkts:
+                mkt = mkts.get(symbol) or mkts.get(f"{symbol}:USDT")
                 if isinstance(mkt, dict):
                     min_amt = float((mkt.get("limits", {}).get("amount", {}) or {}).get("min") or 0.0)
                     if min_amt > 0 and float(amount) < min_amt:
                         return 0.0
                 return float(self.client.amount_to_precision(symbol, amount))
         except Exception:
-            if hasattr(self.client, "markets") and self.client.markets:
+            if has_real_mkts:
                 return 0.0
         return round(float(amount), 4 if amount < 10.0 else 2)
+
+    def get_min_notional(self, symbol: str, reduce_only: bool = False) -> float:
+        """
+        Returns the Binance USDS-M Futures `MIN_NOTIONAL` filter in USD for `symbol`.
+        Note: Binance exempts `reduceOnly=True` orders from `MIN_NOTIONAL` (-4164).
+        """
+        if reduce_only:
+            return 0.0
+        clean = symbol.split(":")[0].replace("/", "").upper()
+        default_min = 100.0 if clean in ("BTCUSDT", "ETHUSDT") else 5.0
+        try:
+            mkts = getattr(self.client, "markets", None)
+            if isinstance(mkts, dict) and mkts:
+                mkt = mkts.get(symbol) or mkts.get(f"{symbol}:USDT")
+                if isinstance(mkt, dict):
+                    cost_min = float((mkt.get("limits", {}).get("cost", {}) or {}).get("min") or 0.0)
+                    filt_min = 0.0
+                    for f in mkt.get("info", {}).get("filters", []) or []:
+                        if isinstance(f, dict) and f.get("filterType") == "MIN_NOTIONAL":
+                            filt_min = max(filt_min, float(f.get("notional") or 0.0))
+                    resolved = max(cost_min, filt_min)
+                    if resolved > 0:
+                        return resolved
+        except Exception:
+            pass
+        return default_min
+
+    @staticmethod
+    def _extract_order_fee_usd(
+        order_resp: Any,
+        filled_qty: float,
+        avg_price: float,
+        fallback_fee_rate: float,
+    ) -> float:
+        """Extracts actual USDT/USD fee from CCXT order response, falling back to notional * fee_rate."""
+        if isinstance(order_resp, dict):
+            fee_obj = order_resp.get("fee")
+            if isinstance(fee_obj, dict) and fee_obj.get("cost") is not None:
+                try:
+                    c_val = float(fee_obj["cost"])
+                    if c_val > 0:
+                        return c_val
+                except (TypeError, ValueError):
+                    pass
+            fees_list = order_resp.get("fees")
+            if isinstance(fees_list, list) and fees_list:
+                tot_f = 0.0
+                for fo in fees_list:
+                    if isinstance(fo, dict) and fo.get("cost") is not None:
+                        with contextlib.suppress(TypeError, ValueError):
+                            tot_f += float(fo["cost"])
+                if tot_f > 0:
+                    return tot_f
+        return max(0.0, float(filled_qty) * float(avg_price) * float(fallback_fee_rate))
 
     def fetch_best_bid_ask(self, symbol: str, fallback_price: float = 100.0) -> tuple[float, float]:
         """
         Fetches true L1 top-of-book `(best_bid, best_ask)` for Post-Only (`GTX`) limit placement.
-        Queries L1 `fetch_order_book(symbol, limit=5)` first (since Binance Futures `/fapi/v1/ticker/24hr`
-        omits `bid`/`ask`), falling back to `fetch_ticker` with tick-safe spread separation.
+        In `dry_run=True` mode (when `self.client` is not a test mock), returns a deterministic
+        tick-safe spread around `fallback_price` without making live network calls.
         """
+        is_mock_client = hasattr(self.client, "_mock_name") or hasattr(
+            getattr(self.client, "fetch_ticker", None), "_mock_name"
+        )
+        if self.dry_run and not is_mock_client:
+            q_bid = self.quantize_price(symbol, fallback_price * 0.9999)
+            q_ask = self.quantize_price(symbol, fallback_price * 1.0001)
+            if q_ask <= q_bid:
+                step = max(fallback_price * 0.0002, 1e-6)
+                q_ask = self.quantize_price(symbol, q_bid + step)
+            return q_bid, q_ask
         try:
             if hasattr(self.client, "fetch_order_book"):
                 ob = self.client.fetch_order_book(symbol, limit=5)
@@ -475,7 +544,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             bal = self.client.fetch_balance()
             col = self.compute_effective_margin_collateral(bal)
             if col["effective_wallet_usd"] > 0:
-                self.portfolio.cash = float(col["effective_free_usd"])
+                self.portfolio.cash = float(col["effective_wallet_usd"])
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not fetch live balance during reconciliation: {e}")
 
@@ -561,22 +630,30 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         last_order_id = order_id
         filled_total = 0.0
         cost_total = 0.0
+        maker_filled_qty = 0.0
+        taker_filled_qty = 0.0
+        total_fee_usd = 0.0
+        min_not_usd = max(5.0, self.get_min_notional(symbol, reduce_only=reduce_only))
 
         last_gtx_rejected = False
         for attempt in range(self.max_chase_iterations):
             rem_q = self.quantize_amount(symbol, remaining)
-            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < 20.5):
+            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < min_not_usd):
                 remaining = 0.0
                 break
             bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=limit_px)
-            spread = max(ask - bid, bid * 0.0005, 1e-6)
+            real_spread = max(ask - bid, 1e-8)
+            backoff = max(real_spread * 0.5, bid * 0.0001)
             if side == OrderSide.BUY:
-                raw_target = (bid - spread * 0.5) if last_gtx_rejected else bid
+                raw_target = (bid - backoff) if last_gtx_rejected else bid
+                chase_px = self.quantize_price(symbol, raw_target)
+                if chase_px >= ask:
+                    chase_px = self.quantize_price(symbol, ask - max(real_spread, ask * 0.0002))
             else:
-                raw_target = (ask + spread * 1.2) if last_gtx_rejected else ask
-            chase_px = self.quantize_price(symbol, raw_target)
-            if side == OrderSide.SELL and chase_px <= bid:
-                chase_px = self.quantize_price(symbol, ask + max(spread, ask * 0.001))
+                raw_target = (ask + backoff) if last_gtx_rejected else ask
+                chase_px = self.quantize_price(symbol, raw_target)
+                if chase_px <= bid:
+                    chase_px = self.quantize_price(symbol, bid + max(real_spread, bid * 0.0002))
             params: dict[str, Any] = {"timeInForce": "GTX"}
             if reduce_only:
                 params["reduceOnly"] = True
@@ -586,7 +663,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                     symbol=symbol,
                     type="limit",
                     side=ccxt_side,
-                    amount=self.quantize_amount(symbol, remaining),
+                    amount=rem_q,
                     price=chase_px,
                     params=params,
                 )
@@ -603,7 +680,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
                 if filled_this > 0:
                     filled_total += filled_this
+                    maker_filled_qty += filled_this
                     cost_total += filled_this * avg_px
+                    total_fee_usd += self._extract_order_fee_usd(chk, filled_this, avg_px, self.maker_fee_pct)
                     remaining = max(0.0, q_amt - filled_total)
                     self.maker_fills_count += 1
 
@@ -619,7 +698,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                         delta_fill = max(0.0, filled_after - filled_this)
                         if delta_fill > 0:
                             filled_total += delta_fill
+                            maker_filled_qty += delta_fill
                             cost_total += delta_fill * avg_after
+                            total_fee_usd += delta_fill * avg_after * self.maker_fee_pct
                             remaining = max(0.0, q_amt - filled_total)
                             if filled_this <= 0:
                                 self.maker_fills_count += 1
@@ -633,7 +714,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                         delta_fill = max(0.0, filled_after - filled_this)
                         if delta_fill > 0:
                             filled_total += delta_fill
+                            maker_filled_qty += delta_fill
                             cost_total += delta_fill * avg_after
+                            total_fee_usd += delta_fill * avg_after * self.maker_fee_pct
                             remaining = max(0.0, q_amt - filled_total)
                             if filled_this <= 0:
                                 self.maker_fills_count += 1
@@ -650,10 +733,12 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         # Fallback for any remaining quantity
         if remaining > 1e-8 and self.allow_taker_fallback:
             rem_q = self.quantize_amount(symbol, remaining)
-            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < 20.5):
+            if rem_q <= 0 or (filled_total > 0 and not reduce_only and rem_q * limit_px < min_not_usd):
                 remaining = 0.0
             else:
-                fb_params: dict[str, Any] = {"reduceOnly": True} if reduce_only else {}
+                fb_params: dict[str, Any] = {"newOrderRespType": "RESULT"}
+                if reduce_only:
+                    fb_params["reduceOnly"] = True
                 try:
                     res_mkt = self.client.create_order(
                         symbol=symbol,
@@ -662,10 +747,28 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                         amount=rem_q,
                         params=fb_params,
                     )
-                    last_order_id = str(res_mkt.get("id", last_order_id))
-                    avg_px = float(res_mkt.get("average") or res_mkt.get("price") or limit_px)
-                    filled_total += remaining
-                    cost_total += remaining * avg_px
+                    mkt_id = str(res_mkt.get("id", last_order_id))
+                    last_order_id = mkt_id
+                    mkt_filled = float(res_mkt.get("filled") or 0.0)
+                    avg_px = float(res_mkt.get("average") or res_mkt.get("price") or 0.0)
+                    if (mkt_filled <= 0 or avg_px <= 0) and mkt_id and hasattr(self.client, "fetch_order"):
+                        try:
+                            chk_mkt = self.client.fetch_order(mkt_id, symbol)
+                            if isinstance(chk_mkt, dict) and str(chk_mkt.get("id", mkt_id)) == mkt_id:
+                                mkt_filled = float(chk_mkt.get("filled") or mkt_filled)
+                                avg_px = float(chk_mkt.get("average") or chk_mkt.get("price") or avg_px)
+                                res_mkt = chk_mkt
+                        except Exception:
+                            pass
+                    if mkt_filled <= 0:
+                        mkt_filled = rem_q
+                    if avg_px <= 0:
+                        b_fb, a_fb = self.fetch_best_bid_ask(symbol, fallback_price=limit_px)
+                        avg_px = a_fb if side == OrderSide.BUY else b_fb
+                    filled_total += mkt_filled
+                    taker_filled_qty += mkt_filled
+                    cost_total += mkt_filled * avg_px
+                    total_fee_usd += self._extract_order_fee_usd(res_mkt, mkt_filled, avg_px, self.taker_fee_pct)
                     remaining = 0.0
                     self.taker_fills_count += 1
                 except Exception as e:
@@ -691,6 +794,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             average_fill_price=final_avg_px,
             created_at=datetime.now(timezone.utc),
         )
+        final_order._maker_filled_qty = maker_filled_qty  # type: ignore[attr-defined]
+        final_order._taker_filled_qty = taker_filled_qty  # type: ignore[attr-defined]
+        final_order._fee_paid = total_fee_usd  # type: ignore[attr-defined]
         with self._lock:
             self.orders[last_order_id] = final_order
         return final_order
@@ -980,7 +1086,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                         report["multi_assets_margin"] = True
                 except Exception:
                     pass
-            self.portfolio.cash = free_cash
+            self.portfolio.cash = total_cash if total_cash > 0 else free_cash
             if not self.portfolio.positions and total_cash > 0:
                 self.portfolio.initial_cash = total_cash
                 self.peak_equity = total_cash

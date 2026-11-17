@@ -35,6 +35,10 @@ class BacktestResult:
     equity_curve: pd.Series
     drawdown_curve: pd.Series
 
+    @property
+    def final_equity(self) -> float:
+        return float(self.equity_curve.iloc[-1]) if len(self.equity_curve) > 0 else 0.0
+
 
 class VectorizedBacktester:
     """
@@ -46,7 +50,7 @@ class VectorizedBacktester:
     def __init__(
         self,
         initial_capital: float = 100_000.0,
-        taker_fee: float = 0.0004,  # 0.04% taker fee
+        taker_fee: float = 0.0005,  # 0.05% Binance USDS-M VIP0 taker fee
         maker_fee: float = 0.0002,  # 0.02% maker fee
         slippage_bps: float = 1.0,  # 1 bp slippage for takers
         execution_mode: str = "taker",  # "taker", "maker", or "hybrid"

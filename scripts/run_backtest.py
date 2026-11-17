@@ -429,17 +429,23 @@ def run_simulation(
         raw_funding_df = pd.DataFrame(raw_funding_dfs)
 
         engine = SevenFactorOnlineEngine(
+            priors=None,
             f6_min_tstat=0.75,
             f5_min_tstat=1.25 if enable_chop_arb else None,
             enable_chop_range_arb=enable_chop_arb,
             enable_holistic_regime_shields=enable_holistic_shields,
         )
-        unit_weights_df, _ = engine.compute_weights_matrix(
+        high_df = pd.DataFrame({sym: bars_dict[sym]["high"].reindex(master_idx).ffill() for sym in valid_symbols})
+        low_df = pd.DataFrame({sym: bars_dict[sym]["low"].reindex(master_idx).ffill() for sym in valid_symbols})
+        unit_weights_df, mats = engine.compute_weights_matrix(
             close=close_df,
             volume=volume_df,
             raw_funding=raw_funding_df,
             funding_settlement=funding_df,
+            high=high_df,
+            low=low_df,
         )
+        vol_scalar_s = mats["vol_scalar"]
         ctrl = SteppedLeverageController(
             initial_capital=initial_capital,
             start_leverage=start_leverage,
@@ -460,14 +466,12 @@ def run_simulation(
                 sim_eq = max(100.0, sim_eq * (1.0 + bar_ret))
                 if (i - lookback) % rebalance_freq_bars == 0:
                     w_unit = {sym: float(unit_weights_df[sym].iloc[i]) for sym in valid_symbols}
-                    port_rets = (unit_weights_df.iloc[max(0, i - 72) : i] * returns_df.iloc[max(0, i - 72) : i]).sum(
-                        axis=1
-                    )
+                    v_sc = float(vol_scalar_s.iloc[i])
                     scaled_w, _ = ctrl.scale_and_deadband_weights(
                         unit_weights=w_unit,
                         current_weights=current_w,
                         current_equity=sim_eq,
-                        recent_hourly_returns=port_rets,
+                        vol_scalar=v_sc,
                     )
                     current_w = scaled_w
             weights_records[ts] = current_w.copy()
@@ -475,7 +479,7 @@ def run_simulation(
         weights_df = pd.DataFrame.from_dict(weights_records, orient="index").reindex(master_idx).fillna(0.0)
         backtester = VectorizedBacktester(
             initial_capital=initial_capital,
-            taker_fee=0.0004,
+            taker_fee=0.0005,
             maker_fee=0.0002,
             slippage_bps=1.0,
             execution_mode=execution_mode,

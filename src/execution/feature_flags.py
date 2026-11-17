@@ -50,14 +50,14 @@ class FeatureFlags:
     """
     Runtime Feature Flags & Risk Shield guardrails:
     - `enable_anomaly_capsule` (default False in Mainnet) + `auto_close_anomalies_when_disabled` (True).
-    - `enable_hard_equity_floor` (True) + `equity_floor_usd` ($2,600.00 hard stop in Mainnet).
+    - `enable_hard_equity_floor` (True) + `equity_floor_usd` ($2,500.00 hard stop in Mainnet).
     - `enable_invariant_audit` (True) — continuous verification of production invariants.
     """
 
     enable_anomaly_capsule: bool = False
     auto_close_anomalies_when_disabled: bool = True
     enable_hard_equity_floor: bool = True
-    equity_floor_usd: float = 2600.0
+    equity_floor_usd: float = 2500.0
     enable_intracycle_rebalance: bool = True
     enable_invariant_audit: bool = True
     enable_smart_money: bool = True
@@ -120,7 +120,7 @@ class FeatureFlags:
 
         cli_floor = getattr(args, "equity_floor_usd", None) if args is not None else None
         env_floor = env.get("FF_EQUITY_FLOOR_USD", env.get("EQUITY_FLOOR_USD"))
-        default_floor = 2600.0 if is_mainnet else 0.0
+        default_floor = 2500.0 if is_mainnet else 0.0
         if cli_floor is not None:
             floor_usd = float(cli_floor)
         elif env_floor is not None:

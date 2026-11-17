@@ -37,7 +37,7 @@ class SmartExecutionRouter:
         broker: IExecutionClient,
         default_urgency: ExecutionUrgency = ExecutionUrgency.LOW,
         maker_fee_pct: float = 0.0002,  # 0.02% maker
-        taker_fee_pct: float = 0.0004,  # 0.04% taker
+        taker_fee_pct: float = 0.0005,  # 0.05% Binance USDS-M VIP0 taker
         tick_offset_bps: float = 0.5,  # 0.5 bp offset into book
         enable_auto_chunking: bool = True,
         max_single_clip_usd: float = 10_000.0,

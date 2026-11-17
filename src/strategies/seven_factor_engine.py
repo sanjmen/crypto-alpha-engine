@@ -18,9 +18,12 @@ Implements the empirical discoveries from the 22-month (2025-2026) research:
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import pandas as pd
+
+_UNSET_PRIORS: Any = object()
 
 FACTOR_NAMES: tuple[str, ...] = (
     "macro",
@@ -152,13 +155,16 @@ def cap_side_weights_waterfill(
     def _waterfill_leg(vec: np.ndarray, total_leg: float) -> np.ndarray:
         if total_leg <= 1e-10:
             return vec
-        cap_single = total_leg * float(max_side_share) if has_side_cap else total_leg
-        cap_clust = total_leg * float(max_cluster_share) if has_clust_cap else total_leg
         active_cnt = int((vec > 1e-10).sum())
+        eff_side_share = (
+            max(float(max_side_share), (1.0 / active_cnt) + 0.02) if (has_side_cap and active_cnt >= 2) else 1.0
+        )
+        cap_single = total_leg * eff_side_share if (has_side_cap and active_cnt >= 2) else total_leg
+        cap_clust = total_leg * float(max_cluster_share) if has_clust_cap else total_leg
 
         for _ in range(5):
             changed = False
-            if has_side_cap and active_cnt >= 4:
+            if has_side_cap and active_cnt >= 2:
                 over = vec > cap_single + 1e-9
                 if np.any(over) and not np.all(over):
                     excess = float((vec[over] - cap_single).sum())
@@ -186,7 +192,7 @@ def cap_side_weights_waterfill(
             if not changed:
                 break
 
-        if has_side_cap and active_cnt >= 4:
+        if has_side_cap and active_cnt >= 2:
             vec = np.minimum(vec, cap_single)
         return vec
 
@@ -218,7 +224,7 @@ class SevenFactorOnlineEngine:
     def __init__(
         self,
         lookbacks: tuple[int, int, int] = (36, 96, 240),
-        priors: dict[str, float] | None = None,
+        priors: dict[str, float] | None | Any = _UNSET_PRIORS,
         factor_power: float = 1.7,
         comb_power: float = 1.3,
         vol_scalar_bounds: tuple[float, float] = (0.55, 1.15),
@@ -236,9 +242,18 @@ class SevenFactorOnlineEngine:
         enable_chop_range_arb: bool = False,
         chop_max_alpha: float = 0.75,
         enable_holistic_regime_shields: bool = False,
+        enable_no_edge_gate: bool | None = None,
     ) -> None:
         self.lookbacks = lookbacks
-        self.priors = pd.Series(priors or DEFAULT_PRIORS)
+        if priors is _UNSET_PRIORS:
+            self.priors = pd.Series(DEFAULT_PRIORS, dtype=float)
+            self._zero_priors = False
+        elif priors is None or len(priors) == 0:
+            self.priors = pd.Series(0.0, index=FACTOR_NAMES, dtype=float)
+            self._zero_priors = True
+        else:
+            self.priors = pd.Series(priors, dtype=float)
+            self._zero_priors = bool(float(self.priors.abs().sum()) <= 1e-8)
         self.factor_power = factor_power
         self.comb_power = comb_power
         self.vol_scalar_bounds = vol_scalar_bounds
@@ -257,6 +272,11 @@ class SevenFactorOnlineEngine:
         self.enable_chop_range_arb = bool(enable_chop_range_arb)
         self.chop_max_alpha = float(chop_max_alpha)
         self.enable_holistic_regime_shields = bool(enable_holistic_regime_shields)
+        self.enable_no_edge_gate = (
+            bool(enable_no_edge_gate)
+            if enable_no_edge_gate is not None
+            else bool(self._zero_priors or self.enable_holistic_regime_shields)
+        )
         self.min_tstat_by_factor: dict[str, float] = dict(min_tstat_by_factor or {})
         if eff_liq_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
             self.min_tstat_by_factor["liq"] = float(eff_liq_min_tstat)
@@ -336,7 +356,7 @@ class SevenFactorOnlineEngine:
                     reindexed = d_f["fundingRate"].astype(float).reindex(close.index)
                     is_settlement = close.index.hour % 8 == 0
                     funding_per_bar.loc[is_settlement, sym] = reindexed.loc[is_settlement].fillna(0.0)
-                    raw_funding[sym] = reindexed.ffill().bfill().fillna(0.0)
+                    raw_funding[sym] = reindexed.ffill().fillna(0.0)
 
         return close, volume, dollar_vol, raw_funding, funding_per_bar
 
@@ -807,7 +827,9 @@ class SevenFactorOnlineEngine:
         f_rev = -(0.40 * zi[24] + 0.60 * zi[72]) - 0.25 * zr[4]
 
         ann_fund = raw_funding.rolling(72, min_periods=1).mean() * 3.0 * 365.0
-        f_carry = -ann_fund.where(ann_fund.abs() >= 0.05, 0.0)
+        fund_disp = (ann_fund.max(axis=1) - ann_fund.min(axis=1)).fillna(0.0)
+        f_carry_soft = -np.sign(ann_fund) * (ann_fund.abs() - 0.025).clip(lower=0.0)
+        f_carry = f_carry_soft.where(fund_disp >= 0.04, 0.0)
 
         f_liq = np.log(dollar_vol.rolling(168, min_periods=12).mean() + 1.0) - np.log(
             dollar_vol.rolling(720, min_periods=24).mean() + 1.0
@@ -856,7 +878,7 @@ class SevenFactorOnlineEngine:
         if "size" in t_df.columns:
             t_df["size"] = t_df["size"].ewm(span=6, min_periods=1).mean()
 
-        priors_aligned = self.priors.reindex(t_df.columns).fillna(0.10)
+        priors_aligned = self.priors.reindex(t_df.columns).fillna(0.0 if self._zero_priors else 0.10)
         raw_fw = np.maximum(0.0, t_df.add(priors_aligned, axis=1)) ** 2.0
 
         # Ensure dynamic F5_Carry gate is synchronized with `self.enable_chop_range_arb` / `self.f5_min_tstat`
@@ -884,20 +906,27 @@ class SevenFactorOnlineEngine:
                 gate_mask = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
                 raw_fw[f_name] = raw_fw[f_name].where(gate_mask, 0.0)
 
-        # Fallback to un-gated priors if all factors are simultaneously gated to 0 on a bar
+        raw_fw_pre_fallback = raw_fw.copy()
+
+        # Fallback to un-gated reference priors for normalized direction ONLY if all factors are <= 0 on a bar
         zero_rows = raw_fw.sum(axis=1) <= 1e-12
         if zero_rows.any():
+            fb_priors = (
+                priors_aligned
+                if float(priors_aligned.sum()) > 1e-8
+                else pd.Series(DEFAULT_PRIORS, dtype=float).reindex(t_df.columns).fillna(0.10)
+            )
             fallback_fw = pd.DataFrame(
-                np.tile((priors_aligned.values**2.0), (int(zero_rows.sum()), 1)),
+                np.tile((fb_priors.values**2.0), (int(zero_rows.sum()), 1)),
                 index=raw_fw.index[zero_rows],
                 columns=raw_fw.columns,
             )
-            for f_name, min_t in self.min_tstat_by_factor.items():
+            for f_name, min_t in eff_gates.items():
                 if f_name in fallback_fw.columns and min_t is not None:
                     fallback_fw[f_name] = 0.0
             if (fallback_fw.sum(axis=1) <= 1e-12).any():
                 fallback_fw = pd.DataFrame(
-                    np.tile((priors_aligned.values**2.0), (int(zero_rows.sum()), 1)),
+                    np.tile((fb_priors.values**2.0), (int(zero_rows.sum()), 1)),
                     index=raw_fw.index[zero_rows],
                     columns=raw_fw.columns,
                 )
@@ -906,7 +935,9 @@ class SevenFactorOnlineEngine:
         fw_sum = raw_fw.sum(axis=1).replace(0, 1e-8)
         fw_norm = raw_fw.div(fw_sum, axis=0)
 
-        conviction = (raw_fw.sum(axis=1) / (float(priors_aligned.sum()) ** 2.0)).clip(
+        prior_sum_sq = float(priors_aligned.sum()) ** 2.0
+        conv_ref_denom = prior_sum_sq if prior_sum_sq > 1e-8 else 1.0
+        conviction = (raw_fw_pre_fallback.sum(axis=1) / conv_ref_denom).clip(
             self.conviction_bounds[0], self.conviction_bounds[1]
         )
 
@@ -1145,7 +1176,8 @@ class SevenFactorOnlineEngine:
         # outperforming the base book, smoothly rotates up to `chop_max_alpha` (75%) into Range-Arb.
         t_chop_spec = pd.Series(0.0, index=idx, dtype=float)
         alpha_chop_overlay = pd.Series(0.0, index=idx, dtype=float)
-        if self.enable_chop_range_arb and len(cols) >= 4:
+        need_specialist_helpers = (self.enable_chop_range_arb or self.enable_holistic_regime_shields) and len(cols) >= 4
+        if need_specialist_helpers:
             clusters_full = dict(ALT_SECTOR_CLUSTERS)
             clusters_full["MAJORS"] = ("BTCUSDT", "ETHUSDT", "BNBUSDT")
             clean_to_col = {str(c).split(":")[0].replace("/", ""): c for c in cols}
@@ -1172,6 +1204,9 @@ class SevenFactorOnlineEngine:
             w_sect_u = make_continuous_neutral_weights(
                 c_sector_rv.ewm(span=3, min_periods=1).mean(), inv_vol, gross_leverage=1.0, power=1.5
             )
+            max_tr_t = t_df[["macro", "med", "fast"]].max(axis=1)
+
+        if self.enable_chop_range_arb and len(cols) >= 4:
             w_chop_spec = make_continuous_neutral_weights(
                 0.50 * w_range_u + 0.25 * w_sect_u + 0.25 * w_whip_u,
                 ones_df,
@@ -1202,7 +1237,6 @@ class SevenFactorOnlineEngine:
             t_chop_spec = _fast_rolling_tstat(w_chop_spec, (24, 48, 96))
             t_base_fast = _fast_rolling_tstat(w_base_1x, (24, 48))
 
-            max_tr_t = t_df[["macro", "med", "fast"]].max(axis=1)
             mm_mean_t = 0.5 * (t_df["macro"] + t_df["med"])
             macro_chop_gate = ((0.0 - mm_mean_t) / 0.50).clip(0.0, 1.0)
             pure_chop_gate = ((0.10 - max_tr_t) / 0.30).clip(0.0, 1.0) * ((t_chop_spec + 0.10) / 0.50).clip(0.0, 1.0)
@@ -1233,58 +1267,70 @@ class SevenFactorOnlineEngine:
                 index=idx,
             )
 
-            # Unified Holistic Regime Shields (`enable_holistic_regime_shields`):
-            # 1) Lone-Macro Horizon-Divergence & Flight-to-Quality Guard:
-            #    When 7-14d `F1_Macro` monopolizes the book (`fw_macro > 0.50`) while BOTH 48-96h `t_med <= 0.10`
-            #    and 4-12h `t_fast <= -0.05` (`t_med + t_fast <= -0.15`), Macro is lagging a multi-day reversal.
-            #    Rotates up to 80% of the diverging weight into the 7d-14d Whipsaw / Defensive Sector-RV Specialist.
-            # 2) Bull-Surge Laggard Short-Squeeze & Positive-Beta Guard:
-            #    When `btc_ret_24h > +1.6%` in active Trend, dampens shorting coiled oversold laggards, scales down
-            #    post-surge exhaustion, and enforces non-negative portfolio beta (`port_beta >= +0.03`).
-            if self.enable_holistic_regime_shields and btc_col in close.columns:
-                btc_ret_24h = close[btc_col].pct_change(24, fill_method=None).fillna(0.0)
-                mkt_ret_24h = close.pct_change(24, fill_method=None).mean(axis=1).fillna(0.0)
-                alt_bleed_24h = mkt_ret_24h - btc_ret_24h
+        # Unified Holistic Regime Shields (`enable_holistic_regime_shields` — independent of `enable_chop_range_arb`):
+        if self.enable_holistic_regime_shields and len(cols) >= 4 and btc_col in close.columns:
+            btc_ret_24h = close[btc_col].pct_change(24, fill_method=None).fillna(0.0)
+            mkt_ret_24h = close.pct_change(24, fill_method=None).mean(axis=1).fillna(0.0)
+            alt_bleed_24h = mkt_ret_24h - btc_ret_24h
 
-                t_med_s = t_df["med"]
-                t_fst_s = t_df["fast"]
-                is_lone_macro = (
-                    (fw_norm["macro"] > 0.50) & (t_med_s <= 0.10) & (t_fst_s <= -0.05) & ((t_med_s + t_fst_s) <= -0.15)
+            t_med_s = t_df["med"]
+            t_fst_s = t_df["fast"]
+            is_lone_macro = (
+                (fw_norm["macro"] > 0.50) & (t_med_s <= 0.10) & (t_fst_s <= -0.05) & ((t_med_s + t_fst_s) <= -0.15)
+            )
+            w_whip_spec = make_continuous_neutral_weights(
+                0.35 * w_range_u + 0.25 * w_sect_u + 0.40 * w_whip_u,
+                ones_df,
+                gross_leverage=1.0,
+                power=1.2,
+            )
+            w_defensive = make_continuous_neutral_weights(
+                0.70 * w_whip_u + 0.30 * w_sect_u,
+                ones_df,
+                gross_leverage=1.0,
+                power=1.2,
+            )
+            if has_wf or has_cl:
+                w_whip_spec = cap_side_weights_waterfill(
+                    w_whip_spec,
+                    max_side_share=self.trend_waterfill_cap if has_wf else None,
+                    max_cluster_share=self.alt_cluster_cap if has_cl else None,
                 )
-                w_whip_spec = make_continuous_neutral_weights(
-                    0.35 * w_range_u + 0.25 * w_sect_u + 0.40 * w_whip_u,
-                    ones_df,
-                    gross_leverage=1.0,
-                    power=1.2,
+                w_defensive = cap_side_weights_waterfill(
+                    w_defensive,
+                    max_side_share=self.trend_waterfill_cap if has_wf else None,
+                    max_cluster_share=self.alt_cluster_cap if has_cl else None,
                 )
-                w_defensive = make_continuous_neutral_weights(
-                    0.70 * w_whip_u + 0.30 * w_sect_u,
-                    ones_df,
-                    gross_leverage=1.0,
-                    power=1.2,
-                )
-                if has_wf or has_cl:
-                    w_whip_spec = cap_side_weights_waterfill(
-                        w_whip_spec,
-                        max_side_share=self.trend_waterfill_cap if has_wf else None,
-                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
+            is_bleeding_breakdown = is_lone_macro & ((mkt_ret_24h < -0.005) | (alt_bleed_24h < -0.006))
+            w_target_spec = pd.DataFrame(
+                np.where(is_bleeding_breakdown.values[:, None], w_defensive.values, w_whip_spec.values),
+                index=idx,
+                columns=cols,
+            )
+            div_strength = ((-0.10 - (t_med_s + t_fst_s)) / 0.70).clip(0.0, 1.0) * (
+                (fw_norm["macro"] - 0.45) / 0.45
+            ).clip(0.0, 1.0)
+            blend_lm = (div_strength * 0.80).where(is_lone_macro, 0.0)
+            if is_lone_macro.any():
+                orig_g_lm = w_base_1x.abs().sum(axis=1)
+                w_lm_mix = w_base_1x.mul(1.0 - blend_lm, axis=0) + w_target_spec.mul(blend_lm, axis=0)
+                pos_lm = w_lm_mix.clip(lower=0.0)
+                neg_lm = (-w_lm_mix).clip(lower=0.0)
+                ps_lm = pos_lm.sum(axis=1)
+                ns_lm = neg_lm.sum(axis=1)
+                target_g_lm = orig_g_lm * (1.0 - 0.35 * blend_lm)
+                valid_lm = is_lone_macro & (ps_lm > 1e-8) & (ns_lm > 1e-8)
+                w_lm_norm = pos_lm.div(ps_lm.replace(0, 1.0), axis=0).mul(target_g_lm / 2.0, axis=0) - neg_lm.div(
+                    ns_lm.replace(0, 1.0), axis=0
+                ).mul(target_g_lm / 2.0, axis=0)
+                # If opposing vectors perfectly canceled, fall back directly to w_target_spec scaled to target_g_lm
+                canceled_lm = is_lone_macro & (~valid_lm)
+                if canceled_lm.any():
+                    w_lm_norm.loc[canceled_lm] = w_target_spec.loc[canceled_lm].mul(
+                        target_g_lm.loc[canceled_lm], axis=0
                     )
-                    w_defensive = cap_side_weights_waterfill(
-                        w_defensive,
-                        max_side_share=self.trend_waterfill_cap if has_wf else None,
-                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
-                    )
-                is_bleeding_breakdown = is_lone_macro & ((mkt_ret_24h < -0.005) | (alt_bleed_24h < -0.006))
-                w_target_spec = pd.DataFrame(
-                    np.where(is_bleeding_breakdown.values[:, None], w_defensive.values, w_whip_spec.values),
-                    index=idx,
-                    columns=cols,
-                )
-                div_strength = ((-0.10 - (t_med_s + t_fst_s)) / 0.70).clip(0.0, 1.0) * (
-                    (fw_norm["macro"] - 0.45) / 0.45
-                ).clip(0.0, 1.0)
-                blend_lm = (div_strength * 0.80).where(is_lone_macro, 0.0)
-                w_base_1x = w_base_1x.mul(1.0 - blend_lm, axis=0) + w_target_spec.mul(0.55 * blend_lm, axis=0)
+                w_base_1x = w_base_1x.copy()
+                w_base_1x.loc[is_lone_macro] = w_lm_norm.loc[is_lone_macro]
                 if has_wf or has_cl:
                     w_base_1x = cap_side_weights_waterfill(
                         w_base_1x,
@@ -1293,128 +1339,148 @@ class SevenFactorOnlineEngine:
                     )
                 alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lm)
 
-                # 3) Lone-Rev Concentration Cap & Active Bleed/Squeeze Guard:
-                #    When `F4_Rev` monopolizes the book (`fw_rev > 0.50`) while both `t_macro <= 0.15` and `t_fast <= 0.10`,
-                #    caps `fw_rev <= 0.45`, rotates >= 55% into Intra-Sector Relative-Value (`w_sect_u + w_range_u`),
-                #    dampens catching falling knives (e.g. bleeding laggards) or shorting rising leaders, and scales
-                #    down gross conviction to 0.65.
-                t_mac_s = t_df["macro"]
-                is_lone_rev = (fw_norm["rev"] > 0.50) & (t_mac_s <= 0.15) & (t_fst_s <= 0.10)
-                if is_lone_rev.any():
-                    w_sect_rv_spec = make_continuous_neutral_weights(
-                        0.55 * w_sect_u + 0.45 * w_range_u,
-                        ones_df,
-                        gross_leverage=1.0,
-                        power=1.2,
+            # 3) Lone-Rev Concentration Cap & Active Bleed/Squeeze Guard
+            t_mac_s = t_df["macro"]
+            is_lone_rev = (fw_norm["rev"] > 0.50) & (t_mac_s <= 0.15) & (t_fst_s <= 0.10)
+            if is_lone_rev.any():
+                w_sect_rv_spec = make_continuous_neutral_weights(
+                    0.55 * w_sect_u + 0.45 * w_range_u,
+                    ones_df,
+                    gross_leverage=1.0,
+                    power=1.2,
+                )
+                if has_wf or has_cl:
+                    w_sect_rv_spec = cap_side_weights_waterfill(
+                        w_sect_rv_spec,
+                        max_side_share=0.22,
+                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
                     )
-                    if has_wf or has_cl:
-                        w_sect_rv_spec = cap_side_weights_waterfill(
-                            w_sect_rv_spec,
-                            max_side_share=0.22,
-                            max_cluster_share=self.alt_cluster_cap if has_cl else None,
-                        )
-                    blend_lr = (((fw_norm["rev"] - 0.40) / 0.40).clip(0.45, 0.65)).where(is_lone_rev, 0.0)
-                    w_blended_lr = w_base_1x.mul(1.0 - blend_lr, axis=0) + w_sect_rv_spec.mul(0.60 * blend_lr, axis=0)
-                    active_bleed_long = (
-                        is_lone_rev.values[:, None]
-                        & (w_blended_lr > 0.0)
-                        & (zi[24] < -0.20)
-                        & ((zi[12] < -0.15) | (zr[4] < -0.05))
-                        & (cmf_24 <= 0.02)
+                blend_lr = (((fw_norm["rev"] - 0.40) / 0.40).clip(0.45, 0.65)).where(is_lone_rev, 0.0)
+                w_blended_lr = w_base_1x.mul(1.0 - blend_lr, axis=0) + w_sect_rv_spec.mul(blend_lr, axis=0)
+                active_bleed_long = (
+                    is_lone_rev.values[:, None]
+                    & (w_blended_lr > 0.0)
+                    & (zi[24] < -0.20)
+                    & ((zi[12] < -0.15) | (zr[4] < -0.05))
+                    & (cmf_24 <= 0.02)
+                )
+                active_leader_short = (
+                    is_lone_rev.values[:, None]
+                    & (w_blended_lr < 0.0)
+                    & (zi[24] > 0.20)
+                    & ((zi[12] > 0.15) | (zr[4] > 0.05))
+                )
+                w_guarded_lr = w_blended_lr.where(~active_bleed_long, 0.15 * w_blended_lr).where(
+                    ~active_leader_short, 0.15 * w_blended_lr
+                )
+                pos_lr = w_guarded_lr.clip(lower=0.0)
+                neg_lr = (-w_guarded_lr).clip(lower=0.0)
+                ps_lr = pos_lr.sum(axis=1).replace(0, 1.0)
+                ns_lr = neg_lr.sum(axis=1).replace(0, 1.0)
+                orig_g_lr = w_base_1x.abs().sum(axis=1)
+                target_g_lr = np.minimum(orig_g_lr, 0.72)
+                w_norm_lr = pos_lr.div(ps_lr, axis=0).mul(target_g_lr / 2.0, axis=0) - neg_lr.div(ns_lr, axis=0).mul(
+                    target_g_lr / 2.0, axis=0
+                )
+                if has_wf or has_cl:
+                    w_norm_lr = cap_side_weights_waterfill(
+                        w_norm_lr,
+                        max_side_share=0.22,
+                        max_cluster_share=self.alt_cluster_cap if has_cl else None,
                     )
-                    active_leader_short = (
-                        is_lone_rev.values[:, None]
-                        & (w_blended_lr < 0.0)
-                        & (zi[24] > 0.20)
-                        & ((zi[12] > 0.15) | (zr[4] > 0.05))
-                    )
-                    w_guarded_lr = w_blended_lr.where(~active_bleed_long, 0.15 * w_blended_lr).where(
-                        ~active_leader_short, 0.15 * w_blended_lr
-                    )
-                    pos_lr = w_guarded_lr.clip(lower=0.0)
-                    neg_lr = (-w_guarded_lr).clip(lower=0.0)
-                    ps_lr = pos_lr.sum(axis=1).replace(0, 1.0)
-                    ns_lr = neg_lr.sum(axis=1).replace(0, 1.0)
-                    lr_gross_scale = pd.Series(np.where(is_lone_rev, 0.65, 1.0), index=idx)
-                    target_g_lr = w_base_1x.abs().sum(axis=1) * lr_gross_scale
-                    w_norm_lr = pos_lr.div(ps_lr, axis=0).mul(target_g_lr / 2.0, axis=0) - neg_lr.div(
-                        ns_lr, axis=0
-                    ).mul(target_g_lr / 2.0, axis=0)
-                    if has_wf or has_cl:
-                        w_norm_lr = cap_side_weights_waterfill(
-                            w_norm_lr,
-                            max_side_share=0.22,
-                            max_cluster_share=self.alt_cluster_cap if has_cl else None,
-                        )
-                    w_base_1x.loc[is_lone_rev] = w_norm_lr.loc[is_lone_rev]
-                    conviction = conviction.where(~is_lone_rev, np.minimum(conviction, 0.65))
-                    alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lr)
-                    excess_rev = (fw_norm["rev"] - 0.45).clip(lower=0.0).where(is_lone_rev, 0.0)
-                    fw_norm = fw_norm.copy()
-                    fw_norm["rev"] = fw_norm["rev"] - excess_rev
-                    other_cols = [c for c in fw_norm.columns if c != "rev"]
-                    other_sum = fw_norm[other_cols].sum(axis=1).replace(0, 1.0)
-                    for oc in other_cols:
-                        fw_norm[oc] = fw_norm[oc] + excess_rev * (fw_norm[oc] / other_sum)
+                w_base_1x.loc[is_lone_rev] = w_norm_lr.loc[is_lone_rev]
+                conviction = conviction.where(~is_lone_rev, np.minimum(conviction, 0.72))
+                alpha_chop_overlay = np.maximum(alpha_chop_overlay, blend_lr)
 
-                is_bull_surge = (btc_ret_24h > 0.016) & (max_tr_t > 0.0) & (alpha_chop_overlay < 0.25)
-                coiled_laggard_short = (
-                    is_bull_surge.values[:, None]
-                    & (w_base_1x < 0.0)
-                    & ((zi[24] < -0.20) | (zi[12] < -0.20) | (zi[72] < -0.25))
-                    & (zr[4] > -0.60)
-                )
-                w_adj_b = w_base_1x.where(~coiled_laggard_short, 0.20 * w_base_1x)
-                bull_exhaustion_scale = pd.Series(
-                    np.where(
-                        is_bull_surge & (btc_ret_24h > 0.018),
-                        np.clip(1.0 - ((btc_ret_24h - 0.016) / 0.022) * 0.70, 0.30, 1.0),
-                        1.0,
-                    ),
-                    index=idx,
-                )
-                pos_b0 = w_adj_b.clip(lower=0.0)
-                neg_b0 = (-w_adj_b).clip(lower=0.0)
-                gross_t = w_base_1x.abs().sum(axis=1) * bull_exhaustion_scale
-                p_sum0 = pos_b0.sum(axis=1).replace(0, 1.0)
-                n_sum0 = neg_b0.sum(axis=1).replace(0, 1.0)
-                w_base_1x = pos_b0.div(p_sum0, axis=0).mul(gross_t / 2.0, axis=0) - neg_b0.div(n_sum0, axis=0).mul(
+                excess_rev = (fw_norm["rev"] - 0.45).clip(lower=0.0).where(is_lone_rev, 0.0)
+                fw_norm = fw_norm.copy()
+                other_cols = [c for c in fw_norm.columns if c != "rev"]
+                other_raw_sum = fw_norm[other_cols].sum(axis=1)
+                has_other = other_raw_sum > 0.05
+                fw_norm["rev"] = fw_norm["rev"] - excess_rev.where(has_other, 0.0)
+                safe_other_sum = other_raw_sum.where(has_other, 1.0)
+                for oc in other_cols:
+                    fw_norm[oc] = fw_norm[oc] + excess_rev.where(has_other, 0.0) * (fw_norm[oc] / safe_other_sum)
+
+            is_bull_surge = (btc_ret_24h > 0.016) & (max_tr_t > 0.0) & (alpha_chop_overlay < 0.25)
+            coiled_laggard_short = (
+                is_bull_surge.values[:, None]
+                & (w_base_1x < 0.0)
+                & ((zi[24] < -0.20) | (zi[12] < -0.20) | (zi[72] < -0.25))
+                & (zr[4] > -0.60)
+            )
+            w_adj_b = w_base_1x.where(~coiled_laggard_short, 0.20 * w_base_1x)
+            bull_exhaustion_scale = pd.Series(
+                np.where(
+                    is_bull_surge & (btc_ret_24h > 0.018),
+                    np.clip(1.0 - ((btc_ret_24h - 0.016) / 0.022) * 0.70, 0.30, 1.0),
+                    1.0,
+                ),
+                index=idx,
+            )
+            pos_b0 = w_adj_b.clip(lower=0.0)
+            neg_b0 = (-w_adj_b).clip(lower=0.0)
+            gross_t = w_base_1x.abs().sum(axis=1) * bull_exhaustion_scale
+            p_sum0 = pos_b0.sum(axis=1).replace(0, 1.0)
+            n_sum0 = neg_b0.sum(axis=1).replace(0, 1.0)
+            w_base_1x = pos_b0.div(p_sum0, axis=0).mul(gross_t / 2.0, axis=0) - neg_b0.div(n_sum0, axis=0).mul(
+                gross_t / 2.0, axis=0
+            )
+
+            port_beta_s = (w_base_1x * beta_72).sum(axis=1)
+            b_mean_s = beta_72.mean(axis=1)
+            b_cent_s = beta_72.sub(b_mean_s, axis=0)
+            b_var_s = (b_cent_s**2).sum(axis=1).replace(0, 1.0)
+            need_beta_fix = is_bull_surge & (port_beta_s < 0.03) & (gross_t > 1e-8)
+            if need_beta_fix.any():
+                excess_b = port_beta_s - 0.05
+                adj_f = (excess_b / b_var_s).where(need_beta_fix, 0.0)
+                w_b_fix = w_base_1x.sub(b_cent_s.mul(adj_f, axis=0), axis=0)
+                pos_b1 = w_b_fix.clip(lower=0.0)
+                neg_b1 = (-w_b_fix).clip(lower=0.0)
+                ps_b1 = pos_b1.sum(axis=1).replace(0, 1.0)
+                ns_b1 = neg_b1.sum(axis=1).replace(0, 1.0)
+                w_fixed = pos_b1.div(ps_b1, axis=0).mul(gross_t / 2.0, axis=0) - neg_b1.div(ns_b1, axis=0).mul(
                     gross_t / 2.0, axis=0
                 )
+                w_base_1x.loc[need_beta_fix] = w_fixed.loc[need_beta_fix]
 
-                port_beta_s = (w_base_1x * beta_72).sum(axis=1)
-                b_mean_s = beta_72.mean(axis=1)
-                b_cent_s = beta_72.sub(b_mean_s, axis=0)
-                b_var_s = (b_cent_s**2).sum(axis=1).replace(0, 1.0)
-                need_beta_fix = is_bull_surge & (port_beta_s < 0.03) & (gross_t > 1e-8)
-                if need_beta_fix.any():
-                    excess_b = port_beta_s - 0.05
-                    adj_f = (excess_b / b_var_s).where(need_beta_fix, 0.0)
-                    w_b_fix = w_base_1x.sub(b_cent_s.mul(adj_f, axis=0), axis=0)
-                    pos_b1 = w_b_fix.clip(lower=0.0)
-                    neg_b1 = (-w_b_fix).clip(lower=0.0)
-                    ps_b1 = pos_b1.sum(axis=1).replace(0, 1.0)
-                    ns_b1 = neg_b1.sum(axis=1).replace(0, 1.0)
-                    w_fixed = pos_b1.div(ps_b1, axis=0).mul(gross_t / 2.0, axis=0) - neg_b1.div(ns_b1, axis=0).mul(
-                        gross_t / 2.0, axis=0
-                    )
-                    w_base_1x.loc[need_beta_fix] = w_fixed.loc[need_beta_fix]
+        # All-Negative Factor De-Gross / Cash-Out Gate (`enable_no_edge_gate`):
+        # When all un-gated factors exhibit non-positive/marginal online IC (`max_active_t < 0.15`) AND
+        # the Chop Range-Arb Specialist does not show edge (`alpha_chop_overlay < 0.25`), smoothly de-grosses
+        # down to Cash (`0.0x` at `max_active_t <= -0.05`) instead of forcing 100% exposure in negative-IC factors.
+        if self.enable_no_edge_gate and len(idx) > 36:
+            active_t_mat = t_df.copy()
+            for f_name, min_t in eff_gates.items():
+                if f_name in active_t_mat.columns and min_t is not None:
+                    gate_ok = (t_df_raw[f_name] >= float(min_t)) & (t_df[f_name] >= float(min_t))
+                    active_t_mat[f_name] = active_t_mat[f_name].where(gate_ok, -np.inf)
+            max_active_t = active_t_mat.max(axis=1).replace(-np.inf, -1.0)
+            post_warmup = pd.Series(np.arange(len(idx)) >= 36, index=idx)
+            needs_degross = post_warmup & (max_active_t < 0.15) & (alpha_chop_overlay < 0.25)
+            if needs_degross.any():
+                edge_scale = pd.Series(
+                    np.where(needs_degross, np.clip((max_active_t + 0.05) / 0.20, 0.0, 1.0), 1.0),
+                    index=idx,
+                    dtype=float,
+                )
+                w_base_1x = w_base_1x.mul(edge_scale, axis=0)
+                conviction = conviction * edge_scale
 
         unit_ret_1h = (w_base_1x.shift(1).fillna(0.0) * rets_1h).sum(axis=1)
-        port_vol_72h = unit_ret_1h.rolling(72, min_periods=12).std().bfill().fillna(0.003)
-        median_vol = float(port_vol_72h.median()) if len(port_vol_72h) > 0 else 0.003
-        if median_vol <= 1e-8 or np.isnan(median_vol):
-            median_vol = 0.003
+        port_vol_72h = unit_ret_1h.rolling(72, min_periods=12).std().ffill().fillna(0.003)
+        median_vol_s = port_vol_72h.expanding(min_periods=24).median().ffill().fillna(0.003)
+        median_vol_s = median_vol_s.where((median_vol_s > 1e-8) & np.isfinite(median_vol_s), 0.003)
 
         vol_scalar = (
-            (median_vol / port_vol_72h.replace(0, np.nan))
+            (median_vol_s / port_vol_72h.replace(0, np.nan))
             .clip(self.vol_scalar_bounds[0], self.vol_scalar_bounds[1])
             .fillna(1.0)
         )
         if self.enable_holistic_regime_shields and all(k in t_df.columns for k in ("macro", "fast", "rev")):
             is_weak_trend_chop = (t_df["macro"] <= 0.10) & (t_df["fast"] <= 0.10)
             vol_scalar = pd.Series(
-                np.where(is_weak_trend_chop, np.minimum(vol_scalar, 0.68), vol_scalar),
+                np.where(is_weak_trend_chop, np.minimum(vol_scalar, 0.75), vol_scalar),
                 index=idx,
                 dtype=float,
             )
@@ -1430,7 +1496,7 @@ class SevenFactorOnlineEngine:
             "conviction": conviction,
             "vol_scalar": vol_scalar,
             "port_vol_72h": port_vol_72h,
-            "median_vol": pd.Series(median_vol, index=idx),
+            "median_vol": median_vol_s,
             "beta_72": beta_72,
             "cmf_24": cmf_24,
             "t_cmf": t_cmf,
@@ -1444,6 +1510,59 @@ class SevenFactorOnlineEngine:
             "alpha_chop_overlay": alpha_chop_overlay,
             "vol_24h": vol_24h,
         }
+
+    def compute_weights_matrix(
+        self,
+        close: pd.DataFrame,
+        volume: pd.DataFrame,
+        raw_funding: pd.DataFrame | None = None,
+        funding_settlement: pd.DataFrame | None = None,
+        high: pd.DataFrame | None = None,
+        low: pd.DataFrame | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """
+        Convenience matrix interface for vectorized backtesting (`scripts/run_backtest.py`):
+        constructs per-symbol DataFrames from aligned `(close, volume, funding)` matrices,
+        evaluates `compute_matrices()`, and returns `(w_base_1x, mats)`.
+        """
+        bars_1h: dict[str, pd.DataFrame] = {}
+        funding_rates: dict[str, pd.DataFrame] = {}
+        for sym in close.columns:
+            h_s = high[sym] if (high is not None and sym in high.columns) else close[sym]
+            l_s = low[sym] if (low is not None and sym in low.columns) else close[sym]
+            bars_1h[str(sym)] = pd.DataFrame(
+                {
+                    "timestamp": close.index,
+                    "open": close[sym].values,
+                    "high": h_s.values,
+                    "low": l_s.values,
+                    "close": close[sym].values,
+                    "volume": volume[sym].values if sym in volume.columns else 0.0,
+                },
+                index=close.index,
+            )
+            if raw_funding is not None and sym in raw_funding.columns:
+                funding_rates[str(sym)] = pd.DataFrame(
+                    {
+                        "timestamp": close.index,
+                        "fundingRate": raw_funding[sym].values,
+                    },
+                    index=close.index,
+                )
+            elif funding_settlement is not None and sym in funding_settlement.columns:
+                funding_rates[str(sym)] = pd.DataFrame(
+                    {
+                        "timestamp": close.index,
+                        "fundingRate": funding_settlement[sym].values,
+                    },
+                    index=close.index,
+                )
+
+        mats = self.compute_matrices(
+            bars_1h=bars_1h,
+            funding_rates=funding_rates if funding_rates else None,
+        )
+        return mats["w_base_1x"], mats
 
     def allocate_latest(
         self,

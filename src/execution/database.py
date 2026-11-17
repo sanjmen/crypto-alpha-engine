@@ -431,15 +431,14 @@ class ShadowDatabase:
         timestamp: datetime | None = None,
     ) -> None:
         """Upserts an active or flat position record."""
-        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
-        opened_dt = getattr(position, "opened_at", None)
-        opened_ts = opened_dt.isoformat() if isinstance(opened_dt, datetime) else ts
-        tp_val = take_profit if take_profit is not None else getattr(position, "take_profit", None)
-        sl_val = stop_loss if stop_loss is not None else getattr(position, "stop_loss", None)
-        peak_val = getattr(position, "peak_price", 0.0) or 0.0
-        strat_val = getattr(position, "strategy", None)
-
         with self._lock:
+            ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+            opened_dt = getattr(position, "opened_at", None)
+            opened_ts = opened_dt.isoformat() if isinstance(opened_dt, datetime) else ts
+            tp_val = take_profit if take_profit is not None else getattr(position, "take_profit", None)
+            sl_val = stop_loss if stop_loss is not None else getattr(position, "stop_loss", None)
+            peak_val = getattr(position, "peak_price", 0.0) or 0.0
+            strat_val = getattr(position, "strategy", None)
             cursor = self._conn.cursor()
             cursor.execute(
                 """
@@ -972,11 +971,11 @@ class ShadowDatabase:
                 float(t.get("price", 0.0)),
                 float(t.get("change_24h", 0.0)),
                 float(t.get("volume_24h", 0.0)),
-                float(t.get("high", 0.0)),
-                float(t.get("low", 0.0)),
+                float(t.get("high_24h", t.get("high", 0.0))),
+                float(t.get("low_24h", t.get("low", 0.0))),
                 now,
             )
-            for sym, t in tickers.items()
+            for sym, t in list(tickers.items())
             if t.get("price", 0.0) > 0
         ]
         if not records:

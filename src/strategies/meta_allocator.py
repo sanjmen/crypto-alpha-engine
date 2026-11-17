@@ -207,6 +207,10 @@ class MetaStrategyAllocator:
 
         effective_unit_weights = dict(seven_factor_result.unit_weights)
         if cooldown_blocked_sides:
+            orig_l = sum(v for v in effective_unit_weights.values() if v > 0)
+            orig_s = sum(abs(v) for v in effective_unit_weights.values() if v < 0)
+            orig_leg = max(orig_l, orig_s)
+            blocked_cd = False
             for sym_key, weight_val in list(effective_unit_weights.items()):
                 clean_key = sym_key.replace("/", "")
                 blocked_side = cooldown_blocked_sides.get(clean_key) or cooldown_blocked_sides.get(sym_key)
@@ -215,6 +219,37 @@ class MetaStrategyAllocator:
                     or (weight_val < 0 and blocked_side == PositionSide.SHORT)
                 ):
                     effective_unit_weights[sym_key] = 0.0
+                    blocked_cd = True
+
+            if blocked_cd and orig_leg > 1e-8:
+                l_sum = sum(v for v in effective_unit_weights.values() if v > 0)
+                s_sum = sum(abs(v) for v in effective_unit_weights.values() if v < 0)
+                if l_sum <= 1e-8 or s_sum <= 1e-8:
+                    effective_unit_weights = {k: 0.0 for k in effective_unit_weights}
+                else:
+                    max_u_pos = 0.35 * orig_leg
+                    if 0 < l_sum < 0.50 * orig_leg:
+                        p_keys = [k for k, v in effective_unit_weights.items() if v > 0]
+                        tgt_l = min(orig_leg, len(p_keys) * max_u_pos)
+                        if tgt_l > l_sum:
+                            sc_l = tgt_l / l_sum
+                            for k in p_keys:
+                                effective_unit_weights[k] = min(max_u_pos, effective_unit_weights[k] * sc_l)
+                            l_sum = sum(v for v in effective_unit_weights.values() if v > 0)
+                    if 0 < s_sum < 0.50 * orig_leg:
+                        n_keys = [k for k, v in effective_unit_weights.items() if v < 0]
+                        tgt_s = min(orig_leg, len(n_keys) * max_u_pos)
+                        if tgt_s > s_sum:
+                            sc_s = tgt_s / s_sum
+                            for k in n_keys:
+                                effective_unit_weights[k] = -min(max_u_pos, abs(effective_unit_weights[k]) * sc_s)
+                            s_sum = sum(abs(v) for v in effective_unit_weights.values() if v < 0)
+                    bal_u = min(l_sum, s_sum)
+                    for k, v in list(effective_unit_weights.items()):
+                        if v > 0 and l_sum > bal_u:
+                            effective_unit_weights[k] = v * (bal_u / l_sum)
+                        elif v < 0 and s_sum > bal_u:
+                            effective_unit_weights[k] = v * (bal_u / s_sum)
 
         equity = max(float(portfolio.total_equity), 1.0)
         if current_weights is None and portfolio.positions:

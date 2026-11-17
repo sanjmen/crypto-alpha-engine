@@ -81,7 +81,7 @@ class MarketRegimeClassifier(IRegimeDetector):
         poly = np.polyfit(time_idx, sub_close, 1)
         slope = float(poly[0])
         drift_norm = abs(slope * recent_n) / max(float(sub_close[0]), 1e-6)
-        snr = drift_norm / max(curr_gk, 1e-4)
+        snr = drift_norm / max(curr_gk * float(np.sqrt(recent_n)), 1e-4)
 
         if vol_zscore > self.vol_z_threshold:
             return MarketRegime.VOLATILE

@@ -152,7 +152,11 @@ class EmergencyKillSwitch:
                 if hasattr(exchange_client, "set_leverage"):
                     exchange_client.set_leverage(target_leverage_int, symbol)
             except Exception as err:  # noqa: BLE001
-                logger.warning(f"Could not set leverage={target_leverage_int}x for {symbol}: {err}")
+                err_str = str(err)
+                if "-2028" in err_str or "Leverage reduction is not supported" in err_str:
+                    logger.debug(f"Leverage reduction deferred on {symbol} (open position margin in use): {err}")
+                else:
+                    logger.warning(f"Could not set leverage={target_leverage_int}x for {symbol}: {err}")
 
         return synced
 

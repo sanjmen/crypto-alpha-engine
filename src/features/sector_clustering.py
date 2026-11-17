@@ -206,12 +206,24 @@ class StatisticalSectorClusterer:
 
         self.optimal_k_ = num_clusters
 
-        clustering = AgglomerativeClustering(
-            n_clusters=num_clusters,
-            metric="euclidean" if self.linkage == "ward" else "precomputed",
-            linkage=self.linkage,
-        )
-        self.labels_ = clustering.fit_predict(dist)
+        if self.linkage == "ward":
+            # Ward linkage requires Euclidean feature vectors (standardized return series per asset),
+            # never a precomputed pairwise distance matrix (which triggers SciPy ClusterWarning).
+            std_vals = clean_rets.std(axis=0).replace(0, 1.0).fillna(1.0)
+            norm_feats = clean_rets.sub(clean_rets.mean(axis=0), axis=1).div(std_vals, axis=1).fillna(0.0).values.T
+            clustering = AgglomerativeClustering(
+                n_clusters=num_clusters,
+                metric="euclidean",
+                linkage="ward",
+            )
+            self.labels_ = clustering.fit_predict(norm_feats)
+        else:
+            clustering = AgglomerativeClustering(
+                n_clusters=num_clusters,
+                metric="precomputed",
+                linkage=self.linkage,
+            )
+            self.labels_ = clustering.fit_predict(dist)
 
         self.clusters_ = {}
         for idx, label in enumerate(self.labels_):

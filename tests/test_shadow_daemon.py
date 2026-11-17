@@ -105,11 +105,14 @@ def test_daemon_fast_cycle(daemon: ShadowTradingDaemon):
 
     portfolio, filled_orders = daemon.run_fast_cycle()
     assert portfolio.total_equity == 100_000.0
-    # ETH market low was 3,480.0 > 3,450.0 -> Should remain pending
+    # ETH ask is 3,501.0 > 3,450.0 (and 24h low alone must NOT falsely fill passive limit orders)
     assert len(filled_orders) == 0
-
-    # Now simulate market dipping to 3,440.0
     daemon.exchange.fetch_tickers.return_value["ETH/USDT"]["low"] = 3_440.0
+    _, fake_low_fills = daemon.run_fast_cycle()
+    assert len(fake_low_fills) == 0
+
+    # Now simulate real top-of-book market dipping to 3,440.0 (ask <= 3,450.0)
+    daemon.exchange.fetch_tickers.return_value["ETH/USDT"].update({"last": 3_440.0, "bid": 3_439.0, "ask": 3_441.0})
     portfolio, filled_orders = daemon.run_fast_cycle()
     assert len(filled_orders) == 1
     assert filled_orders[0].symbol == "ETH/USDT"
@@ -935,7 +938,7 @@ def test_three_shield_rules_feature_flags_and_hard_equity_floor():
     assert ff_mn.enable_anomaly_capsule is False
     assert ff_mn.auto_close_anomalies_when_disabled is True
     assert ff_mn.enable_hard_equity_floor is True
-    assert ff_mn.equity_floor_usd == 2600.0
+    assert ff_mn.equity_floor_usd == 2500.0
 
     ff_shd = FeatureFlags.from_env_and_args(mode="shadow", environ={})
     assert ff_shd.enable_anomaly_capsule is True
