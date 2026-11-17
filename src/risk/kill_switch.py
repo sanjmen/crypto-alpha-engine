@@ -13,12 +13,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import logging
 import math
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any
 
 from src.domain.entities import Portfolio
 from src.domain.enums import PositionSide
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_utc(dt: datetime | None) -> datetime:
+    """Normalizes a datetime (or None) into a timezone-aware UTC datetime."""
+    if dt is None:
+        return datetime.now(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -31,8 +38,12 @@ class KillSwitchStatus:
     net_exposure_usd: float
     net_exposure_pct: float
     margin_ratio_pct: float
-    flattened_symbols: List[str] = field(default_factory=list)
+    flattened_symbols: list[str] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def rolling_24h_drawdown_pct(self) -> float:
+        return self.rolling_24h_dd_pct
 
 
 class EmergencyKillSwitch:
@@ -54,23 +65,21 @@ class EmergencyKillSwitch:
         self.lockout_hours = int(lockout_hours)
         self.equity_floor_usd = float(equity_floor_usd)
 
-        self._equity_window_24h: Deque[Tuple[datetime, float]] = deque()
-        self.halted_until: Optional[datetime] = None
+        self._equity_window_24h: deque[tuple[datetime, float]] = deque()
+        self.halted_until: datetime | None = None
         self.last_halt_reason: str = ""
-        self._last_asymmetry_warn_ts: Optional[datetime] = None
+        self._last_asymmetry_warn_ts: datetime | None = None
 
-    def is_locked(self, now: Optional[datetime] = None) -> bool:
+    def is_locked(self, now: datetime | None = None) -> bool:
         """Returns True if the kill-switch is currently in an emergency lockout window."""
-        now_dt = now or datetime.now(timezone.utc)
-        if self.halted_until and now_dt < self.halted_until:
-            return True
-        return False
+        now_dt = _ensure_utc(now)
+        return bool(self.halted_until and now_dt < _ensure_utc(self.halted_until))
 
-    def record_equity(self, equity: float, timestamp: Optional[datetime] = None) -> float:
+    def record_equity(self, equity: float, timestamp: datetime | None = None) -> float:
         """
         Records an equity observation and returns the rolling 24h drawdown fraction (0.0 to 1.0).
         """
-        now_dt = timestamp or datetime.now(timezone.utc)
+        now_dt = _ensure_utc(timestamp)
         cutoff = now_dt - timedelta(hours=24)
         self._equity_window_24h.append((now_dt, float(equity)))
 
@@ -83,36 +92,36 @@ class EmergencyKillSwitch:
         return max(0.0, (peak_24h - float(equity)) / peak_24h)
 
     @staticmethod
-    def compute_net_exposure(portfolio: Portfolio) -> Tuple[float, float, float]:
+    def compute_net_exposure(portfolio: Portfolio) -> tuple[float, float, float]:
         """Returns (long_usd, short_usd, net_usd) across all active portfolio positions."""
         long_usd = 0.0
         short_usd = 0.0
-        for pos in portfolio.positions.values():
-            if pos.side == PositionSide.FLAT or pos.quantity <= 0:
+        for position in portfolio.positions.values():
+            if position.side == PositionSide.FLAT or position.quantity <= 0:
                 continue
-            px = pos.current_price if pos.current_price > 0 else pos.entry_price
-            notional = abs(pos.quantity * px)
-            if pos.side == PositionSide.LONG:
+            price = position.current_price if position.current_price > 0 else position.entry_price
+            notional = abs(position.quantity * price)
+            if position.side == PositionSide.LONG:
                 long_usd += notional
-            elif pos.side == PositionSide.SHORT:
+            elif position.side == PositionSide.SHORT:
                 short_usd += notional
         return long_usd, short_usd, long_usd - short_usd
 
     def sync_margin_and_leverage(
         self,
         exchange_client: Any,
-        symbols: List[str],
+        symbols: list[str],
         effective_leverage: float,
         dry_run: bool = True,
         enforce_one_way_mode: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """
         Synchronizes One-Way Position Mode (`dualSidePosition='false'`), `CROSSED` margin mode,
         and sets per-symbol exchange leverage bracket to `min(5, ceil(effective_leverage))`
         on Binance Futures (`fapi`).
         """
-        target_int_lev = max(1, min(5, int(math.ceil(effective_leverage))))
-        synced: Dict[str, int] = {}
+        target_leverage_int = max(1, min(5, int(math.ceil(effective_leverage))))
+        synced: dict[str, int] = {}
 
         if not dry_run and enforce_one_way_mode:
             try:
@@ -123,27 +132,27 @@ class EmergencyKillSwitch:
                         is_hedged = mode_info.get("hedged")
                 if is_hedged is not False and hasattr(exchange_client, "set_position_mode"):
                     exchange_client.set_position_mode(False)
-            except Exception as e:  # noqa: BLE001
-                err_str = str(e)
+            except Exception as err:  # noqa: BLE001
+                err_str = str(err)
                 if "-4059" in err_str or "No need to change position side" in err_str:
                     logger.debug("Position mode already set to One-Way Mode (-4059).")
                 else:
-                    logger.warning(f"Could not enforce One-Way position mode: {e}")
+                    logger.warning(f"Could not enforce One-Way position mode: {err}")
 
-        for sym in symbols:
-            synced[sym] = target_int_lev
+        for symbol in symbols:
+            synced[symbol] = target_leverage_int
             if dry_run:
                 continue
             try:
                 if hasattr(exchange_client, "set_margin_mode"):
-                    exchange_client.set_margin_mode("cross", sym)
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Margin mode already CROSSED or unchanged for {sym}: {e}")
+                    exchange_client.set_margin_mode("cross", symbol)
+            except Exception as err:  # noqa: BLE001
+                logger.debug(f"Margin mode already CROSSED or unchanged for {symbol}: {err}")
             try:
                 if hasattr(exchange_client, "set_leverage"):
-                    exchange_client.set_leverage(target_int_lev, sym)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"Could not set leverage={target_int_lev}x for {sym}: {e}")
+                    exchange_client.set_leverage(target_leverage_int, symbol)
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"Could not set leverage={target_leverage_int}x for {symbol}: {err}")
 
         return synced
 
@@ -152,19 +161,17 @@ class EmergencyKillSwitch:
         portfolio: Portfolio,
         broker: Any = None,
         margin_ratio: float = 0.0,
-        timestamp: Optional[datetime] = None,
+        timestamp: datetime | None = None,
     ) -> KillSwitchStatus:
         """
         Evaluates all 3 hard safety circuit breakers:
         1. Rolling 24h drawdown >= `max_24h_drawdown_pct` (12%)
         2. Maintenance margin ratio >= `max_margin_ratio` (50%)
-        3. Net dollar exposure asymmetry > `max_net_exposure_pct` (15% of equity)
-
-        If (1) or (2) triggers, cancels all open orders and flattens all positions (`reduceOnly=True`).
+        3. Net dollar exposure asymmetry > `max_net_exposure_pct` (15% of gross/equity)
         """
-        now_dt = timestamp or datetime.now(timezone.utc)
+        now_dt = _ensure_utc(timestamp)
         equity = max(float(portfolio.total_equity), 1.0)
-        dd_24h = self.record_equity(equity, timestamp=now_dt)
+        drawdown_24h = self.record_equity(equity, timestamp=now_dt)
         long_usd, short_usd, net_usd = self.compute_net_exposure(portfolio)
         gross_usd = long_usd + short_usd
         net_pct = abs(net_usd) / max(gross_usd, equity, 1.0)
@@ -173,7 +180,7 @@ class EmergencyKillSwitch:
             return KillSwitchStatus(
                 triggered=True,
                 reason=f"LOCKED: {self.last_halt_reason}",
-                rolling_24h_dd_pct=dd_24h * 100.0,
+                rolling_24h_dd_pct=drawdown_24h * 100.0,
                 net_exposure_usd=net_usd,
                 net_exposure_pct=net_pct * 100.0,
                 margin_ratio_pct=margin_ratio * 100.0,
@@ -182,24 +189,20 @@ class EmergencyKillSwitch:
         trigger_reason = ""
         is_floor_breach = False
         raw_equity = float(portfolio.total_equity)
-        if self.equity_floor_usd > 0.0 and 100.0 < raw_equity <= self.equity_floor_usd:
-            trigger_reason = (
-                f"Hard Equity Floor breached: ${raw_equity:,.2f} <= ${self.equity_floor_usd:,.2f}"
-            )
+        if self.equity_floor_usd > 0.0 and 0.0 < raw_equity <= self.equity_floor_usd:
+            trigger_reason = f"Hard Equity Floor breached: ${raw_equity:,.2f} <= ${self.equity_floor_usd:,.2f}"
             is_floor_breach = True
-        elif dd_24h >= self.max_24h_drawdown_pct:
+        elif drawdown_24h >= self.max_24h_drawdown_pct:
             trigger_reason = (
-                f"24h Drawdown {dd_24h*100:.2f}% breached limit {self.max_24h_drawdown_pct*100:.2f}%"
+                f"24h Drawdown {drawdown_24h * 100:.2f}% breached limit {self.max_24h_drawdown_pct * 100:.2f}%"
             )
         elif margin_ratio >= self.max_margin_ratio:
-            trigger_reason = (
-                f"Margin Ratio {margin_ratio*100:.2f}% breached limit {self.max_margin_ratio*100:.2f}%"
-            )
+            trigger_reason = f"Margin Ratio {margin_ratio * 100:.2f}% breached limit {self.max_margin_ratio * 100:.2f}%"
 
-        flattened: List[str] = []
+        flattened: list[str] = []
         if trigger_reason:
-            lock_hrs = max(self.lockout_hours, 8760) if is_floor_breach else self.lockout_hours
-            self.halted_until = now_dt + timedelta(hours=lock_hrs)
+            lockout_hrs = max(self.lockout_hours, 8760) if is_floor_breach else self.lockout_hours
+            self.halted_until = now_dt + timedelta(hours=lockout_hrs)
             self.last_halt_reason = trigger_reason
             logger.critical(f"🚨 EMERGENCY KILL-SWITCH TRIGGERED: {trigger_reason}")
             if broker is not None and hasattr(broker, "emergency_flatten_all"):
@@ -207,31 +210,27 @@ class EmergencyKillSwitch:
             return KillSwitchStatus(
                 triggered=True,
                 reason=trigger_reason,
-                rolling_24h_dd_pct=dd_24h * 100.0,
+                rolling_24h_dd_pct=drawdown_24h * 100.0,
                 net_exposure_usd=net_usd,
                 net_exposure_pct=net_pct * 100.0,
                 margin_ratio_pct=margin_ratio * 100.0,
                 flattened_symbols=flattened,
             )
 
-        # Check Net Exposure Asymmetry Guard
         if net_pct > self.max_net_exposure_pct:
-            asym_reason = (
-                f"Net Exposure Asymmetry {net_pct*100:.2f}% (${net_usd:+,.2f}) "
-                f"exceeded {self.max_net_exposure_pct*100:.2f}% limit"
+            asymmetry_reason = (
+                f"Net Exposure Asymmetry {net_pct * 100:.2f}% (${net_usd:+,.2f}) "
+                f"exceeded {self.max_net_exposure_pct * 100:.2f}% limit"
             )
-            if (
-                self._last_asymmetry_warn_ts is None
-                or (now_dt - self._last_asymmetry_warn_ts).total_seconds() >= 300.0
-            ):
-                logger.warning(f"⚠️ {asym_reason}")
+            if self._last_asymmetry_warn_ts is None or (now_dt - self._last_asymmetry_warn_ts).total_seconds() >= 300.0:
+                logger.warning(f"⚠️ {asymmetry_reason}")
                 self._last_asymmetry_warn_ts = now_dt
             if broker is not None and hasattr(broker, "hedge_excess_exposure"):
                 broker.hedge_excess_exposure(net_usd)
             return KillSwitchStatus(
                 triggered=True,
-                reason=asym_reason,
-                rolling_24h_dd_pct=dd_24h * 100.0,
+                reason=asymmetry_reason,
+                rolling_24h_dd_pct=drawdown_24h * 100.0,
                 net_exposure_usd=net_usd,
                 net_exposure_pct=net_pct * 100.0,
                 margin_ratio_pct=margin_ratio * 100.0,
@@ -240,7 +239,7 @@ class EmergencyKillSwitch:
         return KillSwitchStatus(
             triggered=False,
             reason="OK",
-            rolling_24h_dd_pct=dd_24h * 100.0,
+            rolling_24h_dd_pct=drawdown_24h * 100.0,
             net_exposure_usd=net_usd,
             net_exposure_pct=net_pct * 100.0,
             margin_ratio_pct=margin_ratio * 100.0,

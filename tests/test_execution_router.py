@@ -3,6 +3,7 @@ Unit tests for SmartExecutionRouter.
 """
 
 import pytest
+
 from src.domain.enums import OrderSide, OrderType
 from src.execution.execution_router import ExecutionUrgency, SmartExecutionRouter
 from src.execution.paper_broker import PaperExecutionBroker
@@ -52,7 +53,7 @@ def test_maker_fill_probability_decay():
     assert prob_far < 0.20
 
 
-def test_m13_issue_47_level2_obi_adaptive_maker_routing():
+def test_level2_obi_adaptive_maker_routing():
     """
     Tests Issue #47 (Level-2 Order Book Imbalance OBI_5 Adaptive Maker Routing):
     1) compute_order_book_imbalance accurately computes (V_bid - V_ask) / (V_bid + V_ask) across top 5 levels.
@@ -93,4 +94,3 @@ def test_m13_issue_47_level2_obi_adaptive_maker_routing():
         obi=0.50,
     )
     assert pytest.approx(ord_favorable.price, abs=1e-6) == 200.0
-

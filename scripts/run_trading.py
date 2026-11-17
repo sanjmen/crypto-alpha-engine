@@ -26,7 +26,7 @@ from pathlib import Path
 import signal
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -131,9 +131,7 @@ def resolve_mode_config(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Unified Multi-Mode Trading Engine (Shadow / Testnet / Mainnet)"
-    )
+    parser = argparse.ArgumentParser(description="Unified Multi-Mode Trading Engine (Shadow / Testnet / Mainnet)")
     parser.add_argument("--daemon", action="store_true", help="Run the autonomous trading daemon loop")
     parser.add_argument("--monitor", action="store_true", help="Launch the real-time Rich terminal telemetry dashboard")
     parser.add_argument("--once", action="store_true", help="Execute a single synchronous step and print status")
@@ -143,47 +141,99 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Execution mode: shadow (data/shadow_trading.db), testnet (data/testnet_trading.db), or mainnet (data/live_trading.db)",
     )
-    parser.add_argument("--shadow", action="store_true", help="Run in local Shadow Lab mode (read-only Mainnet feeds, 0 capital risk)")
-    parser.add_argument("--testnet", action="store_true", help="Run on Binance Futures Testnet (data/testnet_trading.db)")
-    parser.add_argument("--mainnet", action="store_true", help="Run LIVE on Binance USDS-M Futures Mainnet (data/live_trading.db)")
-    parser.add_argument("--smoke-test", action="store_true", help="Run 5-stage exchange connectivity & order lifecycle smoke test")
-    parser.add_argument("--smoke-symbol", type=str, default="DOGE/USDT", help="Symbol for --smoke-test (default: DOGE/USDT)")
-    parser.add_argument("--smoke-notional", type=float, default=6.0, help="Target USD notional for --smoke-test (default: 6.0)")
-    parser.add_argument("--configure-only", action="store_true", help="Configure One-Way mode, Cross Margin & Leverage on exchange and exit")
+    parser.add_argument(
+        "--shadow", action="store_true", help="Run in local Shadow Lab mode (read-only Mainnet feeds, 0 capital risk)"
+    )
+    parser.add_argument(
+        "--testnet", action="store_true", help="Run on Binance Futures Testnet (data/testnet_trading.db)"
+    )
+    parser.add_argument(
+        "--mainnet", action="store_true", help="Run LIVE on Binance USDS-M Futures Mainnet (data/live_trading.db)"
+    )
+    parser.add_argument(
+        "--smoke-test", action="store_true", help="Run 5-stage exchange connectivity & order lifecycle smoke test"
+    )
+    parser.add_argument(
+        "--smoke-symbol", type=str, default="DOGE/USDT", help="Symbol for --smoke-test (default: DOGE/USDT)"
+    )
+    parser.add_argument(
+        "--smoke-notional", type=float, default=6.0, help="Target USD notional for --smoke-test (default: 6.0)"
+    )
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Configure One-Way mode, Cross Margin & Leverage on exchange and exit",
+    )
     parser.add_argument(
         "--capital",
         type=float,
         default=None,
         help="Initial portfolio capital in USDT (default: 3000.0 in --shadow, 1000.0 in --mainnet)",
     )
-    parser.add_argument("--rebalance-now", action="store_true", help="Force an immediate 7-Factor rebalance cycle on daemon startup")
-    parser.add_argument("--reset", action="store_true", help="Reset all previous database records in the selected mode DB before starting")
+    parser.add_argument(
+        "--rebalance-now", action="store_true", help="Force an immediate 7-Factor rebalance cycle on daemon startup"
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Reset all previous database records in the selected mode DB before starting",
+    )
     parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="Override path to SQLite database")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (e.g. 'BTC/USDT,ETH/USDT')")
-    parser.add_argument("--fast-interval", type=float, default=10.0, help="Fast loop interval in seconds (default: 10.0)")
-    parser.add_argument("--rebalance-interval", type=float, default=14400.0, help="Rebalance interval in seconds (default: 14400 = 4h)")
+    parser.add_argument(
+        "--fast-interval", type=float, default=10.0, help="Fast loop interval in seconds (default: 10.0)"
+    )
+    parser.add_argument(
+        "--rebalance-interval", type=float, default=14400.0, help="Rebalance interval in seconds (default: 14400 = 4h)"
+    )
     parser.add_argument("--start-leverage", type=float, default=2.5, help="Initial gross leverage tier (default: 2.5x)")
-    parser.add_argument("--max-leverage", type=float, default=5.0, help="Maximum stepped gross leverage tier (default: 5.0x)")
-    parser.add_argument("--step-leverage", type=float, default=0.5, help="Leverage increment per HWM milestone (default: 0.5x)")
-    parser.add_argument("--milestone-gain", type=float, default=0.15, help="HWM compound gain required per +0.5x step (default: 0.15 = +15%%)")
-    parser.add_argument("--dd-bracket", type=float, default=0.10, help="Drawdown bracket for SteppedLeverageController de-stepping (default: 0.10)")
+    parser.add_argument(
+        "--max-leverage", type=float, default=5.0, help="Maximum stepped gross leverage tier (default: 5.0x)"
+    )
+    parser.add_argument(
+        "--step-leverage", type=float, default=0.5, help="Leverage increment per HWM milestone (default: 0.5x)"
+    )
+    parser.add_argument(
+        "--milestone-gain",
+        type=float,
+        default=0.15,
+        help="HWM compound gain required per +0.5x step (default: 0.15 = +15%%)",
+    )
+    parser.add_argument(
+        "--dd-bracket",
+        type=float,
+        default=0.10,
+        help="Drawdown bracket for SteppedLeverageController de-stepping (default: 0.10)",
+    )
     parser.add_argument(
         "--market-neutral-3x",
         action="store_true",
         help="Lever #3 preset: Start at 3.0x Market-Neutral base leverage with tighter 6%% DD de-step bracket",
     )
     parser.add_argument(
+        "--enable-experimental-satellites",
         "--enable-m13",
+        dest="enable_experimental_satellites",
         action="store_true",
-        help="Explicitly enable quarantined M13 satellite extensions (Harvester & 4.5%% Anomaly Sizing) in --mainnet/--testnet",
+        help="Explicitly enable quarantined experimental satellite extensions (Harvester & 4.5%% Anomaly Sizing) in --mainnet/--testnet",
     )
     parser.add_argument(
         "--legacy-baseline-priors",
         action="store_true",
-        help="Revert to legacy static BASELINE_20D_PRIORS instead of M15 Dynamic Online IC Softmax + F6 Gate",
+        help="Revert to legacy static BASELINE_20D_PRIORS instead of Dynamic Online IC Softmax + Liquidity Gate",
     )
-    parser.add_argument("--f6-min-tstat", type=float, default=0.75, help="Lever #1: Minimum t-stat required to activate F6_Liq_Surge (default: 0.75)")
-    parser.add_argument("--anomaly-pct-equity", type=float, default=0.045, help="Lever #2: Max anomaly notional as fraction of total equity (default: 0.045 = 4.5%%)")
+    parser.add_argument(
+        "--f6-min-tstat",
+        type=float,
+        default=0.75,
+        help="Lever #1: Minimum t-stat required to activate F6_Liq_Surge (default: 0.75)",
+    )
+    parser.add_argument(
+        "--anomaly-pct-equity",
+        type=float,
+        default=0.045,
+        help="Lever #2: Max anomaly notional as fraction of total equity (default: 0.045 = 4.5%%)",
+    )
     parser.add_argument(
         "--anomaly-prefer-maker",
         dest="anomaly_prefer_maker",
@@ -197,8 +247,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable Maker Limit-Chase on Anomaly entries and use Market orders",
     )
-    parser.add_argument("--max-single-clip-usd", type=float, default=10000.0, help="Lever #4: Max single child clip USD before automatic order chunking (default: 10000.0)")
-    parser.add_argument("--legacy-allocator", action="store_true", help="Use legacy 3-strategy allocator instead of the 7-Factor Causal Online Engine")
+    parser.add_argument(
+        "--max-single-clip-usd",
+        type=float,
+        default=10000.0,
+        help="Lever #4: Max single child clip USD before automatic order chunking (default: 10000.0)",
+    )
+    parser.add_argument(
+        "--legacy-allocator",
+        action="store_true",
+        help="Use legacy 3-strategy allocator instead of the 7-Factor Causal Online Engine",
+    )
     parser.add_argument(
         "--enable-anomalies",
         dest="enable_anomalies",
@@ -247,14 +306,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit --audit-readiness scorecard as machine-readable JSON",
     )
     parser.add_argument("--enable-pairs", action="store_true", help="Enable Cointegrated Pairs strategy")
-    parser.add_argument("--anomaly-size", type=float, default=15.0, help="Max dollar allocation per anomaly event (default: 15.0 USDT)")
-    parser.add_argument("--min-volume", type=float, default=20000000.0, help="Minimum 24h volume filter in USDT for anomaly scanning (default: 20M)")
-    parser.add_argument("--profit-lock-trigger", type=float, default=0.035, help="Peak gain required to arm Core Profit-Lock Stop-Profit (default: 0.035)")
-    parser.add_argument("--profit-lock-level", type=float, default=0.015, help="Net profit floor locked when Core Profit-Lock triggers (default: 0.015)")
-    parser.add_argument("--trailing-trigger", type=float, default=0.0, help="Peak gain required to arm Core continuous Trailing Stop (default: 0.0 [disabled])")
-    parser.add_argument("--trailing-distance", type=float, default=0.020, help="Distance behind peak price for Core Trailing Stop (default: 0.020)")
-    parser.add_argument("--core-tp", type=float, default=0.050, help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.050 = +5.0%%)")
-    parser.add_argument("--core-sl", type=float, default=None, help="Initial protective Stop-Loss distance for core/7-Factor legs (default: None [disabled])")
+    parser.add_argument(
+        "--anomaly-size", type=float, default=15.0, help="Max dollar allocation per anomaly event (default: 15.0 USDT)"
+    )
+    parser.add_argument(
+        "--min-volume",
+        type=float,
+        default=20000000.0,
+        help="Minimum 24h volume filter in USDT for anomaly scanning (default: 20M)",
+    )
+    parser.add_argument(
+        "--profit-lock-trigger",
+        type=float,
+        default=0.035,
+        help="Peak gain required to arm Core Profit-Lock Stop-Profit (default: 0.035)",
+    )
+    parser.add_argument(
+        "--profit-lock-level",
+        type=float,
+        default=0.015,
+        help="Net profit floor locked when Core Profit-Lock triggers (default: 0.015)",
+    )
+    parser.add_argument(
+        "--trailing-trigger",
+        type=float,
+        default=0.0,
+        help="Peak gain required to arm Core continuous Trailing Stop (default: 0.0 [disabled])",
+    )
+    parser.add_argument(
+        "--trailing-distance",
+        type=float,
+        default=0.020,
+        help="Distance behind peak price for Core Trailing Stop (default: 0.020)",
+    )
+    parser.add_argument(
+        "--core-tp",
+        type=float,
+        default=0.050,
+        help="Passive Maker Take-Profit distance for core/7-Factor legs (default: 0.050 = +5.0%%)",
+    )
+    parser.add_argument(
+        "--core-sl",
+        type=float,
+        default=None,
+        help="Initial protective Stop-Loss distance for core/7-Factor legs (default: None [disabled])",
+    )
     return parser
 
 
@@ -267,7 +363,7 @@ class CheckgateResult:
     details: str
 
 
-def evaluate_shadow_readiness(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
+def evaluate_shadow_readiness(db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
     """
     Evaluates all quantitative Go/No-Go checkgates from `db_path`:
     1. Dollar Neutrality Check: |Long_USD - Short_USD| / Equity <= 5.0%
@@ -304,14 +400,10 @@ def evaluate_shadow_readiness(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
 
     # 1. Dollar Neutrality Check
     long_usd = sum(
-        p.quantity * (p.current_price or p.entry_price)
-        for p in positions.values()
-        if p.side.value == "LONG"
+        p.quantity * (p.current_price or p.entry_price) for p in positions.values() if p.side.value == "LONG"
     )
     short_usd = sum(
-        p.quantity * (p.current_price or p.entry_price)
-        for p in positions.values()
-        if p.side.value == "SHORT"
+        p.quantity * (p.current_price or p.entry_price) for p in positions.values() if p.side.value == "SHORT"
     )
     net_usd = long_usd - short_usd
     net_pct = abs(net_usd) / equity * 100.0
@@ -383,7 +475,7 @@ def evaluate_shadow_readiness(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
         ),
     )
 
-    gates: List[CheckgateResult] = [gate_neutral, gate_beta, gate_maker, gate_dd, gate_cycle]
+    gates: list[CheckgateResult] = [gate_neutral, gate_beta, gate_maker, gate_dd, gate_cycle]
     all_passed = all(g.passed for g in gates)
 
     return {
@@ -438,12 +530,16 @@ def main() -> None:
     db_path = cfg["db_path"]
     effective_capital = float(cfg["capital"])
 
-    is_m13_experimental = (mode == "shadow") or getattr(args, "enable_m13", False)
-    is_m15_core = is_m13_experimental or not getattr(args, "legacy_baseline_priors", False)
+    enable_experimental_satellites = (
+        (mode == "shadow")
+        or getattr(args, "enable_experimental_satellites", False)
+        or getattr(args, "enable_m13", False)
+    )
+    enable_dynamic_factor_ic = enable_experimental_satellites or not getattr(args, "legacy_baseline_priors", False)
     feature_flags = FeatureFlags.from_env_and_args(
         args=args,
         mode=mode,
-        is_m15_core=is_m15_core,
+        enable_institutional_data_feeds=enable_dynamic_factor_ic,
     )
 
     if getattr(args, "show_flags", False) or getattr(args, "set_flag", None):
@@ -507,9 +603,7 @@ def main() -> None:
             max_24h_drawdown_pct=float(getattr(args, "max_24h_dd", 0.065) or 0.065),
             max_net_exposure_pct=0.15,
             max_margin_ratio=0.50,
-            equity_floor_usd=(
-                feature_flags.equity_floor_usd if feature_flags.enable_hard_equity_floor else 0.0
-            ),
+            equity_floor_usd=(feature_flags.equity_floor_usd if feature_flags.enable_hard_equity_floor else 0.0),
         )
         live_broker = BinanceLiveBroker(
             api_key=api_key,
@@ -557,14 +651,14 @@ def main() -> None:
         logger.info(f"Resetting database records in {db_path}...")
         db.reset_all_data()
 
-    # Milestone M15 Selective Promotion (Issues #61, #62, #63):
-    # - M15 Proven Core (Dynamic Online IC Softmax, F6 Gate t>=0.75, F8 Smart Money Flow,
+    # Selective Core & Experimental Satellites Promotion (Issues #61, #62, #63, #64, #65):
+    # - Proven Core (Dynamic Online IC Softmax, F6 Gate t>=0.75, F8 Smart Money Flow,
     #   Quarterly Delivery Basis Scalar, Yield Collateral) is enabled in ALL modes (--mainnet & --shadow).
-    # - Quarantined M13 Satellite Extensions (Extreme Funding Harvester [Issue #64] & 4.5% Dynamic
-    #   Anomaly Sizing [Issue #65]) remain restricted to --shadow (or explicit --enable-m13).
-    is_m13_experimental = (mode == "shadow") or getattr(args, "enable_m13", False)
-    is_m15_core = is_m13_experimental or not getattr(args, "legacy_baseline_priors", False)
-    use_mn_3x = getattr(args, "market_neutral_3x", False) or is_m13_experimental
+    # - Quarantined Satellite Extensions (Extreme Funding Harvester [Issue #64] & 4.5% Dynamic
+    #   Anomaly Sizing [Issue #65]) remain restricted to --shadow (or explicit --enable-experimental-satellites).
+    enable_experimental_satellites = (mode == "shadow") or getattr(args, "enable_experimental_satellites", False)
+    enable_dynamic_factor_ic = enable_experimental_satellites or not getattr(args, "legacy_baseline_priors", False)
+    use_mn_3x = getattr(args, "market_neutral_3x", False) or enable_experimental_satellites
     start_lev = 3.0 if use_mn_3x and args.start_leverage == 2.5 else args.start_leverage
     dd_bracket_val = 0.06 if use_mn_3x and args.dd_bracket == 0.10 else args.dd_bracket
 
@@ -577,15 +671,15 @@ def main() -> None:
         "liq": 0.11,
         "size": 0.18,
     }
-    priors_cfg = None if is_m15_core else BASELINE_20D_PRIORS
-    f6_gate_cfg = args.f6_min_tstat if is_m15_core else None
+    priors_cfg = None if enable_dynamic_factor_ic else BASELINE_20D_PRIORS
+    f6_gate_cfg = args.f6_min_tstat if enable_dynamic_factor_ic else None
 
     broker = ShadowExecutionBroker(
         database=db,
         initial_cash=effective_capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         live_broker=live_broker,
-        enable_yield_collateral=is_m15_core,
+        enable_yield_collateral=enable_dynamic_factor_ic,
     )
     if not cfg["is_live"]:
         broker.scale_capital(effective_capital)
@@ -622,17 +716,17 @@ def main() -> None:
     )
 
     if use_seven_factor:
-        if is_m13_experimental:
-            suite_tag = "M13 Full Suite"
-        elif is_m15_core:
-            suite_tag = "M15 Selective Core + 100% Maker Priority"
+        if enable_experimental_satellites:
+            suite_tag = "Experimental Full Suite"
+        elif enable_dynamic_factor_ic:
+            suite_tag = "Dynamic Online IC Core + 100% Maker Priority"
         else:
             suite_tag = "Baseline 20d + 100% Maker Priority"
         f6_tag = f"t>={f6_gate_cfg:.2f}" if f6_gate_cfg is not None else "Baseline"
         logger.info(
             f"7-Factor Causal Online Engine ENABLED [{mode.upper()} | {suite_tag}] | Capital: ${effective_capital:,.2f} | "
             f"Stepped Leverage: {start_lev:.1f}x -> {args.max_leverage:.1f}x "
-            f"(+{args.step_leverage:.1f}x per +{args.milestone_gain*100:.0f}% HWM | "
+            f"(+{args.step_leverage:.1f}x per +{args.milestone_gain * 100:.0f}% HWM | "
             f"F6 Gate: {f6_tag} | Maker Priority: {args.anomaly_prefer_maker})"
         )
 
@@ -643,7 +737,7 @@ def main() -> None:
         create_illiquid_oversold_bounce,
     )
 
-    is_small_test = (args.anomaly_size <= 25.0 and effective_capital <= 1000.0)
+    is_small_test = args.anomaly_size <= 25.0 and effective_capital <= 1000.0
     bounce_strat = create_illiquid_oversold_bounce(test_mode=is_small_test)
     bounce_strat.symbols_filter = None
     bounce_strat.max_position_usd = args.anomaly_size
@@ -654,9 +748,9 @@ def main() -> None:
     fade_strat.symbols_filter = None
     fade_strat.max_position_usd = args.anomaly_size
 
-    # Issue #64 (M15-4): Quarantine Extreme Funding Harvester from Mainnet until recalibrated
+    # Issue #64: Quarantine Extreme Funding Harvester from Mainnet until recalibrated
     harvester_strat = None
-    if is_m13_experimental:
+    if enable_experimental_satellites:
         harvester_strat = create_extreme_funding_harvester(test_mode=is_small_test)
         harvester_strat.symbols_filter = None
         harvester_strat.max_position_usd = args.anomaly_size
@@ -681,15 +775,15 @@ def main() -> None:
     eff_trailing_trigger = args.trailing_trigger if args.trailing_trigger is not None else 0.0
     eff_core_sl = args.core_sl if (args.core_sl is not None and args.core_sl > 0) else None
     logger.info(
-        f"🛡️ Core Bracket Profile [{mode.upper()}]: TP={eff_core_tp*100:.1f}% (Maker), "
-        f"Profit-Lock={args.profit_lock_trigger*100:.1f}%->{args.profit_lock_level*100:.1f}%, "
-        f"Trailing={'DISABLED' if not eff_trailing_trigger or eff_trailing_trigger <= 0 else f'{eff_trailing_trigger*100:.1f}%/{args.trailing_distance*100:.1f}%'}, "
-        f"Initial SL={'DISABLED' if not eff_core_sl or eff_core_sl <= 0 else f'-{eff_core_sl*100:.1f}%'}"
+        f"🛡️ Core Bracket Profile [{mode.upper()}]: TP={eff_core_tp * 100:.1f}% (Maker), "
+        f"Profit-Lock={args.profit_lock_trigger * 100:.1f}%->{args.profit_lock_level * 100:.1f}%, "
+        f"Trailing={'DISABLED' if not eff_trailing_trigger or eff_trailing_trigger <= 0 else f'{eff_trailing_trigger * 100:.1f}%/{args.trailing_distance * 100:.1f}%'}, "
+        f"Initial SL={'DISABLED' if not eff_core_sl or eff_core_sl <= 0 else f'-{eff_core_sl * 100:.1f}%'}"
     )
     logger.info(
         f"🚩 Feature Flags & 3 Reglas de Blindaje [{mode.upper()}]: "
         f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
-        f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct*100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
+        f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
         f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
         f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"
@@ -708,8 +802,8 @@ def main() -> None:
         enable_market_scan=True,
         enable_anomalies=feature_flags.enable_anomaly_capsule,
         anomaly_size=args.anomaly_size,
-        # Issue #65 (M15-5): Quarantine 4.5% dynamic anomaly equity sizing from Mainnet (keep $45 cap)
-        anomaly_pct_equity=args.anomaly_pct_equity if is_m13_experimental else None,
+        # Issue #65: Quarantine 4.5% dynamic anomaly equity sizing from Mainnet (keep $45 cap)
+        anomaly_pct_equity=args.anomaly_pct_equity if enable_experimental_satellites else None,
         anomaly_prefer_maker=args.anomaly_prefer_maker,
         enable_smart_money=feature_flags.enable_smart_money,
         enable_quarterly_basis=feature_flags.enable_quarterly_basis,
@@ -735,12 +829,12 @@ def main() -> None:
             )
         ),
     )
-    # In --shadow mode, automatically trigger an immediate rebalance on startup so new M13 changes apply right away
+    # In --shadow mode, automatically trigger an immediate rebalance on startup so new experimental changes apply right away
     if getattr(args, "rebalance_now", False) or (mode == "shadow"):
         daemon.last_rebalance_time = None
     elif mode == "mainnet" and priors_cfg is None and hasattr(db, "get_latest_seven_factor_telemetry"):
-        # Issue #61 (M15-1): Auto-trigger a one-time rebalance when upgrading Mainnet from static
-        # BASELINE_20D_PRIORS (where negative-tstat factors still held >5% weight) to M15 Dynamic IC + F6 Gate
+        # Issue #61: Auto-trigger a one-time rebalance when upgrading Mainnet from static
+        # BASELINE_20D_PRIORS (where negative-tstat factors still held >5% weight) to Dynamic IC + F6 Gate
         sf_prev = db.get_latest_seven_factor_telemetry() or {}
         prev_w = sf_prev.get("factor_weights") or {}
         prev_t = sf_prev.get("factor_tstats") or {}
@@ -750,7 +844,9 @@ def main() -> None:
         )
         tier_changed = abs(float(sf_prev.get("unlocked_tier") or start_lev) - start_lev) > 0.1
         if has_legacy_prior_weights or tier_changed:
-            logger.info("🚀 [M15 Upgrade] Legacy static-prior weights or base leverage tier change detected — scheduling immediate rebalance.")
+            logger.info(
+                "🚀 [Dynamic IC Upgrade] Legacy static-prior weights or base leverage tier change detected — scheduling immediate rebalance."
+            )
             daemon.last_rebalance_time = None
 
     if args.once:

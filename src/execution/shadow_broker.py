@@ -5,10 +5,11 @@ enforcing hard safety circuit breakers, passive Maker touch execution,
 taker slippage, 8h funding cashflows, and local SQLite persistence.
 """
 
-import logging
-import uuid
+import contextlib
 from datetime import datetime, timezone
+import logging
 from typing import Any
+import uuid
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
@@ -39,12 +40,12 @@ class ShadowExecutionBroker(IExecutionClient):
         self,
         database: ShadowDatabase | None = None,
         initial_cash: float = 100_000.0,
-        taker_fee_pct: float = 0.0004,     # 0.04% taker
-        maker_fee_pct: float = 0.0002,     # 0.02% maker
-        slippage_bps: float = 1.0,         # 1 bp slippage for market orders
-        max_gross_leverage: float = 2.5,   # Hard circuit breaker
+        taker_fee_pct: float = 0.0004,  # 0.04% taker
+        maker_fee_pct: float = 0.0002,  # 0.02% maker
+        slippage_bps: float = 1.0,  # 1 bp slippage for market orders
+        max_gross_leverage: float = 2.5,  # Hard circuit breaker
         max_order_notional: float = 25_000.0,
-        max_drawdown_stop: float = 0.15,   # 15% drawdown halts execution
+        max_drawdown_stop: float = 0.15,  # 15% drawdown halts execution
         impact_model: NonLinearMarketImpactModel | None = None,
         capacity_ceiling: CapitalCapacityCeiling | None = None,
         enforce_capacity_ceiling: bool = False,
@@ -181,7 +182,7 @@ class ShadowExecutionBroker(IExecutionClient):
                     else:
                         ex_pos.opened_at = datetime.now(timezone.utc)
                         ex_pos.peak_price = ex_pos.entry_price
-                        ex_pos.strategy = (local_pos.strategy if local_pos and local_pos.strategy else "7-Factor Core")
+                        ex_pos.strategy = local_pos.strategy if local_pos and local_pos.strategy else "7-Factor Core"
                         self.portfolio.positions[sym] = ex_pos
                         self.db.save_position(ex_pos)
 
@@ -215,14 +216,10 @@ class ShadowExecutionBroker(IExecutionClient):
 
         symbol = order.symbol
         if symbol not in self._configured_live_symbols:
-            try:
+            with contextlib.suppress(Exception):
                 self.live_broker.client.set_margin_mode("cross", symbol)
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 self.live_broker.client.set_leverage(self._current_live_leverage, symbol)
-            except Exception:
-                pass
             self._configured_live_symbols.add(symbol)
 
         pos = self.portfolio.positions.get(symbol)
@@ -369,9 +366,16 @@ class ShadowExecutionBroker(IExecutionClient):
             )
         return trades
 
-    def verify_risk_circuit_breakers(self, symbol: str, quantity: float, est_price: float) -> None:
+    def verify_risk_circuit_breakers(
+        self,
+        symbol: str,
+        quantity: float,
+        est_price: float,
+        side: OrderSide | None = None,
+    ) -> None:
         """
         Enforces 3 non-negotiable safety circuit breakers before order creation.
+        Position-reducing orders bypass the gross-leverage ceiling check so de-risking is never blocked.
         """
         order_notional = quantity * est_price
         if order_notional > self.max_order_notional:
@@ -385,16 +389,29 @@ class ShadowExecutionBroker(IExecutionClient):
         drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if drawdown >= self.max_drawdown_stop:
             raise MaxDrawdownStopError(
-                f"Hard emergency stop: drawdown {drawdown*100:.2f}% exceeds {self.max_drawdown_stop*100:.2f}%"
+                f"Hard emergency stop: drawdown {drawdown * 100:.2f}% exceeds {self.max_drawdown_stop * 100:.2f}%"
             )
 
-        current_gross = sum(abs(p.market_value) for p in self.portfolio.positions.values())
-        new_gross = current_gross + order_notional
-        new_leverage = new_gross / max(current_equity, 1.0)
-        if new_leverage > self.max_gross_leverage:
-            raise MaxLeverageExceededError(
-                f"Projected gross leverage {new_leverage:.2f}x exceeds ceiling {self.max_gross_leverage:.2f}x"
+        pos = self.portfolio.positions.get(symbol)
+        is_reducing = bool(
+            side is not None
+            and pos is not None
+            and pos.side != PositionSide.FLAT
+            and pos.quantity > 0
+            and (
+                (pos.side == PositionSide.LONG and side == OrderSide.SELL)
+                or (pos.side == PositionSide.SHORT and side == OrderSide.BUY)
             )
+            and quantity <= pos.quantity * 1.001
+        )
+        if not is_reducing:
+            current_gross = sum(abs(p.market_value) for p in self.portfolio.positions.values())
+            new_gross = current_gross + order_notional
+            new_leverage = new_gross / max(current_equity, 1.0)
+            if new_leverage > self.max_gross_leverage:
+                raise MaxLeverageExceededError(
+                    f"Projected gross leverage {new_leverage:.2f}x exceeds ceiling {self.max_gross_leverage:.2f}x"
+                )
 
     def create_order(
         self,
@@ -416,7 +433,7 @@ class ShadowExecutionBroker(IExecutionClient):
         est_price = price or self.market_prices.get(symbol, 100.0)
 
         # 1. Enforce safety circuit breakers
-        self.verify_risk_circuit_breakers(symbol, quantity, est_price)
+        self.verify_risk_circuit_breakers(symbol, quantity, est_price, side=side)
 
         if self.enforce_capacity_ceiling and self.capacity_ceiling:
             order_notional = est_price * quantity
@@ -731,8 +748,11 @@ class ShadowExecutionBroker(IExecutionClient):
         """
         pending_orders = self.db.get_pending_orders()
         filled_orders: list[Order] = []
+        canceled_order_ids: set[str] = set()
 
         for order in pending_orders:
+            if order.id in canceled_order_ids:
+                continue
             symbol = order.symbol
             tick = symbol_ticks.get(symbol) or symbol_ticks.get(symbol.replace("/", ""))
             if not tick or order.price is None:
@@ -748,23 +768,32 @@ class ShadowExecutionBroker(IExecutionClient):
             should_fill = False
             if order.order_type == OrderType.TAKE_PROFIT:
                 # Sell TP triggers when current market price rises to/above target; Buy TP triggers when current drops to/below target
-                if order.side == OrderSide.SELL and (bid >= limit_price or current >= limit_price):
-                    should_fill = True
-                elif order.side == OrderSide.BUY and (ask <= limit_price or current <= limit_price):
+                if (
+                    order.side == OrderSide.SELL
+                    and (bid >= limit_price or current >= limit_price)
+                    or order.side == OrderSide.BUY
+                    and (ask <= limit_price or current <= limit_price)
+                ):
                     should_fill = True
             elif order.order_type == OrderType.STOP_LOSS:
                 # Sell SL triggers when current market price drops to/below stop; Buy SL triggers when current rises to/above stop
-                if order.side == OrderSide.SELL and (bid <= limit_price or current <= limit_price):
-                    should_fill = True
-                elif order.side == OrderSide.BUY and (ask >= limit_price or current >= limit_price):
+                if (
+                    order.side == OrderSide.SELL
+                    and (bid <= limit_price or current <= limit_price)
+                    or order.side == OrderSide.BUY
+                    and (ask >= limit_price or current >= limit_price)
+                ):
                     should_fill = True
             else:
                 # Standard passive LIMIT order:
                 # Buy limit fills when market ask, current, or low drops to or crosses limit
                 # Sell limit fills when market bid, current, or high rises to or crosses limit
-                if order.side == OrderSide.BUY and (ask <= limit_price or current <= limit_price or low <= limit_price):
-                    should_fill = True
-                elif order.side == OrderSide.SELL and (bid >= limit_price or current >= limit_price or high >= limit_price):
+                if (
+                    order.side == OrderSide.BUY
+                    and (ask <= limit_price or current <= limit_price or low <= limit_price)
+                    or order.side == OrderSide.SELL
+                    and (bid >= limit_price or current >= limit_price or high >= limit_price)
+                ):
                     should_fill = True
 
             if should_fill:
@@ -778,16 +807,20 @@ class ShadowExecutionBroker(IExecutionClient):
                     if self.is_live and order.order_type == OrderType.LIMIT:
                         order.status = OrderStatus.CANCELED
                         self.db.update_order_status(order.id, OrderStatus.CANCELED)
+                        canceled_order_ids.add(order.id)
                     continue
                 if order.status == OrderStatus.FILLED:
                     filled_orders.append(order)
 
                     # OCO bracket logic: Cancel opposing bracket order if TP or SL triggered
                     if order.order_type in (OrderType.TAKE_PROFIT, OrderType.STOP_LOSS):
-                        opposing = OrderType.STOP_LOSS if order.order_type == OrderType.TAKE_PROFIT else OrderType.TAKE_PROFIT
+                        opposing = (
+                            OrderType.STOP_LOSS if order.order_type == OrderType.TAKE_PROFIT else OrderType.TAKE_PROFIT
+                        )
                         for other in self.db.get_pending_orders():
                             if other.symbol == symbol and other.order_type == opposing:
                                 self.db.update_order_status(other.id, OrderStatus.CANCELED)
+                                canceled_order_ids.add(other.id)
 
         return filled_orders
 
@@ -925,7 +958,11 @@ class ShadowExecutionBroker(IExecutionClient):
         flattened: list[str] = []
         if self.is_live and self.live_broker is not None:
             for sym, pos in self.portfolio.positions.items():
-                if pos.side != PositionSide.FLAT and pos.quantity > 0 and sym not in self.live_broker.portfolio.positions:
+                if (
+                    pos.side != PositionSide.FLAT
+                    and pos.quantity > 0
+                    and sym not in self.live_broker.portfolio.positions
+                ):
                     self.live_broker.portfolio.positions[sym] = Position(
                         symbol=sym,
                         side=pos.side,
@@ -1003,9 +1040,8 @@ class ShadowExecutionBroker(IExecutionClient):
                 pos.strategy = trade.strategy
 
             # Existing position
-            is_increasing = (
-                (pos.side == PositionSide.LONG and trade.side == OrderSide.BUY)
-                or (pos.side == PositionSide.SHORT and trade.side == OrderSide.SELL)
+            is_increasing = (pos.side == PositionSide.LONG and trade.side == OrderSide.BUY) or (
+                pos.side == PositionSide.SHORT and trade.side == OrderSide.SELL
             )
 
             if is_increasing:
@@ -1069,7 +1105,11 @@ class ShadowExecutionBroker(IExecutionClient):
         self.db.save_position(pos, realized_pnl=realized_pnl)
 
         # Keep any active TP/SL bracket order quantities synchronized with updated position size
-        if pos.side != PositionSide.FLAT and pos.quantity > 0 and (pos.take_profit is not None or pos.stop_loss is not None):
+        if (
+            pos.side != PositionSide.FLAT
+            and pos.quantity > 0
+            and (pos.take_profit is not None or pos.stop_loss is not None)
+        ):
             self.create_bracket_orders(symbol=symbol, take_profit=pos.take_profit, stop_loss=pos.stop_loss)
 
         return realized_pnl

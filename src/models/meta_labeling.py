@@ -9,14 +9,12 @@ by filtering false positives and sizing positions via the Kelly Criterion.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    brier_score_loss,
-    roc_auc_score,
-)
+from sklearn.metrics import brier_score_loss, roc_auc_score
 
 from src.domain.entities import Signal
 
@@ -24,6 +22,7 @@ from src.domain.entities import Signal
 @dataclass
 class MetaLabelingReport:
     """Performance telemetry for the Secondary Meta-Classifier."""
+
     auc_roc: float
     brier_score: float
     precision_filtered: float
@@ -38,12 +37,7 @@ class KellyPositionSizer:
     into optimal Kelly or Fractional Kelly position sizing.
     """
 
-    def __init__(self, kelly_fraction: float = 0.5, max_leverage: float = 1.0):
-        """
-        Args:
-            kelly_fraction: Fraction of full Kelly to deploy (default 0.5 = half-Kelly for tail protection).
-            max_leverage: Maximum absolute leverage per position (default 1.0 = 100% notional).
-        """
+    def __init__(self, kelly_fraction: float = 0.5, max_leverage: float = 1.0) -> None:
         if not (0.0 < kelly_fraction <= 1.0):
             raise ValueError("kelly_fraction must be in (0, 1]")
         self.kelly_fraction = kelly_fraction
@@ -56,25 +50,22 @@ class KellyPositionSizer:
         size = side * max(0.0, 2 * P - 1) * kelly_fraction
         When P <= 0.5, size is 0.0 (trade is rejected).
         """
-        if prob_success <= 0.5:
+        if prob_success <= 0.5 or side == 0.0:
             return 0.0
 
-        raw_kelly = 2.0 * prob_success - 1.0  # Scales from 0.0 to 1.0 for P in [0.5, 1.0]
-        allocated = raw_kelly * self.kelly_fraction * self.max_leverage
-        allocated = min(allocated, self.max_leverage)
-
-        sign = 1.0 if side >= 0 else -1.0
-        return sign * allocated
+        raw_kelly = 2.0 * prob_success - 1.0
+        allocated = min(raw_kelly * self.kelly_fraction * self.max_leverage, self.max_leverage)
+        sign = 1.0 if side > 0 else -1.0
+        return float(sign * allocated)
 
     def size_batch(self, probs: np.ndarray, sides: np.ndarray) -> np.ndarray:
         """Vectorized computation of signed positions."""
-        probs = np.asarray(probs, dtype=np.float64)
-        sides = np.asarray(sides, dtype=np.float64)
-        active_mask = probs > 0.5
-        raw_kelly = np.where(active_mask, 2.0 * probs - 1.0, 0.0)
+        probs_arr = np.asarray(probs, dtype=np.float64)
+        sides_arr = np.asarray(sides, dtype=np.float64)
+        active_mask = probs_arr > 0.5
+        raw_kelly = np.where(active_mask, 2.0 * probs_arr - 1.0, 0.0)
         allocated = np.clip(raw_kelly * self.kelly_fraction * self.max_leverage, 0.0, self.max_leverage)
-        signed_sizes = np.sign(sides) * allocated
-        return signed_sizes
+        return np.sign(sides_arr) * allocated
 
 
 class SecondaryMetaClassifier:
@@ -86,10 +77,10 @@ class SecondaryMetaClassifier:
 
     def __init__(
         self,
-        lgb_params: dict | None = None,
+        lgb_params: dict[str, Any] | None = None,
         kelly_fraction: float = 0.5,
         max_leverage: float = 1.0,
-    ):
+    ) -> None:
         self.lgb_params = lgb_params or {
             "objective": "binary",
             "metric": "binary_logloss",
@@ -118,28 +109,20 @@ class SecondaryMetaClassifier:
     ) -> "SecondaryMetaClassifier":
         """
         Fits the secondary classifier on meta-features and Triple Barrier labels.
-
-        Args:
-            X: DataFrame of meta-features at event inception (t0).
-            y: Binary target from Triple Barrier (1 = profit-take, 0 = stopped out).
-            sample_weights: Optional Series of sample uniqueness/return-attribution weights.
         """
         valid_mask = ~(X.isna().any(axis=1) | y.isna())
         valid_arr = valid_mask.values if hasattr(valid_mask, "values") else np.asarray(valid_mask)
-        X_clean = X.iloc[valid_arr].copy()
-        y_clean = y.iloc[valid_arr].astype(int).copy()
+        features_clean = X.iloc[valid_arr].copy()
+        targets_clean = y.iloc[valid_arr].astype(int).copy()
 
-        if len(X_clean) == 0:
+        if len(features_clean) == 0:
             raise ValueError("No valid samples for training MetaClassifier.")
 
-        self.feature_names = list(X_clean.columns)
-        weights_clean = None
-        if sample_weights is not None:
-            weights_clean = sample_weights.iloc[valid_arr].values
+        self.feature_names = list(features_clean.columns)
+        weights_clean = sample_weights.iloc[valid_arr].values if sample_weights is not None else None
 
         self.model = lgb.LGBMClassifier(**self.lgb_params)
-        self.model.fit(X_clean, y_clean, sample_weight=weights_clean)
-
+        self.model.fit(features_clean, targets_clean, sample_weight=weights_clean)
         return self
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
@@ -147,9 +130,8 @@ class SecondaryMetaClassifier:
         if self.model is None:
             raise RuntimeError("MetaClassifier must be fitted before predict_proba.")
 
-        X_aligned = X[self.feature_names].fillna(0.0)
-        probs = self.model.predict_proba(X_aligned)[:, 1]
-        return probs
+        features_aligned = X[self.feature_names].fillna(0.0)
+        return np.asarray(self.model.predict_proba(features_aligned)[:, 1], dtype=np.float64)
 
     def evaluate_filter(
         self,
@@ -162,10 +144,8 @@ class SecondaryMetaClassifier:
         probs = self.predict_proba(X_test)
         y_true = y_test.values.astype(int)
 
-        # Baseline unfiltered precision (win rate of primary model)
         baseline_precision = float(np.mean(y_true))
 
-        # Filtered trades: only trades where P > 0.5 are taken
         filtered_mask = probs > 0.5
         if np.sum(filtered_mask) > 0:
             filtered_precision = float(np.mean(y_true[filtered_mask]))
@@ -177,9 +157,8 @@ class SecondaryMetaClassifier:
         auc = float(roc_auc_score(y_true, probs)) if len(np.unique(y_true)) > 1 else 0.5
         brier = float(brier_score_loss(y_true, probs))
 
-        # Sharpe ratio uplift heuristic: Precision improvement / sqrt(Trades ratio)
         if trades_ratio > 0 and baseline_precision > 0:
-            sharpe_uplift = (filtered_precision / baseline_precision) * np.sqrt(trades_ratio)
+            sharpe_uplift = float((filtered_precision / baseline_precision) * np.sqrt(trades_ratio))
         else:
             sharpe_uplift = 1.0
 
@@ -199,13 +178,6 @@ class SecondaryMetaClassifier:
     ) -> list[Signal]:
         """
         Filters and sizes primary alpha signals using the secondary meta-classifier.
-
-        Args:
-            primary_signals: Signals emitted by primary model (score in [-1, 1]).
-            meta_features: DataFrame indexed by symbol containing current meta-factors.
-
-        Returns:
-            List of sized Signal objects. Unprofitable signals are vetoed (score = 0.0).
         """
         if not primary_signals:
             return []
@@ -213,28 +185,33 @@ class SecondaryMetaClassifier:
         if self.model is None:
             return primary_signals
 
-        sized_signals = []
+        present_symbols = [sig.symbol for sig in primary_signals if sig.symbol in meta_features.index]
+        prob_by_symbol: dict[str, float] = {}
+        if present_symbols:
+            batch_features = meta_features.loc[present_symbols]
+            batch_probs = self.predict_proba(batch_features)
+            for sym, prob_val in zip(present_symbols, batch_probs, strict=False):
+                prob_by_symbol[sym] = float(prob_val)
+
+        sized_signals: list[Signal] = []
         for sig in primary_signals:
-            sym = sig.symbol
-            if sym not in meta_features.index:
-                # If symbol not in meta-features, retain original signal
+            if sig.symbol not in prob_by_symbol:
                 sized_signals.append(sig)
                 continue
 
-            row_feat = meta_features.loc[[sym]]
-            prob_success = float(self.predict_proba(row_feat)[0])
-            primary_side = 1.0 if sig.score >= 0 else -1.0
-
-            # Compute Kelly size
+            prob_success = prob_by_symbol[sig.symbol]
+            primary_side = 1.0 if sig.score > 0 else (-1.0 if sig.score < 0 else 0.0)
             allocated_weight = self.sizer.compute_size(prob_success, primary_side)
 
-            # Updated signal
-            sized_signals.append(Signal(
-                timestamp=sig.timestamp,
-                symbol=sig.symbol,
-                score=float(allocated_weight),
-                confidence=float(prob_success),
-                horizon_minutes=sig.horizon_minutes,
-            ))
+            sized_signals.append(
+                Signal(
+                    timestamp=sig.timestamp,
+                    symbol=sig.symbol,
+                    score=float(allocated_weight),
+                    confidence=float(prob_success),
+                    horizon_minutes=sig.horizon_minutes,
+                    metadata=dict(sig.metadata),
+                )
+            )
 
         return sized_signals

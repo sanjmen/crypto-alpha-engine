@@ -1,7 +1,4 @@
-from unittest.mock import patch, MagicMock
-from pathlib import Path
-import subprocess
-import pytest
+from unittest.mock import MagicMock, patch
 
 from src.cloud.colab_client import ColabClient
 
@@ -16,7 +13,7 @@ def test_get_active_sessions(mock_run):
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout="[colab] Active sessions:\nSession Name       GPU   Status\n--------------------------------\n[crypto_ingest]   None  Running\n[casmi_a100]      A100  Running\n",
-        stderr=""
+        stderr="",
     )
     client = ColabClient()
     sessions = client.get_active_sessions()
@@ -35,7 +32,7 @@ def test_ensure_session_cpu(mock_run):
     # Case 2: not active, create new CPU session
     mock_run.side_effect = [
         MagicMock(returncode=0, stdout="No active sessions found on server.\n", stderr=""),
-        MagicMock(returncode=0, stdout="Session created\n", stderr="")
+        MagicMock(returncode=0, stdout="Session created\n", stderr=""),
     ]
     client2 = ColabClient(session_name="fresh_cpu")
     assert client2.ensure_session() is True

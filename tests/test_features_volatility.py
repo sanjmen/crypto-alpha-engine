@@ -1,13 +1,12 @@
 import numpy as np
-import pytest
 
 from src.features.volatility import (
-    realized_volatility,
-    parkinson_volatility,
-    garman_klass_volatility,
-    rogers_satchell_volatility,
     OnlineEWMAVolatility,
     OnlineGARCH11,
+    garman_klass_volatility,
+    parkinson_volatility,
+    realized_volatility,
+    rogers_satchell_volatility,
 )
 
 
@@ -33,7 +32,7 @@ def test_volatility_estimators_basic():
 
 def test_online_ewma_and_garch():
     ewma = OnlineEWMAVolatility(decay=0.94, initial_vol=0.02)
-    v1 = ewma.update(0.01)
+    ewma.update(0.01)
     v2 = ewma.update(0.03)
     assert v2 > 0.0
 

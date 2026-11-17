@@ -13,10 +13,11 @@ Implements:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from dataclasses import dataclass
 import logging
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -322,10 +323,8 @@ class ExchangeRateLimiter:
             retry_after_str = header_map.get("retry-after")
             cooldown_sec = self.config.default_cooldown_on_429_seconds
             if retry_after_str is not None:
-                try:
+                with contextlib.suppress(ValueError):
                     cooldown_sec = max(5.0, float(retry_after_str))
-                except ValueError:
-                    pass
 
             reason = "IP Ban Warning (HTTP 418)" if status_code == 418 else "Rate Limit Exceeded (HTTP 429)"
             self.trigger_cooldown(cooldown_sec, reason=reason)

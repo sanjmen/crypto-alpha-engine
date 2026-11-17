@@ -1,9 +1,8 @@
 from datetime import datetime, timezone
-import pytest
 
 from src.domain.entities import Signal
-from src.risk.vol_targeting import VolatilityTargetingSizer
 from src.risk.kelly_sizing import FractionalKellySizer
+from src.risk.vol_targeting import VolatilityTargetingSizer
 
 
 def test_volatility_targeting_sizer():

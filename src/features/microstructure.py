@@ -22,39 +22,46 @@ def corwin_schultz_spread(
     Computes Corwin-Schultz (2012) Bid-Ask Spread from consecutive high-low pairs.
     Returns effective percentage spread per bar (floored at 0).
     """
-    h = np.asarray(high, dtype=np.float64)
-    l = np.asarray(low, dtype=np.float64)
+    high_arr = np.asarray(high, dtype=np.float64)
+    low_arr = np.asarray(low, dtype=np.float64)
 
-    n = len(h)
-    if n < 2 or len(l) != n:
-        return np.zeros(n, dtype=np.float64)
+    num_bars = len(high_arr)
+    if num_bars < 2 or len(low_arr) != num_bars:
+        return np.zeros(num_bars, dtype=np.float64)
 
-    spreads = np.zeros(n, dtype=np.float64)
+    spreads = np.zeros(num_bars, dtype=np.float64)
     sqrt2 = np.sqrt(2.0)
     denom = 3.0 - 2.0 * sqrt2
 
-    for t in range(1, n):
-        h0, l0 = h[t - 1], l[t - 1]
-        h1, l1 = h[t], l[t]
+    for bar_idx in range(1, num_bars):
+        high_prev, low_prev = high_arr[bar_idx - 1], low_arr[bar_idx - 1]
+        high_curr, low_curr = high_arr[bar_idx], low_arr[bar_idx]
 
-        if h0 <= 0 or l0 <= 0 or h1 <= 0 or l1 <= 0 or h0 < l0 or h1 < l1:
-            spreads[t] = 0.0
+        if (
+            high_prev <= 0
+            or low_prev <= 0
+            or high_curr <= 0
+            or low_curr <= 0
+            or high_prev < low_prev
+            or high_curr < low_curr
+        ):
+            spreads[bar_idx] = 0.0
             continue
 
-        hl0 = np.log(h0 / l0)
-        hl1 = np.log(h1 / l1)
-        beta = hl0**2 + hl1**2
+        hl_prev = np.log(high_prev / low_prev)
+        hl_curr = np.log(high_curr / low_curr)
+        beta = hl_prev**2 + hl_curr**2
 
-        h2 = max(h0, h1)
-        l2 = min(l0, l1)
-        gamma = (np.log(h2 / l2)) ** 2
+        high_2bar = max(high_prev, high_curr)
+        low_2bar = min(low_prev, low_curr)
+        gamma = (np.log(high_2bar / low_2bar)) ** 2
 
         alpha = (sqrt2 * np.sqrt(beta) - np.sqrt(beta)) / denom - np.sqrt(gamma / denom)
         if alpha < 0:
-            spreads[t] = 0.0
+            spreads[bar_idx] = 0.0
         else:
             spread = 2.0 * (np.exp(alpha) - 1.0) / (1.0 + np.exp(alpha))
-            spreads[t] = max(0.0, float(spread))
+            spreads[bar_idx] = max(0.0, float(spread))
 
     return spreads
 
@@ -69,9 +76,9 @@ def rolling_corwin_schultz_spread(
     Useful for smoothing single-bar microstructure noise.
     """
     raw_spreads = corwin_schultz_spread(high, low)
-    s = pd.Series(raw_spreads)
-    rolling_s = s.rolling(window=window, min_periods=1).mean().values
-    return np.asarray(rolling_s, dtype=np.float64)
+    spread_series = pd.Series(raw_spreads)
+    rolling_spread = spread_series.rolling(window=window, min_periods=1).mean().values
+    return np.asarray(rolling_spread, dtype=np.float64)
 
 
 def roll_effective_spread(prices: np.ndarray | pd.Series | list[float]) -> float:
@@ -79,12 +86,13 @@ def roll_effective_spread(prices: np.ndarray | pd.Series | list[float]) -> float
     Computes Roll (1984) Effective Spread from serial covariance of price increments.
     S = 2 * sqrt(-cov(dr_t, dr_{t-1})) when cov < 0, else 0.
     """
-    p = np.asarray(prices, dtype=np.float64)
-    if len(p) < 3:
+    prices_arr = np.asarray(prices, dtype=np.float64)
+    prices_arr = prices_arr[np.isfinite(prices_arr) & (prices_arr > 0)]
+    if len(prices_arr) < 4:
         return 0.0
 
-    rets = np.diff(np.log(p))
-    cov = np.cov(rets[1:], rets[:-1])[0, 1] if len(rets) > 2 else 0.0
+    rets = np.diff(np.log(prices_arr))
+    cov = float(np.cov(rets[1:], rets[:-1])[0, 1]) if len(rets) > 2 else 0.0
 
     if cov < 0:
         return float(2.0 * np.sqrt(-cov))
@@ -99,19 +107,19 @@ def amihud_illiquidity(
     Computes Amihud (2002) Illiquidity ratio:
     ILLIQ = mean( |r_t| / Volume_t )
     """
-    r = np.asarray(returns, dtype=np.float64)
-    v = np.asarray(volumes, dtype=np.float64)
+    returns_arr = np.asarray(returns, dtype=np.float64)
+    volumes_arr = np.asarray(volumes, dtype=np.float64)
 
-    if len(r) == 0 or len(v) != len(r):
+    if len(returns_arr) == 0 or len(volumes_arr) != len(returns_arr):
         return 0.0
 
-    valid_mask = v > 0
+    valid_mask = (volumes_arr > 0) & np.isfinite(returns_arr) & np.isfinite(volumes_arr)
     if not np.any(valid_mask):
         return 0.0
 
-    r_v = np.abs(r[valid_mask])
-    v_v = v[valid_mask]
-    illiq = np.mean(r_v / v_v)
+    abs_rets = np.abs(returns_arr[valid_mask])
+    valid_vols = volumes_arr[valid_mask]
+    illiq = np.mean(abs_rets / valid_vols)
     return float(illiq)
 
 
@@ -121,14 +129,15 @@ def rolling_amihud_illiquidity(
     window: int = 24,
 ) -> np.ndarray:
     """Computes rolling Amihud illiquidity over a specified bar window."""
-    r = np.asarray(returns, dtype=np.float64)
-    v = np.asarray(volumes, dtype=np.float64)
-    n = len(r)
-    if n == 0 or len(v) != n:
-        return np.zeros(n, dtype=np.float64)
+    returns_arr = np.asarray(returns, dtype=np.float64)
+    volumes_arr = np.asarray(volumes, dtype=np.float64)
+    num_bars = len(returns_arr)
+    if num_bars == 0 or len(volumes_arr) != num_bars:
+        return np.zeros(num_bars, dtype=np.float64)
 
-    ratio = np.where(v > 0, np.abs(r) / np.maximum(v, 1.0), 0.0)
-    s = pd.Series(ratio)
-    rolling_illiq = s.rolling(window=window, min_periods=1).mean().values
+    valid_mask = (volumes_arr > 0) & np.isfinite(returns_arr) & np.isfinite(volumes_arr)
+    ratio = np.zeros(num_bars, dtype=np.float64)
+    np.divide(np.abs(returns_arr), volumes_arr, out=ratio, where=valid_mask)
+    ratio_series = pd.Series(ratio)
+    rolling_illiq = ratio_series.rolling(window=window, min_periods=1).mean().values
     return np.asarray(rolling_illiq, dtype=np.float64)
-

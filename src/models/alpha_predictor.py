@@ -6,12 +6,13 @@ Ported and adapted from the institutional architecture in datacrunch-2.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any
+
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import Ridge
-import lightgbm as lgb
 
 from src.domain.entities import Signal
 from src.ports.model_ports import IAlphaModel
@@ -21,16 +22,16 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
     """
     Ensemble model combining L2-regularized linear Ridge and LightGBM GBDT.
     Predicts cross-sectional relative performance across the asset universe.
-    Enforces dollar neutrality and Gaussian rank normalization.
+    Enforces dollar neutrality and cross-sectional rank normalization.
     """
 
     def __init__(
         self,
         ridge_alpha: float = 100.0,
-        lgb_params: Optional[Dict] = None,
+        lgb_params: dict[str, Any] | None = None,
         ridge_weight: float = 0.5,
         lgb_weight: float = 0.5,
-    ):
+    ) -> None:
         self.ridge_alpha = ridge_alpha
         self.ridge_weight = ridge_weight
         self.lgb_weight = lgb_weight
@@ -47,9 +48,9 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
             "n_jobs": -1,
         }
 
-        self.ridge_model: Optional[Ridge] = None
-        self.lgb_model: Optional[lgb.LGBMRegressor] = None
-        self.feature_names: List[str] = []
+        self.ridge_model: Ridge | None = None
+        self.lgb_model: lgb.LGBMRegressor | None = None
+        self.feature_names: list[str] = []
 
     def fit(self, features: pd.DataFrame, targets: pd.Series) -> "CrossSectionalAlphaPredictor":
         """
@@ -57,23 +58,22 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
         features: DataFrame where rows are (timestamp, symbol) observations and columns are factors.
         targets: Series of forward returns or cross-sectional ranks.
         """
-        # Clean NaNs and Infinities
-        valid_mask = ~(features.isna().any(axis=1) | targets.isna() | np.isinf(targets))
-        X = features.loc[valid_mask].copy()
-        y = targets.loc[valid_mask].copy()
+        valid_mask = ~(
+            features.isna().any(axis=1) | np.isinf(features).any(axis=1) | targets.isna() | np.isinf(targets)
+        )
+        features_clean = features.loc[valid_mask].copy()
+        targets_clean = targets.loc[valid_mask].copy()
 
-        if len(X) == 0:
+        if len(features_clean) == 0:
             raise ValueError("No valid training samples after dropping NaNs.")
 
-        self.feature_names = list(X.columns)
+        self.feature_names = list(features_clean.columns)
 
-        # 1. Fit Ridge Regression
         self.ridge_model = Ridge(alpha=self.ridge_alpha)
-        self.ridge_model.fit(X, y)
+        self.ridge_model.fit(features_clean, targets_clean)
 
-        # 2. Fit LightGBM Regressor
         self.lgb_model = lgb.LGBMRegressor(**self.lgb_params)
-        self.lgb_model.fit(X, y)
+        self.lgb_model.fit(features_clean, targets_clean)
 
         return self
 
@@ -84,22 +84,33 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
         if self.ridge_model is None or self.lgb_model is None:
             raise RuntimeError("Model must be fitted before calling predict.")
 
-        X = features[self.feature_names].fillna(0.0)
+        features_aligned = features[self.feature_names].fillna(0.0)
 
-        preds_ridge = self.ridge_model.predict(X)
-        preds_lgb = self.lgb_model.predict(X)
+        preds_ridge = self.ridge_model.predict(features_aligned)
+        preds_lgb = self.lgb_model.predict(features_aligned)
 
-        # Standardize individual model predictions
-        std_ridge = np.std(preds_ridge) or 1.0
-        std_lgb = np.std(preds_lgb) or 1.0
+        std_ridge = float(np.std(preds_ridge))
+        std_lgb = float(np.std(preds_lgb))
 
-        norm_ridge = (preds_ridge - np.mean(preds_ridge)) / std_ridge
-        norm_lgb = (preds_lgb - np.mean(preds_lgb)) / std_lgb
+        norm_ridge = (
+            (preds_ridge - float(np.mean(preds_ridge))) / std_ridge
+            if (np.isfinite(std_ridge) and std_ridge > 1e-8)
+            else np.zeros_like(preds_ridge)
+        )
+        norm_lgb = (
+            (preds_lgb - float(np.mean(preds_lgb))) / std_lgb
+            if (np.isfinite(std_lgb) and std_lgb > 1e-8)
+            else np.zeros_like(preds_lgb)
+        )
 
         blended = (self.ridge_weight * norm_ridge) + (self.lgb_weight * norm_lgb)
-        return blended
+        return np.asarray(blended, dtype=np.float64)
 
-    def predict(self, features: pd.DataFrame) -> List[Signal]:
+    def predict(
+        self,
+        features: pd.DataFrame,
+        timestamp: datetime | None = None,
+    ) -> list[Signal]:
         """
         Generates normalized, dollar-neutral Signal objects for each asset.
         features: DataFrame where index contains symbols or has a 'symbol' column.
@@ -111,7 +122,6 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
         else:
             symbols = [str(idx) for idx in features.index]
 
-        # Cross-sectional rank transform to [-1.0, 1.0]
         n_assets = len(blended_preds)
         if n_assets == 0:
             return []
@@ -119,24 +129,23 @@ class CrossSectionalAlphaPredictor(IAlphaModel):
         if n_assets == 1:
             ranks = np.array([0.0])
         else:
-            ranks = stats.rankdata(blended_preds) / (n_assets + 1.0)  # Uniform (0, 1)
-            ranks = (ranks - 0.5) * 2.0  # Zero-mean centered [-1.0, 1.0]
+            ranks = stats.rankdata(blended_preds) / (n_assets + 1.0)
+            ranks = (ranks - 0.5) * 2.0
 
-        # Dollar neutralization: sum of weights = 0
-        mean_val = np.mean(ranks)
+        mean_val = float(np.mean(ranks))
         neutral_signals = ranks - mean_val
-        max_abs = np.max(np.abs(neutral_signals)) or 1.0
+        raw_max_abs = float(np.max(np.abs(neutral_signals)))
+        max_abs = raw_max_abs if (np.isfinite(raw_max_abs) and raw_max_abs > 1e-8) else 1.0
         normalized = neutral_signals / max_abs
 
-        signals = []
-        now = datetime.now(timezone.utc)
-        for sym, val in zip(symbols, normalized):
-            signals.append(Signal(
-                timestamp=now,
+        signal_time = timestamp or datetime.now(timezone.utc)
+        return [
+            Signal(
+                timestamp=signal_time,
                 symbol=sym,
                 score=float(val),
                 confidence=float(min(1.0, abs(val))),
                 horizon_minutes=60,
-            ))
-
-        return signals
+            )
+            for sym, val in zip(symbols, normalized, strict=False)
+        ]

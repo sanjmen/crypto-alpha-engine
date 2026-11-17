@@ -13,14 +13,15 @@ Enforces least-privilege security guarantees for algorithmic trading:
 from __future__ import annotations
 
 import base64
+import contextlib
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import ipaddress
 import json
 import logging
 import os
-import re
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -123,7 +124,9 @@ class SensitiveDataMasker:
 
     # Generic patterns matching potential hex/alphanumeric API keys and secrets >= 32 chars
     _KEY_REGEX = re.compile(r"\b[A-Za-z0-9_-]{32,64}\b")
-    _ENV_PAIR_REGEX = re.compile(r"(api[_-]?key|secret|password|token)\s*[:=]\s*['\"]?([A-Za-z0-9_\-+/=]{8,})['\"]?", re.IGNORECASE)
+    _ENV_PAIR_REGEX = re.compile(
+        r"(api[_-]?key|secret|password|token)\s*[:=]\s*['\"]?([A-Za-z0-9_\-+/=]{8,})['\"]?", re.IGNORECASE
+    )
 
     def __init__(self) -> None:
         self._exact_secrets: set[str] = set()
@@ -149,7 +152,9 @@ class SensitiveDataMasker:
         # 1. Exact match replacements for registered secrets
         for secret in self._exact_secrets:
             if secret in masked:
-                masked = masked.replace(secret, f"***REDACTED({secret[:2]}..{secret[-2:] if len(secret) > 4 else ''})***")
+                masked = masked.replace(
+                    secret, f"***REDACTED({secret[:2]}..{secret[-2:] if len(secret) > 4 else ''})***"
+                )
 
         # 2. Key/Value assignment pattern masking
         def _replace_kv(m: re.Match) -> str:
@@ -268,9 +273,7 @@ class CredentialVault:
         fernet_key = cls._derive_fernet_key(master_passphrase, salt)
         fernet = Fernet(fernet_key)
 
-        payload_dict = {
-            ex_id: asdict(creds) for ex_id, creds in credentials.items()
-        }
+        payload_dict = {ex_id: asdict(creds) for ex_id, creds in credentials.items()}
         json_bytes = json.dumps(payload_dict).encode("utf-8")
         encrypted_bytes = fernet.encrypt(json_bytes)
 
@@ -286,10 +289,8 @@ class CredentialVault:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Write with restricted file permissions (0600: read/write only by owner)
         path.write_text(json.dumps(vault_bundle, indent=2))
-        try:
+        with contextlib.suppress(OSError):
             path.chmod(0o600)
-        except OSError:
-            pass  # Non-posix fallback
 
     @classmethod
     def load_from_encrypted_file(
@@ -398,9 +399,7 @@ class PreFlightPermissionValidator:
 
         # 4. Futures Trading Permission Check
         if require_futures and not can_trade_futures:
-            raise SecurityViolationError(
-                "API key lacks perpetual futures trading permission (enableFutures is False)."
-            )
+            raise SecurityViolationError("API key lacks perpetual futures trading permission (enableFutures is False).")
 
         return ApiPermissionReport(
             exchange_id="binance",

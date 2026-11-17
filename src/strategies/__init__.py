@@ -1,49 +1,49 @@
 """
-Quantitative Trading Strategies & Alpha Generation Engines.
+Quantitative Strategies & Alpha Allocation Layer for Crypto-Alpha-Engine.
 """
 
-from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
-from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
-from src.strategies.funding_carry_arbitrage import FundingCarryArbitrageStrategy
-from src.strategies.meta_allocator import MetaStrategyAllocator
-from src.strategies.perp_perp_arbitrage import (
-    ArbitrageAction,
-    CrossExchangeCollateralManager,
-    CrossExchangePerpArbitrageEngine,
-    PerpPerpSpread,
-    TransferEvent,
-)
-from src.strategies.extreme_anomaly import (
-    EarlyBreakoutStrategy,
-    OversoldBounceStrategy,
-    PumpFundingFadeStrategy,
-    create_illiquid_early_breakout,
-    create_illiquid_funding_fade,
-    create_illiquid_oversold_bounce,
-    create_liquid_early_breakout,
-    create_liquid_funding_fade,
-    create_liquid_oversold_bounce,
-)
-from src.strategies.stat_arb_mean_reversion import StatArbMeanReversionStrategy
+from __future__ import annotations
 
-__all__ = [
-    "ArbitrageAction",
-    "CointegratedPairsStrategy",
-    "CrossExchangeCollateralManager",
-    "CrossExchangePerpArbitrageEngine",
-    "CrossSectionalMomentumStrategy",
-    "EarlyBreakoutStrategy",
-    "FundingCarryArbitrageStrategy",
-    "MetaStrategyAllocator",
-    "OversoldBounceStrategy",
-    "PerpPerpSpread",
-    "PumpFundingFadeStrategy",
-    "StatArbMeanReversionStrategy",
-    "TransferEvent",
-    "create_illiquid_early_breakout",
-    "create_illiquid_funding_fade",
-    "create_illiquid_oversold_bounce",
-    "create_liquid_early_breakout",
-    "create_liquid_funding_fade",
-    "create_liquid_oversold_bounce",
-]
+import importlib
+from typing import Any
+
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "BaseAnomalyStrategy": ("src.strategies.extreme_anomaly", "BaseAnomalyStrategy"),
+    "CointegratedPairsStrategy": ("src.strategies.cointegrated_pairs", "CointegratedPairsStrategy"),
+    "CrossSectionalMomentumStrategy": (
+        "src.strategies.cross_sectional_momentum",
+        "CrossSectionalMomentumStrategy",
+    ),
+    "EarlyBreakoutStrategy": ("src.strategies.extreme_anomaly", "EarlyBreakoutStrategy"),
+    "ExtremeFundingHarvesterStrategy": (
+        "src.strategies.extreme_anomaly",
+        "ExtremeFundingHarvesterStrategy",
+    ),
+    "FundingCarryArbitrageStrategy": (
+        "src.strategies.funding_carry_arbitrage",
+        "FundingCarryArbitrageStrategy",
+    ),
+    "MetaStrategyAllocator": ("src.strategies.meta_allocator", "MetaStrategyAllocator"),
+    "OversoldBounceStrategy": ("src.strategies.extreme_anomaly", "OversoldBounceStrategy"),
+    "PerpPerpArbitrageStrategy": ("src.strategies.perp_perp_arbitrage", "PerpPerpArbitrageStrategy"),
+    "PumpFundingFadeStrategy": ("src.strategies.extreme_anomaly", "PumpFundingFadeStrategy"),
+    "SevenFactorAllocationResult": (
+        "src.strategies.seven_factor_engine",
+        "SevenFactorAllocationResult",
+    ),
+    "SevenFactorOnlineEngine": ("src.strategies.seven_factor_engine", "SevenFactorOnlineEngine"),
+    "StatArbMeanReversionStrategy": (
+        "src.strategies.stat_arb_mean_reversion",
+        "StatArbMeanReversionStrategy",
+    ),
+}
+
+__all__ = list(_LAZY_IMPORTS.keys())
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_IMPORTS:
+        module_path, attr_name = _LAZY_IMPORTS[name]
+        module = importlib.import_module(module_path)
+        return getattr(module, attr_name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

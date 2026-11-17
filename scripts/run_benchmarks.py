@@ -22,12 +22,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import io
 from pathlib import Path
 import sys
-import time
-from typing import Dict, List, Tuple
 import urllib.request
 import zipfile
 
@@ -59,7 +56,7 @@ from src.strategies.extreme_anomaly import (
 
 
 def _load_aligned_prices(
-    symbols: List[str],
+    symbols: list[str],
     cache_dir: Path,
     lookback_bars: int = 5000,
 ) -> pd.DataFrame:
@@ -89,7 +86,7 @@ def _load_aligned_prices(
 # ==============================================================================
 def run_hrp_benchmark(
     cache_dir: Path,
-    symbols: List[str],
+    symbols: list[str],
     lookback: int = 4000,
     window: int = 720,
     rebalance: int = 24,
@@ -161,7 +158,7 @@ def run_info_bars_benchmark(
     date_str: str = "2024-03-01",
     dollar_threshold: float = 10_000_000.0,
     dib_threshold: float = 1_000_000.0,
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
     print("=" * 80)
     print(f"  [SUITE: INFO-BARS] INFORMATION-DRIVEN BARS STATISTICAL BENCHMARK ({symbol} {date_str})")
     print("=" * 80)
@@ -180,10 +177,10 @@ def run_info_bars_benchmark(
         "1-Minute Time Bars": time_bars_1m,
         "5-Minute Time Bars": time_bars_5m,
         "15-Minute Time Bars": time_bars_15m,
-        f"Dollar Bars (${dollar_threshold/1e6:.0f}M)": dollar_bars,
+        f"Dollar Bars (${dollar_threshold / 1e6:.0f}M)": dollar_bars,
         "Dollar Imbalance Bars (DIB)": dib_bars,
     }
-    results: Dict[str, Dict[str, float]] = {}
+    results: dict[str, dict[str, float]] = {}
     for name, bar_df in benchmarks.items():
         rets = StatisticalValidator.compute_log_returns(bar_df)
         jb_stats = StatisticalValidator.test_normality_jarque_bera(rets)
@@ -204,9 +201,8 @@ def _fetch_or_synthesize_book_depth() -> pd.DataFrame:
     url = "https://data.binance.vision/data/futures/um/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2024-05-01.zip"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CryptoAlphaEngine/1.0)"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            with zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
-                return pd.read_csv(zf.open(zf.namelist()[0]))
+        with urllib.request.urlopen(req, timeout=10) as resp, zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
+            return pd.read_csv(zf.open(zf.namelist()[0]))
     except Exception:
         base_notionals = {
             1: 69_523_632.53,
@@ -239,7 +235,9 @@ def run_market_impact_benchmark() -> pd.DataFrame:
         reference_volume=btc_daily_volume,
         fit_exponent=False,
     )
-    print(f"  Calibrated Impact Coefficient Y = {calibrated.Y_coefficient:.4f} | Exponent alpha = {calibrated.alpha_exponent:.2f}")
+    print(
+        f"  Calibrated Impact Coefficient Y = {calibrated.Y_coefficient:.4f} | Exponent alpha = {calibrated.alpha_exponent:.2f}"
+    )
 
     ceiling = CapitalCapacityCeiling(max_depth_fraction=0.05, max_volume_fraction=0.02)
     order_sizes = [10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000]
@@ -264,13 +262,15 @@ def run_market_impact_benchmark() -> pd.DataFrame:
             is_flash_crash=True,
         )
         cap_rep = ceiling.evaluate_capacity("BTCUSDT", q, 69_500_000.0, btc_hourly_volume)
-        rows.append({
-            "order_usd": q,
-            "normal_bps": round(est_norm.slippage_bps, 2),
-            "flash_crash_bps": round(est_crash.slippage_bps, 2),
-            "within_capacity": cap_rep.within_capacity,
-            "twap_chunks": cap_rep.recommended_chunks,
-        })
+        rows.append(
+            {
+                "order_usd": q,
+                "normal_bps": round(est_norm.slippage_bps, 2),
+                "flash_crash_bps": round(est_crash.slippage_bps, 2),
+                "within_capacity": cap_rep.within_capacity,
+                "twap_chunks": cap_rep.recommended_chunks,
+            }
+        )
     df_res = pd.DataFrame(rows)
     print(df_res.to_string(index=False))
     return df_res
@@ -284,11 +284,29 @@ def run_pure_anomalies_benchmark(cache_dir: Path) -> pd.DataFrame:
     print("  [SUITE: ANOMALIES] PURE EVENT-DRIVEN EXTREME ANOMALY STRATEGIES BENCHMARK")
     print("=" * 80)
     symbols = [
-        "BTCUSDT", "ETHUSDT", "RENDERUSDT", "FETUSDT",
-        "CTSIUSDT", "MAGICUSDT", "OGNUSDT", "RLCUSDT",
-        "GTCUSDT", "COMPUSDT", "CRVUSDT", "DYDXUSDT",
-        "WALUSDT", "BSPUSDT", "TRUTHUSDT", "ZEREBROUSDT",
-        "BTWUSDT", "QUSDT", "AVAUSDT", "EPICUSDT", "MUBARAKUSDT", "CRWVUSDT", "CAPUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "RENDERUSDT",
+        "FETUSDT",
+        "CTSIUSDT",
+        "MAGICUSDT",
+        "OGNUSDT",
+        "RLCUSDT",
+        "GTCUSDT",
+        "COMPUSDT",
+        "CRVUSDT",
+        "DYDXUSDT",
+        "WALUSDT",
+        "BSPUSDT",
+        "TRUTHUSDT",
+        "ZEREBROUSDT",
+        "BTWUSDT",
+        "QUSDT",
+        "AVAUSDT",
+        "EPICUSDT",
+        "MUBARAKUSDT",
+        "CRWVUSDT",
+        "CAPUSDT",
     ]
     bars_dir = cache_dir / "bars" / "1h"
     funding_dir = cache_dir / "funding"
@@ -364,20 +382,24 @@ def run_pure_anomalies_benchmark(cache_dir: Path) -> pd.DataFrame:
                             exit_p, outcome = tp_p, "TAKE_PROFIT"
                             break
                 pnl_pct = (entry_p / exit_p - 1.0) if is_short else (exit_p / entry_p - 1.0)
-                trades.append({
-                    "timestamp": ts,
-                    "strategy": strat_name,
-                    "symbol": sig.symbol,
-                    "pnl_pct": pnl_pct,
-                    "outcome": outcome,
-                })
+                trades.append(
+                    {
+                        "timestamp": ts,
+                        "strategy": strat_name,
+                        "symbol": sig.symbol,
+                        "pnl_pct": pnl_pct,
+                        "outcome": outcome,
+                    }
+                )
 
     df_trades = pd.DataFrame(trades)
     if not df_trades.empty:
         for strat_name, grp in df_trades.groupby("strategy"):
             n_t = len(grp)
             win_rate = (grp["pnl_pct"] > 0).mean() * 100.0
-            print(f"  {strat_name:<18} | Trades: {n_t:4d} | Win Rate: {win_rate:5.1f}% | Mean Ret: {grp['pnl_pct'].mean()*100:+6.2f}%")
+            print(
+                f"  {strat_name:<18} | Trades: {n_t:4d} | Win Rate: {win_rate:5.1f}% | Mean Ret: {grp['pnl_pct'].mean() * 100:+6.2f}%"
+            )
     return df_trades
 
 
@@ -392,9 +414,22 @@ def run_cointegration_benchmark(
     print("  [SUITE: COINTEGRATION] SECTOR CLUSTERING & COINTEGRATED STAT-ARB BENCHMARK")
     print("=" * 80)
     symbols = [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "NEARUSDT", "DOTUSDT", "LTCUSDT",
-        "UNIUSDT", "AAVEUSDT", "LINKUSDT", "CRVUSDT", "LDOUSDT",
-        "DOGEUSDT", "RENDERUSDT", "FETUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "AVAXUSDT",
+        "NEARUSDT",
+        "DOTUSDT",
+        "LTCUSDT",
+        "UNIUSDT",
+        "AAVEUSDT",
+        "LINKUSDT",
+        "CRVUSDT",
+        "LDOUSDT",
+        "DOGEUSDT",
+        "RENDERUSDT",
+        "FETUSDT",
     ]
     prices = _load_aligned_prices(symbols, cache_dir, lookback_bars=lookback)
     if prices.empty:
@@ -421,14 +456,16 @@ def run_cointegration_benchmark(
                 s1, s2 = syms[i], syms[j]
                 res = tester.test_pair(prices[s1], prices[s2], y_symbol=s1, x_symbol=s2)
                 if res.is_tradable:
-                    rows.append({
-                        "sector": sec,
-                        "pair": f"{s1}/{s2}",
-                        "p_value": round(res.p_value, 4),
-                        "beta": round(res.hedge_ratios[s2], 4),
-                        "half_life_h": round(res.half_life_bars, 1),
-                        "hurst": round(res.hurst_exponent, 3),
-                    })
+                    rows.append(
+                        {
+                            "sector": sec,
+                            "pair": f"{s1}/{s2}",
+                            "p_value": round(res.p_value, 4),
+                            "beta": round(res.hedge_ratios[s2], 4),
+                            "half_life_h": round(res.half_life_bars, 1),
+                            "hurst": round(res.hurst_exponent, 3),
+                        }
+                    )
     df_pairs = pd.DataFrame(rows)
     if not df_pairs.empty:
         print(df_pairs.to_string(index=False))
@@ -438,16 +475,16 @@ def run_cointegration_benchmark(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Unified Quantitative & Microstructure Benchmark Suite CLI"
-    )
+    parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
         "--suite",
         choices=["all", "hrp", "info-bars", "market-impact", "anomalies", "cointegration"],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
     )
-    parser.add_argument("--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path.")
+    parser.add_argument(
+        "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path."
+    )
     parser.add_argument(
         "--symbols",
         type=str,
@@ -457,8 +494,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookback", type=int, default=4000, help="Total 1h bars to evaluate.")
     parser.add_argument("--window", type=int, default=720, help="HRP estimation window in hours (default: 720).")
     parser.add_argument("--rebalance", type=int, default=24, help="HRP rebalancing frequency in hours (default: 24).")
-    parser.add_argument("--symbol", type=str, default="BTCUSDT", help="Symbol for info-bars benchmark (default: BTCUSDT).")
-    parser.add_argument("--date", type=str, default="2024-03-01", help="Date for info-bars tick streaming (default: 2024-03-01).")
+    parser.add_argument(
+        "--symbol", type=str, default="BTCUSDT", help="Symbol for info-bars benchmark (default: BTCUSDT)."
+    )
+    parser.add_argument(
+        "--date", type=str, default="2024-03-01", help="Date for info-bars tick streaming (default: 2024-03-01)."
+    )
     parser.add_argument("--output-dir", type=str, default="reports", help="Output directory for reports.")
     return parser
 
@@ -471,9 +512,7 @@ def main() -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
     suites = (
-        ["hrp", "market-impact", "cointegration", "anomalies", "info-bars"]
-        if args.suite == "all"
-        else [args.suite]
+        ["hrp", "market-impact", "cointegration", "anomalies", "info-bars"] if args.suite == "all" else [args.suite]
     )
 
     for s_name in suites:

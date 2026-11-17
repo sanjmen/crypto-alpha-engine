@@ -5,11 +5,12 @@ extreme leverage, and flash drawdowns.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-import logging
-import time
-import uuid
 from datetime import datetime, timezone
+import logging
+import threading
+import time
 from typing import Any
+import uuid
 
 import ccxt
 
@@ -116,6 +117,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         self.peak_equity = 100_000.0
         self.trade_history: list[Trade] = []
         self.orders: dict[str, Order] = {}
+        self._lock = threading.RLock()
 
     @staticmethod
     def _install_linear_market_aliases(exchange: Any) -> None:
@@ -131,10 +133,16 @@ class CCXTExecutionAdapter(IExecutionClient):
             mkts = orig_load(*args, **kwargs)
             if isinstance(mkts, dict):
                 for k, m in list(mkts.items()):
-                    if isinstance(k, str) and k.endswith(":USDT") and isinstance(m, dict):
-                        if m.get("swap", True) and m.get("linear", True) and not m.get("delivery", False):
-                            short_sym = k.split(":")[0]
-                            mkts[short_sym] = m
+                    if (
+                        isinstance(k, str)
+                        and k.endswith(":USDT")
+                        and isinstance(m, dict)
+                        and m.get("swap", True)
+                        and m.get("linear", True)
+                        and not m.get("delivery", False)
+                    ):
+                        short_sym = k.split(":")[0]
+                        mkts[short_sym] = m
             return mkts
 
         exchange.load_markets = _wrapped_load_markets
@@ -149,7 +157,7 @@ class CCXTExecutionAdapter(IExecutionClient):
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
         if order_id in self.orders:
-            self.orders[order_id].status = OrderStatus.CANCELLED
+            self.orders[order_id].status = OrderStatus.CANCELED
             return True
         return False
 
@@ -175,7 +183,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if drawdown >= self.max_drawdown_stop:
             raise MaxDrawdownStopError(
-                f"Hard emergency stop: current drawdown {drawdown*100:.2f}% exceeds {self.max_drawdown_stop*100:.2f}%"
+                f"Hard emergency stop: current drawdown {drawdown * 100:.2f}% exceeds {self.max_drawdown_stop * 100:.2f}%"
             )
 
         # Estimate post-trade gross leverage
@@ -194,6 +202,7 @@ class CCXTExecutionAdapter(IExecutionClient):
         order_type: OrderType,
         quantity: float,
         price: float | None = None,
+        strategy: str | None = None,
     ) -> Order:
         est_price = price or 100.0
 
@@ -210,6 +219,7 @@ class CCXTExecutionAdapter(IExecutionClient):
             price=price,
             status=OrderStatus.PENDING,
             created_at=datetime.now(tz=timezone.utc),
+            strategy=strategy,
         )
 
         if self.dry_run:
@@ -226,18 +236,21 @@ class CCXTExecutionAdapter(IExecutionClient):
                 price=est_price,
                 fee=quantity * est_price * self.taker_fee_pct,
                 timestamp=datetime.now(tz=timezone.utc),
+                strategy=strategy,
             )
-            self.trade_history.append(trade)
-            self.portfolio.cash -= trade.fee
-            # Record position
-            pos_side = PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
-            self.portfolio.positions[symbol] = Position(
-                symbol=symbol,
-                side=pos_side,
-                quantity=quantity,
-                entry_price=est_price,
-                current_price=est_price,
-            )
+            with self._lock:
+                self.trade_history.append(trade)
+                self.portfolio.cash -= trade.fee
+                # Record position
+                pos_side = PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
+                self.portfolio.positions[symbol] = Position(
+                    symbol=symbol,
+                    side=pos_side,
+                    quantity=quantity,
+                    entry_price=est_price,
+                    current_price=est_price,
+                    strategy=strategy,
+                )
         else:
             # Send live order to CCXT
             ccxt_side = "buy" if side == OrderSide.BUY else "sell"
@@ -249,10 +262,11 @@ class CCXTExecutionAdapter(IExecutionClient):
                 amount=quantity,
                 price=price,
             )
-            order.status = OrderStatus.SUBMITTED
+            order.status = OrderStatus.PENDING
             order.id = str(res.get("id", order_id))
 
-        self.orders[order_id] = order
+        with self._lock:
+            self.orders[order_id] = order
         return order
 
 
@@ -629,7 +643,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                         pass
             except Exception as e:  # noqa: BLE001
                 last_gtx_rejected = True
-                logger.debug(f"GTX attempt {attempt+1} on {symbol} rejected/repricing: {e}")
+                logger.debug(f"GTX attempt {attempt + 1} on {symbol} rejected/repricing: {e}")
                 if self.chase_interval_sec > 0:
                     time.sleep(min(0.25, self.chase_interval_sec * 0.2))
 
@@ -677,7 +691,8 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             average_fill_price=final_avg_px,
             created_at=datetime.now(timezone.utc),
         )
-        self.orders[last_order_id] = final_order
+        with self._lock:
+            self.orders[last_order_id] = final_order
         return final_order
 
     def _apply_fill_to_portfolio(
@@ -688,27 +703,26 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         fill_price: float,
     ) -> None:
         """Updates internal position tracking after an order fill."""
-        existing = self.portfolio.positions.get(symbol)
-        signed_delta = quantity if side == OrderSide.BUY else -quantity
-        if existing and existing.side != PositionSide.FLAT and existing.quantity > 0:
-            existing_signed = (
-                existing.quantity if existing.side == PositionSide.LONG else -existing.quantity
-            )
-            new_signed = existing_signed + signed_delta
-        else:
-            new_signed = signed_delta
+        with self._lock:
+            existing = self.portfolio.positions.get(symbol)
+            signed_delta = quantity if side == OrderSide.BUY else -quantity
+            if existing and existing.side != PositionSide.FLAT and existing.quantity > 0:
+                existing_signed = existing.quantity if existing.side == PositionSide.LONG else -existing.quantity
+                new_signed = existing_signed + signed_delta
+            else:
+                new_signed = signed_delta
 
-        if abs(new_signed) <= 1e-8:
-            self.portfolio.positions.pop(symbol, None)
-        else:
-            new_side = PositionSide.LONG if new_signed > 0 else PositionSide.SHORT
-            self.portfolio.positions[symbol] = Position(
-                symbol=symbol,
-                side=new_side,
-                quantity=abs(new_signed),
-                entry_price=fill_price,
-                current_price=fill_price,
-            )
+            if abs(new_signed) <= 1e-8:
+                self.portfolio.positions.pop(symbol, None)
+            else:
+                new_side = PositionSide.LONG if new_signed > 0 else PositionSide.SHORT
+                self.portfolio.positions[symbol] = Position(
+                    symbol=symbol,
+                    side=new_side,
+                    quantity=abs(new_signed),
+                    entry_price=fill_price,
+                    current_price=fill_price,
+                )
 
     def execute_atomic_rebalance(
         self,
@@ -823,10 +837,7 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             return None
 
         target_side = PositionSide.LONG if net_exposure_usd > 0 else PositionSide.SHORT
-        candidates = [
-            p for p in self.portfolio.positions.values()
-            if p.side == target_side and p.quantity > 0
-        ]
+        candidates = [p for p in self.portfolio.positions.values() if p.side == target_side and p.quantity > 0]
         if not candidates:
             return None
 
@@ -905,10 +916,12 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         try:
             if hasattr(self.client, "fapiPrivateGetMultiAssetsMargin"):
                 ma_resp = self.client.fapiPrivateGetMultiAssetsMargin()
-                is_multi = bool(
-                    str(ma_resp.get("multiAssetsMargin", "false")).lower() == "true"
-                )
-                if is_multi and enforce_single_asset_margin and hasattr(self.client, "fapiPrivatePostMultiAssetsMargin"):
+                is_multi = bool(str(ma_resp.get("multiAssetsMargin", "false")).lower() == "true")
+                if (
+                    is_multi
+                    and enforce_single_asset_margin
+                    and hasattr(self.client, "fapiPrivatePostMultiAssetsMargin")
+                ):
                     self.client.fapiPrivatePostMultiAssetsMargin({"multiAssetsMargin": "false"})
                     is_multi = False
                 report["multi_assets_margin"] = is_multi
@@ -938,7 +951,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
 
             try:
                 lev_resp = self.client.set_leverage(target_int_lev, req_sym)
-                confirmed_lev = int(lev_resp.get("leverage", target_int_lev)) if isinstance(lev_resp, dict) else target_int_lev
+                confirmed_lev = (
+                    int(lev_resp.get("leverage", target_int_lev)) if isinstance(lev_resp, dict) else target_int_lev
+                )
                 report["leverages"][sym] = confirmed_lev
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Could not set leverage={target_int_lev}x for {sym}: {e}")
@@ -954,7 +969,11 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             report["ldusdt_balance"] = col["ldusdt_wallet"]
             report["yield_collateral_usd"] = col["yield_collateral_usd"]
             report["yield_collateral_share"] = col["yield_collateral_share"]
-            if col["yield_collateral_usd"] > 0 and not report.get("multi_assets_margin") and not enforce_single_asset_margin:
+            if (
+                col["yield_collateral_usd"] > 0
+                and not report.get("multi_assets_margin")
+                and not enforce_single_asset_margin
+            ):
                 try:
                     if hasattr(self.client, "fapiPrivatePostMultiAssetsMargin"):
                         self.client.fapiPrivatePostMultiAssetsMargin({"multiAssetsMargin": "true"})
@@ -986,7 +1005,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         Stage 4: Live Micro-Position Opening (`notional_usd`) & `positionRisk` Reconciliation.
         Stage 5: Live Position Closing (`reduceOnly=True`) & Clean-Slate Verification (`0` open positions).
         """
-        logger.info(f"🧪 Starting Production Smoke Test on {symbol} (Notional: ${notional_usd:.2f} USDT, Leverage: {leverage}x, DryRun: {self.dry_run})")
+        logger.info(
+            f"🧪 Starting Production Smoke Test on {symbol} (Notional: ${notional_usd:.2f} USDT, Leverage: {leverage}x, DryRun: {self.dry_run})"
+        )
         config_report = self.ensure_account_configuration(
             symbols=[symbol],
             target_leverage=float(leverage),
@@ -1015,7 +1036,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         if self.dry_run:
             resting_order_id = f"dry_gtx_rest_{uuid.uuid4().hex[:8]}"
             gtx_post_cancel_ok = True
-            logger.info(f"[Stage 3/5] DRY-RUN Post-Only GTX resting order posted & cancelled ({resting_order_id} @ ${resting_bid_px})")
+            logger.info(
+                f"[Stage 3/5] DRY-RUN Post-Only GTX resting order posted & cancelled ({resting_order_id} @ ${resting_bid_px})"
+            )
         else:
             res_rest = self.client.create_order(
                 symbol=symbol,
@@ -1026,7 +1049,9 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
                 params={"timeInForce": "GTX"},
             )
             resting_order_id = str(res_rest.get("id", ""))
-            logger.info(f"[Stage 3/5] Live Post-Only GTX order posted: id={resting_order_id} ({qty} {symbol} @ ${resting_bid_px})")
+            logger.info(
+                f"[Stage 3/5] Live Post-Only GTX order posted: id={resting_order_id} ({qty} {symbol} @ ${resting_bid_px})"
+            )
             time.sleep(0.5)
             self.client.cancel_order(resting_order_id, symbol)
             gtx_post_cancel_ok = True
@@ -1046,16 +1071,14 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
         reconciled_open = self.reconcile_positions_from_exchange()
         pos_opened = symbol in reconciled_open or (symbol.split(":")[0] in reconciled_open)
         open_qty = (
-            reconciled_open[symbol].quantity
-            if symbol in reconciled_open
-            else (open_order.filled_quantity or qty)
+            reconciled_open[symbol].quantity if symbol in reconciled_open else (open_order.filled_quantity or qty)
         )
         logger.info(
             f"[Stage 4/5] Position reconciled: opened={pos_opened}, qty={open_qty}, avg_fill=${open_order.average_fill_price}"
         )
 
         # Stage 5: Close Position with reduceOnly=True & Verify 100% Flat State
-        logger.info(f"[Stage 5/5] Closing micro-position with reduceOnly=True...")
+        logger.info("[Stage 5/5] Closing micro-position with reduceOnly=True...")
         if self.dry_run:
             close_order = self.execute_maker_limit_chase(
                 symbol=symbol,
@@ -1113,4 +1136,3 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             "final_usdt_balance": final_balance,
             "net_cost_usdt": round(final_balance - initial_balance, 6),
         }
-

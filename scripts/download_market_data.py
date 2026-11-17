@@ -38,34 +38,112 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.data.ccxt_provider import CCXTMarketDataProvider, TOP_30_SYMBOLS
+from src.data.ccxt_provider import TOP_30_SYMBOLS, CCXTMarketDataProvider
 from src.data.parquet_storage import ParquetBarStorage
 from src.domain.enums import Timeframe
 
 TOP_15_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "RENDERUSDT", "FETUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "SUIUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "RENDERUSDT",
+    "FETUSDT",
 ]
 
 ALL_82_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
-    "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
-    "SUIUSDT", "APTUSDT", "DOTUSDT", "ATOMUSDT", "FTMUSDT",
-    "ALGOUSDT", "EGLDUSDT", "KAVAUSDT", "IOTAUSDT", "MINAUSDT",
-    "ICPUSDT", "SEIUSDT", "TIAUSDT", "THETAUSDT", "ZILUSDT",
-    "ARBUSDT", "OPUSDT", "MATICUSDT", "STRKUSDT", "ZKUSDT",
-    "METUSDT", "ZROUSDT", "UNIUSDT", "AAVEUSDT", "CRVUSDT",
-    "MKRUSDT", "SNXUSDT", "COMPUSDT", "1INCHUSDT", "SUSHIUSDT",
-    "DYDXUSDT", "JUPUSDT", "ENAUSDT", "INJUSDT", "RUNEUSDT",
-    "LDOUSDT", "PENDLEUSDT", "FETUSDT", "RENDERUSDT", "TAOUSDT",
-    "WLDUSDT", "GRTUSDT", "RLCUSDT", "LTCUSDT", "BCHUSDT",
-    "ETCUSDT", "XMRUSDT", "ZECUSDT", "FILUSDT", "1000PEPEUSDT",
-    "1000SHIBUSDT", "1000FLOKIUSDT", "BONKUSDT", "WIFUSDT", "MEMEUSDT",
-    "SANDUSDT", "MANAUSDT", "AXSUSDT", "GALAUSDT", "ENJUSDT",
-    "CHZUSDT", "MAGICUSDT", "PYTHUSDT", "ONDOUSDT", "QNTUSDT",
-    "BATUSDT", "SKLUSDT", "CTSIUSDT", "GTCUSDT", "OGNUSDT",
-    "KSMUSDT", "FLOWUSDT", "WUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "XRPUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "NEARUSDT",
+    "SUIUSDT",
+    "APTUSDT",
+    "DOTUSDT",
+    "ATOMUSDT",
+    "FTMUSDT",
+    "ALGOUSDT",
+    "EGLDUSDT",
+    "KAVAUSDT",
+    "IOTAUSDT",
+    "MINAUSDT",
+    "ICPUSDT",
+    "SEIUSDT",
+    "TIAUSDT",
+    "THETAUSDT",
+    "ZILUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "MATICUSDT",
+    "STRKUSDT",
+    "ZKUSDT",
+    "METUSDT",
+    "ZROUSDT",
+    "UNIUSDT",
+    "AAVEUSDT",
+    "CRVUSDT",
+    "MKRUSDT",
+    "SNXUSDT",
+    "COMPUSDT",
+    "1INCHUSDT",
+    "SUSHIUSDT",
+    "DYDXUSDT",
+    "JUPUSDT",
+    "ENAUSDT",
+    "INJUSDT",
+    "RUNEUSDT",
+    "LDOUSDT",
+    "PENDLEUSDT",
+    "FETUSDT",
+    "RENDERUSDT",
+    "TAOUSDT",
+    "WLDUSDT",
+    "GRTUSDT",
+    "RLCUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "ETCUSDT",
+    "XMRUSDT",
+    "ZECUSDT",
+    "FILUSDT",
+    "1000PEPEUSDT",
+    "1000SHIBUSDT",
+    "1000FLOKIUSDT",
+    "BONKUSDT",
+    "WIFUSDT",
+    "MEMEUSDT",
+    "SANDUSDT",
+    "MANAUSDT",
+    "AXSUSDT",
+    "GALAUSDT",
+    "ENJUSDT",
+    "CHZUSDT",
+    "MAGICUSDT",
+    "PYTHUSDT",
+    "ONDOUSDT",
+    "QNTUSDT",
+    "BATUSDT",
+    "SKLUSDT",
+    "CTSIUSDT",
+    "GTCUSDT",
+    "OGNUSDT",
+    "KSMUSDT",
+    "FLOWUSDT",
+    "WUSDT",
 ]
 
 PRESETS = {
@@ -78,9 +156,18 @@ PRESETS = {
 
 BINANCE_VISION_S3_BASE = "https://data.binance.vision"
 KLINES_COLS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trade_count",
-    "taker_buy_base_vol", "taker_buy_quote_vol", "ignore",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_volume",
+    "trade_count",
+    "taker_buy_base_vol",
+    "taker_buy_quote_vol",
+    "ignore",
 ]
 FUNDING_COLS = ["calc_time", "funding_interval_hours", "last_funding_rate"]
 
@@ -134,9 +221,18 @@ def _parse_klines_to_df(rows: list, symbol: str) -> pd.DataFrame:
     df = pd.DataFrame(
         rows,
         columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trade_count",
-            "taker_buy_vol", "taker_buy_quote_vol", "ignore",
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
+            "trade_count",
+            "taker_buy_vol",
+            "taker_buy_quote_vol",
+            "ignore",
         ],
     )
     df["timestamp"] = (df["open_time"].astype("int64") // 1000).astype("float64")
@@ -151,12 +247,14 @@ def _fetch_klines_range(exchange, symbol: str, interval: str, start_ms: int, end
     cur_ms = start_ms
     while cur_ms < end_ms:
         try:
-            rows = exchange.fapiPublicGetKlines({
-                "symbol": symbol,
-                "interval": interval,
-                "startTime": cur_ms,
-                "limit": 1500,
-            })
+            rows = exchange.fapiPublicGetKlines(
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": cur_ms,
+                    "limit": 1500,
+                }
+            )
             if not rows:
                 break
             all_rows.extend(rows)
@@ -191,11 +289,14 @@ def run_subhourly_mode(args: argparse.Namespace) -> None:
     pattern = "{" + ",".join([f"{s}.parquet" for s in symbols]) + "}"
     subprocess.run(
         [
-            "rclone", "copy",
+            "rclone",
+            "copy",
             "gdrive:trading/crypto-alpha-engine/data/bars/15m/",
             str(bars_15m_dir),
-            "--include", pattern,
-            "--transfers", "16",
+            "--include",
+            pattern,
+            "--transfers",
+            "16",
         ],
         check=False,
     )
@@ -218,7 +319,9 @@ def run_subhourly_mode(args: argparse.Namespace) -> None:
             if pd.api.types.is_datetime64_any_dtype(old_df["timestamp"]):
                 old_df["timestamp"] = old_df["timestamp"].astype("int64") // 10**9
             combined = pd.concat([old_df, new_15], ignore_index=True)
-            combined = combined.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
+            combined = (
+                combined.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
+            )
         else:
             combined = new_15
         if not combined.empty:
@@ -242,15 +345,14 @@ def run_subhourly_mode(args: argparse.Namespace) -> None:
 def _fetch_zip_df(url: str, col_names: list[str]) -> pd.DataFrame | None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            with zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
-                csv_name = zf.namelist()[0]
-                with zf.open(csv_name) as f:
-                    first_line = f.readline().decode("utf-8")
-                    has_header = any(k in first_line for k in ["open_time", "create_time", "calc_time"])
-                if has_header:
-                    return pd.read_csv(zf.open(csv_name))
-                return pd.read_csv(zf.open(csv_name), header=None, names=col_names)
+        with urllib.request.urlopen(req, timeout=30) as resp, zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
+            csv_name = zf.namelist()[0]
+            with zf.open(csv_name) as f:
+                first_line = f.readline().decode("utf-8")
+                has_header = any(k in first_line for k in ["open_time", "create_time", "calc_time"])
+            if has_header:
+                return pd.read_csv(zf.open(csv_name))
+            return pd.read_csv(zf.open(csv_name), header=None, names=col_names)
     except Exception:
         return None
 
@@ -260,19 +362,29 @@ def _fetch_month_kline(symbol: str, timeframe: str, year: int, month: int) -> pd
     url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/klines/{symbol}/{timeframe}/{symbol}-{timeframe}-{year}-{month_str}.zip"
     df = _fetch_zip_df(url, KLINES_COLS)
     if df is not None and not df.empty:
-        trade_count = pd.to_numeric(df["trade_count"], errors="coerce").fillna(0).astype(np.int64) if "trade_count" in df.columns else np.zeros(len(df), dtype=np.int64)
-        taker_vol = pd.to_numeric(df["taker_buy_base_vol"], errors="coerce").fillna(0.0).astype(np.float64) if "taker_buy_base_vol" in df.columns else np.zeros(len(df), dtype=np.float64)
-        return pd.DataFrame({
-            "timestamp": (pd.to_numeric(df["open_time"]) // 1000).astype(np.int64),
-            "symbol": symbol,
-            "open": pd.to_numeric(df["open"], errors="coerce").astype(np.float64),
-            "high": pd.to_numeric(df["high"], errors="coerce").astype(np.float64),
-            "low": pd.to_numeric(df["low"], errors="coerce").astype(np.float64),
-            "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float64),
-            "volume": pd.to_numeric(df["volume"], errors="coerce").astype(np.float64),
-            "trade_count": trade_count,
-            "taker_buy_vol": taker_vol,
-        })
+        trade_count = (
+            pd.to_numeric(df["trade_count"], errors="coerce").fillna(0).astype(np.int64)
+            if "trade_count" in df.columns
+            else np.zeros(len(df), dtype=np.int64)
+        )
+        taker_vol = (
+            pd.to_numeric(df["taker_buy_base_vol"], errors="coerce").fillna(0.0).astype(np.float64)
+            if "taker_buy_base_vol" in df.columns
+            else np.zeros(len(df), dtype=np.float64)
+        )
+        return pd.DataFrame(
+            {
+                "timestamp": (pd.to_numeric(df["open_time"]) // 1000).astype(np.int64),
+                "symbol": symbol,
+                "open": pd.to_numeric(df["open"], errors="coerce").astype(np.float64),
+                "high": pd.to_numeric(df["high"], errors="coerce").astype(np.float64),
+                "low": pd.to_numeric(df["low"], errors="coerce").astype(np.float64),
+                "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float64),
+                "volume": pd.to_numeric(df["volume"], errors="coerce").astype(np.float64),
+                "trade_count": trade_count,
+                "taker_buy_vol": taker_vol,
+            }
+        )
     return None
 
 
@@ -281,12 +393,14 @@ def _fetch_month_funding(symbol: str, year: int, month: int) -> pd.DataFrame | N
     url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{year}-{month_str}.zip"
     df = _fetch_zip_df(url, FUNDING_COLS)
     if df is not None and not df.empty:
-        return pd.DataFrame({
-            "timestamp": (pd.to_numeric(df["calc_time"]) // 1000).astype(np.int64),
-            "symbol": symbol,
-            "interval_hours": pd.to_numeric(df["funding_interval_hours"], errors="coerce").astype(np.int64),
-            "funding_rate": pd.to_numeric(df["last_funding_rate"], errors="coerce").astype(np.float64),
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": (pd.to_numeric(df["calc_time"]) // 1000).astype(np.int64),
+                "symbol": symbol,
+                "interval_hours": pd.to_numeric(df["funding_interval_hours"], errors="coerce").astype(np.int64),
+                "funding_rate": pd.to_numeric(df["last_funding_rate"], errors="coerce").astype(np.float64),
+            }
+        )
     return None
 
 
@@ -317,7 +431,12 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                     if res_df is not None:
                         dfs.append(res_df)
             if dfs:
-                merged = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                merged = (
+                    pd.concat(dfs, ignore_index=True)
+                    .drop_duplicates(subset=["timestamp"])
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
                 target_dir = base_output_dir / "bars" / tf
                 target_dir.mkdir(parents=True, exist_ok=True)
                 pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
@@ -334,7 +453,12 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                     if res_df is not None:
                         dfs.append(res_df)
             if dfs:
-                merged = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                merged = (
+                    pd.concat(dfs, ignore_index=True)
+                    .drop_duplicates(subset=["timestamp"])
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
                 target_dir = base_output_dir / "funding"
                 target_dir.mkdir(parents=True, exist_ok=True)
                 pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
@@ -343,7 +467,17 @@ def run_vision_mode(args: argparse.Namespace) -> None:
 
     if args.sync_drive:
         subprocess.run(
-            ["rclone", "copy", str(base_output_dir), "gdrive:trading/crypto-alpha-engine/data", "--transfers", "8", "--checkers", "16", "-q"],
+            [
+                "rclone",
+                "copy",
+                str(base_output_dir),
+                "gdrive:trading/crypto-alpha-engine/data",
+                "--transfers",
+                "8",
+                "--checkers",
+                "16",
+                "-q",
+            ],
             check=False,
         )
 
@@ -399,9 +533,7 @@ def run_colab_mode(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Unified Crypto Market Data Ingestion & Cloud/Colab Sync CLI"
-    )
+    parser = argparse.ArgumentParser(description="Unified Crypto Market Data Ingestion & Cloud/Colab Sync CLI")
     parser.add_argument(
         "--mode",
         choices=["ccxt", "subhourly", "vision", "colab"],
@@ -421,13 +553,34 @@ def build_parser() -> argparse.ArgumentParser:
         default="1h",
         help="Bar timeframe (default: 1h).",
     )
-    parser.add_argument("--days", type=int, default=30, help="Number of days of history to fetch in --mode ccxt (default: 30).")
-    parser.add_argument("--output-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Target directory for subhourly/vision modes.")
-    parser.add_argument("--years", type=str, default="2023,2024,2025,2026", help="Comma-separated years for --mode vision.")
-    parser.add_argument("--include-subhourly", action="store_true", help="Include 15m klines alongside 1h in --mode vision.")
-    parser.add_argument("--no-funding", dest="include_funding", action="store_false", default=True, help="Skip 8h funding rates in --mode vision.")
-    parser.add_argument("--sync-drive", action="store_true", help="Sync downloaded Parquet files to Google Drive via rclone.")
-    parser.add_argument("--colab-session", type=str, default="crypto_data_ingest", help="Colab session name for --mode colab.")
+    parser.add_argument(
+        "--days", type=int, default=30, help="Number of days of history to fetch in --mode ccxt (default: 30)."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/tmp/crypto_alpha_backtest_cache",
+        help="Target directory for subhourly/vision modes.",
+    )
+    parser.add_argument(
+        "--years", type=str, default="2023,2024,2025,2026", help="Comma-separated years for --mode vision."
+    )
+    parser.add_argument(
+        "--include-subhourly", action="store_true", help="Include 15m klines alongside 1h in --mode vision."
+    )
+    parser.add_argument(
+        "--no-funding",
+        dest="include_funding",
+        action="store_false",
+        default=True,
+        help="Skip 8h funding rates in --mode vision.",
+    )
+    parser.add_argument(
+        "--sync-drive", action="store_true", help="Sync downloaded Parquet files to Google Drive via rclone."
+    )
+    parser.add_argument(
+        "--colab-session", type=str, default="crypto_data_ingest", help="Colab session name for --mode colab."
+    )
     parser.add_argument(
         "--colab-action",
         choices=["status", "ensure", "mount", "ingest", "stop", "heartbeat"],

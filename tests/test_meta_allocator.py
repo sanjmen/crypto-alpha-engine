@@ -124,11 +124,13 @@ def test_meta_allocator_hrp_strategy_weights():
     n_periods = 100
 
     # 3 strategy return series: momentum and carry have low correlation, stat_arb has high volatility
-    strategy_returns = pd.DataFrame({
-        "momentum": np.random.normal(0.0005, 0.015, n_periods),
-        "stat_arb": np.random.normal(0.0003, 0.030, n_periods),
-        "carry": np.random.normal(0.0002, 0.005, n_periods),
-    })
+    strategy_returns = pd.DataFrame(
+        {
+            "momentum": np.random.normal(0.0005, 0.015, n_periods),
+            "stat_arb": np.random.normal(0.0003, 0.030, n_periods),
+            "carry": np.random.normal(0.0002, 0.005, n_periods),
+        }
+    )
 
     # Pure HRP weights
     hrp_weights = allocator.compute_hrp_strategy_weights(strategy_returns, regime=None)
@@ -152,11 +154,13 @@ def test_meta_allocator_generate_portfolio_with_hrp():
     portfolio = Portfolio(cash=100_000.0, initial_cash=100_000.0, positions={})
     volatilities = {"BTCUSDT": 0.02, "ETHUSDT": 0.03, "SOLUSDT": 0.04}
 
-    strategy_returns = pd.DataFrame({
-        "momentum": np.random.normal(0.0005, 0.015, 50),
-        "stat_arb": np.random.normal(0.0003, 0.025, 50),
-        "carry": np.random.normal(0.0002, 0.008, 50),
-    })
+    strategy_returns = pd.DataFrame(
+        {
+            "momentum": np.random.normal(0.0005, 0.015, 50),
+            "stat_arb": np.random.normal(0.0003, 0.025, 50),
+            "carry": np.random.normal(0.0002, 0.008, 50),
+        }
+    )
 
     net_positions, _regime, strat_weights = allocator.generate_portfolio_allocations(
         market_data=data,

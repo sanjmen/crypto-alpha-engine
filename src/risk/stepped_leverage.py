@@ -5,7 +5,7 @@ and Proportional Turnover Deadbanding.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+
 import numpy as np
 
 
@@ -29,6 +29,10 @@ class LeverageStateSnapshot:
     proportional_deadband: float
     max_single_asset_weight: float
 
+    @property
+    def next_tier_high_water_mark_target(self) -> float:
+        return self.next_tier_hwm_target
+
 
 class SteppedLeverageController:
     """
@@ -51,10 +55,10 @@ class SteppedLeverageController:
         dd_bracket: float = 0.10,
         base_deadband_ratio: float = 0.04 / 2.2,
         base_max_single_ratio: float = 0.45 / 2.2,
-        max_leg_share: Optional[float] = 0.32,
+        max_leg_share: float | None = 0.32,
         min_leg_share: float = 0.05,
         max_leg_positions: int = 5,
-        high_water_mark: Optional[float] = None,
+        high_water_mark: float | None = None,
     ) -> None:
         self.initial_capital = max(float(initial_capital), 1.0)
         self.start_leverage = float(start_leverage)
@@ -82,9 +86,9 @@ class SteppedLeverageController:
         Updates High-Water Mark with `current_equity` and computes the active
         leverage tier, drawdown de-escalation, and effective gross leverage.
         """
-        eq = max(float(current_equity), 0.0)
-        if eq > self.high_water_mark:
-            self.high_water_mark = eq
+        equity_val = float(current_equity) if (np.isfinite(current_equity) and current_equity > 0.0) else 0.0
+        if equity_val > self.high_water_mark:
+            self.high_water_mark = equity_val
 
         hwm_ratio = max(self.high_water_mark / self.initial_capital, 1.0)
         if self.step_leverage > 0.0 and self.gain_per_step > 0.0:
@@ -96,18 +100,15 @@ class SteppedLeverageController:
                 self.start_leverage + steps_unlocked * self.step_leverage,
             )
         else:
-            max_steps = 0
             steps_unlocked = 0
             unlocked_tier = self.start_leverage
 
-        cur_dd = (
-            max(0.0, (self.high_water_mark - eq) / self.high_water_mark)
-            if self.high_water_mark > 0
-            else 0.0
+        current_drawdown = (
+            max(0.0, (self.high_water_mark - equity_val) / self.high_water_mark) if self.high_water_mark > 0 else 0.0
         )
 
         if self.dd_bracket > 0.0 and self.step_leverage > 0.0:
-            steps_down = int(np.floor(cur_dd / self.dd_bracket + 1e-12))
+            steps_down = int(np.floor(current_drawdown / self.dd_bracket + 1e-12))
             active_base = max(
                 self.floor_leverage,
                 unlocked_tier - steps_down * self.step_leverage,
@@ -116,10 +117,9 @@ class SteppedLeverageController:
             steps_down = 0
             active_base = unlocked_tier
 
-        v_scalar = float(np.clip(vol_scalar, 0.55, 1.15))
-        eff_lev = float(min(self.max_leverage, active_base * v_scalar))
+        clamped_vol_scalar = float(np.clip(vol_scalar, 0.55, 1.15))
+        effective_leverage = float(min(self.max_leverage, active_base * clamped_vol_scalar))
 
-        # Next milestone telemetry
         if unlocked_tier < self.max_leverage and self.step_leverage > 0.0:
             next_tier = min(self.max_leverage, unlocked_tier + self.step_leverage)
             prev_milestone_hwm = self.initial_capital * ((1.0 + self.gain_per_step) ** steps_unlocked)
@@ -131,55 +131,71 @@ class SteppedLeverageController:
             next_milestone_hwm = self.high_water_mark
             progress_pct = 100.0
 
-        prop_deadband = self.base_deadband_ratio * eff_lev
-        max_single_w = self.base_max_single_ratio * eff_lev
+        proportional_deadband = self.base_deadband_ratio * effective_leverage
+        max_single_weight = self.base_max_single_ratio * effective_leverage
 
         return LeverageStateSnapshot(
             initial_capital=self.initial_capital,
-            current_equity=eq,
+            current_equity=equity_val,
             high_water_mark=self.high_water_mark,
-            drawdown_pct=cur_dd * 100.0,
+            drawdown_pct=current_drawdown * 100.0,
             unlocked_tier=unlocked_tier,
             steps_unlocked=steps_unlocked,
             steps_down=steps_down,
             active_base_leverage=active_base,
-            vol_scalar=v_scalar,
-            effective_leverage=eff_lev,
+            vol_scalar=clamped_vol_scalar,
+            effective_leverage=effective_leverage,
             next_tier_leverage=next_tier,
             next_tier_hwm_target=float(next_milestone_hwm),
             progress_to_next_tier_pct=progress_pct,
-            proportional_deadband=prop_deadband,
-            max_single_asset_weight=max_single_w,
+            proportional_deadband=proportional_deadband,
+            max_single_asset_weight=max_single_weight,
         )
+
+    def _keep_top_leg_mask(self, leg_magnitudes: np.ndarray) -> np.ndarray:
+        """Returns a boolean mask keeping the top positions on one leg (>= 3 and >= min_leg_share)."""
+        leg_total = float(leg_magnitudes.sum())
+        if leg_total <= 1e-10 or int((leg_magnitudes > 1e-10).sum()) <= 3:
+            return np.ones_like(leg_magnitudes, dtype=bool)
+
+        leg_shares = leg_magnitudes / leg_total
+        rank_order = np.argsort(-leg_magnitudes)
+        keep_mask = np.zeros_like(leg_magnitudes, dtype=bool)
+        for rank_idx, sym_idx in enumerate(rank_order):
+            if leg_magnitudes[sym_idx] <= 1e-10:
+                break
+            if rank_idx < 3 or (rank_idx < self.max_leg_positions and leg_shares[sym_idx] >= self.min_leg_share):
+                keep_mask[sym_idx] = True
+        return keep_mask
 
     def scale_and_deadband_weights(
         self,
-        unit_weights: Dict[str, float],
-        current_weights: Optional[Dict[str, float]],
+        unit_weights: dict[str, float],
+        current_weights: dict[str, float] | None,
         current_equity: float,
         vol_scalar: float = 1.0,
-    ) -> Tuple[Dict[str, float], LeverageStateSnapshot]:
+    ) -> tuple[dict[str, float], LeverageStateSnapshot]:
         """
         Scales 1x unit weights by `effective_leverage`, enforces per-asset weight caps
         and strict 100% dollar neutrality (sum(longs) == -sum(shorts)), and applies
         the proportional turnover deadband against `current_weights`.
         """
-        snap = self.update_state(current_equity=current_equity, vol_scalar=vol_scalar)
-        eff_lev = snap.effective_leverage
-        max_single = snap.max_single_asset_weight
-        db = snap.proportional_deadband
+        snapshot = self.update_state(current_equity=current_equity, vol_scalar=vol_scalar)
+        effective_leverage = snapshot.effective_leverage
+        max_single = snapshot.max_single_asset_weight
+        deadband = snapshot.proportional_deadband
 
         symbols = sorted(unit_weights.keys())
         if not symbols:
-            return {}, snap
+            return {}, snapshot
 
-        raw_w = np.array([float(unit_weights.get(s, 0.0)) * eff_lev for s in symbols], dtype=float)
-        g_init = float(np.sum(np.abs(raw_w)))
+        raw_weights = np.array([float(unit_weights.get(s, 0.0)) * effective_leverage for s in symbols], dtype=float)
+        initial_gross = float(np.sum(np.abs(raw_weights)))
 
-        if g_init > 1e-8:
-            target_g = min(g_init, eff_lev)
-            pos_raw_cnt = int((raw_w > 1e-10).sum())
-            neg_raw_cnt = int((raw_w < -1e-10).sum())
+        if initial_gross > 1e-8:
+            target_gross = min(initial_gross, effective_leverage)
+            pos_raw_cnt = int((raw_weights > 1e-10).sum())
+            neg_raw_cnt = int((raw_weights < -1e-10).sum())
             use_active_leg_cap = (
                 self.max_leg_share is not None
                 and 0.0 < self.max_leg_share < 1.0
@@ -187,107 +203,80 @@ class SteppedLeverageController:
                 and neg_raw_cnt >= 4
             )
             if use_active_leg_cap:
-                max_single = float(self.max_leg_share) * (target_g / 2.0)
-            else:
-                max_single = snap.max_single_asset_weight
+                max_single = float(self.max_leg_share) * (target_gross / 2.0)
 
-            # Prune low-conviction tail stubs (< min_leg_share or beyond max_leg_positions)
-            # on full-universe books (>= 8 symbols) so sub-deadband noise stubs cannot get trapped.
-            raw_pruned = raw_w.copy()
+            raw_pruned = raw_weights.copy()
             if len(symbols) >= 8 and self.min_leg_share > 0.0:
-                pos_init = np.maximum(raw_pruned, 0.0)
-                neg_init = np.maximum(-raw_pruned, 0.0)
-                if pos_init.sum() > 1e-10 and int((pos_init > 1e-10).sum()) > 3:
-                    p_shares = pos_init / float(pos_init.sum())
-                    p_order = np.argsort(-pos_init)
-                    keep_p = np.zeros_like(pos_init, dtype=bool)
-                    for rank_idx, sym_idx in enumerate(p_order):
-                        if pos_init[sym_idx] <= 1e-10:
-                            break
-                        if rank_idx < 3 or (
-                            rank_idx < self.max_leg_positions and p_shares[sym_idx] >= self.min_leg_share
-                        ):
-                            keep_p[sym_idx] = True
-                    raw_pruned = np.where((raw_pruned > 0.0) & (~keep_p), 0.0, raw_pruned)
-
-                if neg_init.sum() > 1e-10 and int((neg_init > 1e-10).sum()) > 3:
-                    n_shares = neg_init / float(neg_init.sum())
-                    n_order = np.argsort(-neg_init)
-                    keep_n = np.zeros_like(neg_init, dtype=bool)
-                    for rank_idx, sym_idx in enumerate(n_order):
-                        if neg_init[sym_idx] <= 1e-10:
-                            break
-                        if rank_idx < 3 or (
-                            rank_idx < self.max_leg_positions and n_shares[sym_idx] >= self.min_leg_share
-                        ):
-                            keep_n[sym_idx] = True
-                    raw_pruned = np.where((raw_pruned < 0.0) & (~keep_n), 0.0, raw_pruned)
+                keep_pos = self._keep_top_leg_mask(np.maximum(raw_pruned, 0.0))
+                keep_neg = self._keep_top_leg_mask(np.maximum(-raw_pruned, 0.0))
+                raw_pruned = np.where((raw_pruned > 0.0) & (~keep_pos), 0.0, raw_pruned)
+                raw_pruned = np.where((raw_pruned < 0.0) & (~keep_neg), 0.0, raw_pruned)
 
             clipped = np.clip(raw_pruned, -max_single, max_single)
-            pos = np.maximum(clipped, 0.0)
-            neg = np.minimum(clipped, 0.0)
-            if pos.sum() > 1e-10 and np.abs(neg.sum()) > 1e-10:
-                pos = pos * ((target_g / 2.0) / pos.sum())
-                neg = neg * ((target_g / 2.0) / np.abs(neg.sum()))
-                desired = np.clip(pos + neg, -max_single, max_single)
-                # Final neutrality polish after single-asset clip
-                pos2 = np.maximum(desired, 0.0)
-                neg2 = np.minimum(desired, 0.0)
-                leg_target = min(float(pos2.sum()), float(np.abs(neg2.sum())))
+            pos_leg = np.maximum(clipped, 0.0)
+            neg_leg = np.minimum(clipped, 0.0)
+            if pos_leg.sum() > 1e-10 and np.abs(neg_leg.sum()) > 1e-10:
+                pos_leg = pos_leg * ((target_gross / 2.0) / pos_leg.sum())
+                neg_leg = neg_leg * ((target_gross / 2.0) / np.abs(neg_leg.sum()))
+                desired = np.clip(pos_leg + neg_leg, -max_single, max_single)
+                pos_clipped = np.maximum(desired, 0.0)
+                neg_clipped = np.minimum(desired, 0.0)
+                leg_target = min(float(pos_clipped.sum()), float(np.abs(neg_clipped.sum())))
                 if leg_target > 1e-10:
-                    pos2 = pos2 * (leg_target / pos2.sum())
-                    neg2 = neg2 * (leg_target / np.abs(neg2.sum()))
-                    desired = pos2 + neg2
+                    pos_clipped = pos_clipped * (leg_target / pos_clipped.sum())
+                    neg_clipped = neg_clipped * (leg_target / np.abs(neg_clipped.sum()))
+                    desired = pos_clipped + neg_clipped
                 else:
-                    desired = np.zeros_like(raw_w)
+                    desired = np.zeros_like(raw_weights)
             else:
-                desired = np.zeros_like(raw_w)
+                desired = np.zeros_like(raw_weights)
         else:
-            desired = np.zeros_like(raw_w)
+            desired = np.zeros_like(raw_weights)
 
         if current_weights:
-            prev_w = np.array([float(current_weights.get(s, 0.0)) for s in symbols], dtype=float)
-            delta = np.abs(desired - prev_w)
-            sign_flip = (desired * prev_w) < -1e-9
-            sub_db_decay = (np.abs(desired) < 0.5 * db) & (np.abs(prev_w) < db)
-            upd = np.where(
-                (np.abs(desired) < 1e-9) | (delta >= db) | sign_flip | sub_db_decay,
+            prev_weights = np.array([float(current_weights.get(s, 0.0)) for s in symbols], dtype=float)
+            delta = np.abs(desired - prev_weights)
+            sign_flip = (desired * prev_weights) < -1e-9
+            sub_deadband_decay = (np.abs(desired) < 0.5 * deadband) & (np.abs(prev_weights) < deadband)
+            updated = np.where(
+                (np.abs(desired) < 1e-9) | (delta >= deadband) | sign_flip | sub_deadband_decay,
                 desired,
-                prev_w,
+                prev_weights,
             )
 
-            # Re-balance long/short legs after deadband when net drift exceeds 2.5% (or cap gross <= eff_lev)
-            pos_u = np.maximum(upd, 0.0)
-            neg_u = np.minimum(upd, 0.0)
-            if pos_u.sum() > 1e-10 and np.abs(neg_u.sum()) > 1e-10:
-                net_drift = abs(float(pos_u.sum()) - float(np.abs(neg_u.sum())))
-                gross_u = float(pos_u.sum()) + float(np.abs(neg_u.sum()))
-                if net_drift > 0.025 or gross_u > eff_lev + 1e-6:
-                    avg_leg = min(eff_lev / 2.0, 0.5 * gross_u)
-                    pos_u = pos_u * (avg_leg / pos_u.sum())
-                    neg_u = neg_u * (avg_leg / np.abs(neg_u.sum()))
-                    upd = pos_u + neg_u
-                # Enforce active-leg concentration cap after deadband so no single asset exceeds max_leg_share
+            pos_updated = np.maximum(updated, 0.0)
+            neg_updated = np.minimum(updated, 0.0)
+            if pos_updated.sum() > 1e-10 and np.abs(neg_updated.sum()) > 1e-10:
+                net_drift = abs(float(pos_updated.sum()) - float(np.abs(neg_updated.sum())))
+                gross_updated = float(pos_updated.sum()) + float(np.abs(neg_updated.sum()))
+                if net_drift > 0.025 or gross_updated > effective_leverage + 1e-6:
+                    avg_leg = min(effective_leverage / 2.0, 0.5 * gross_updated)
+                    pos_updated = pos_updated * (avg_leg / pos_updated.sum())
+                    neg_updated = neg_updated * (avg_leg / np.abs(neg_updated.sum()))
+                    updated = pos_updated + neg_updated
+
                 if (
                     self.max_leg_share is not None
                     and 0.0 < self.max_leg_share < 1.0
-                    and int((upd > 1e-10).sum()) >= 4
-                    and int((upd < -1e-10).sum()) >= 4
+                    and int((updated > 1e-10).sum()) >= 4
+                    and int((updated < -1e-10).sum()) >= 4
                 ):
-                    p_u = np.maximum(upd, 0.0)
-                    n_u = np.maximum(-upd, 0.0)
-                    if p_u.sum() > 1e-10 and n_u.sum() > 1e-10:
-                        cap_p = float(p_u.sum()) * float(self.max_leg_share)
-                        cap_n = float(n_u.sum()) * float(self.max_leg_share)
-                        p_u = np.minimum(p_u, cap_p)
-                        n_u = np.minimum(n_u, cap_n)
-                        leg_u = min(float(p_u.sum()), float(n_u.sum()))
-                        if leg_u > 1e-10:
-                            upd = p_u * (leg_u / float(p_u.sum())) - n_u * (leg_u / float(n_u.sum()))
+                    pos_cap_leg = np.maximum(updated, 0.0)
+                    neg_cap_leg = np.maximum(-updated, 0.0)
+                    if pos_cap_leg.sum() > 1e-10 and neg_cap_leg.sum() > 1e-10:
+                        cap_pos = float(pos_cap_leg.sum()) * float(self.max_leg_share)
+                        cap_neg = float(neg_cap_leg.sum()) * float(self.max_leg_share)
+                        pos_cap_leg = np.minimum(pos_cap_leg, cap_pos)
+                        neg_cap_leg = np.minimum(neg_cap_leg, cap_neg)
+                        leg_target_u = min(float(pos_cap_leg.sum()), float(neg_cap_leg.sum()))
+                        if leg_target_u > 1e-10:
+                            updated = pos_cap_leg * (leg_target_u / float(pos_cap_leg.sum())) - neg_cap_leg * (
+                                leg_target_u / float(neg_cap_leg.sum())
+                            )
             else:
-                upd = desired
+                updated = desired
         else:
-            upd = desired
+            updated = desired
 
-        final_weights = {sym: float(upd[i]) for i, sym in enumerate(symbols) if abs(upd[i]) > 1e-8}
-        return final_weights, snap
+        final_weights = {sym: float(updated[i]) for i, sym in enumerate(symbols) if abs(updated[i]) > 1e-8}
+        return final_weights, snapshot

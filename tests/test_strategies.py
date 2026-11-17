@@ -25,13 +25,15 @@ def test_cross_sectional_momentum_strategy():
         opens = (highs + lows) / 2.0
         volumes = np.random.uniform(1000, 5000, size=100)
 
-        df = pd.DataFrame({
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-        })
+        df = pd.DataFrame(
+            {
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+            }
+        )
         market_data[sym] = df
         volatilities[sym] = 0.50
 

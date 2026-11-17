@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.models.alpha_predictor import CrossSectionalAlphaPredictor
 from src.domain.entities import Signal
+from src.models.alpha_predictor import CrossSectionalAlphaPredictor
 
 
 def test_alpha_predictor_fit_and_predict():
@@ -12,11 +12,13 @@ def test_alpha_predictor_fit_and_predict():
     n_assets = 10
 
     # Synthetic features: 3 quantitative factors
-    features = pd.DataFrame({
-        "mom_24h": np.random.randn(n_samples),
-        "vol_parkinson": np.abs(np.random.randn(n_samples)),
-        "smart_money_div": np.random.randn(n_samples),
-    })
+    features = pd.DataFrame(
+        {
+            "mom_24h": np.random.randn(n_samples),
+            "vol_parkinson": np.abs(np.random.randn(n_samples)),
+            "smart_money_div": np.random.randn(n_samples),
+        }
+    )
 
     # Forward returns correlated with factors + noise
     targets = (
@@ -33,12 +35,14 @@ def test_alpha_predictor_fit_and_predict():
     assert predictor.lgb_model is not None
 
     # Predict on test universe
-    test_features = pd.DataFrame({
-        "symbol": [f"CRYPTO_{i}USDT" for i in range(n_assets)],
-        "mom_24h": np.random.randn(n_assets),
-        "vol_parkinson": np.abs(np.random.randn(n_assets)),
-        "smart_money_div": np.random.randn(n_assets),
-    })
+    test_features = pd.DataFrame(
+        {
+            "symbol": [f"CRYPTO_{i}USDT" for i in range(n_assets)],
+            "mom_24h": np.random.randn(n_assets),
+            "vol_parkinson": np.abs(np.random.randn(n_assets)),
+            "smart_money_div": np.random.randn(n_assets),
+        }
+    )
 
     signals = predictor.predict(test_features)
     assert len(signals) == n_assets

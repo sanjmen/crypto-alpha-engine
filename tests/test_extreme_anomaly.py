@@ -2,7 +2,6 @@
 Unit & Integration Tests for Extreme Anomaly & Illiquid Tail Strategies.
 """
 
-from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import pytest
@@ -51,10 +50,26 @@ def sample_market_data():
     v_breakout[-4:] = 4000.0
 
     market = {
-        "BTCUSDT": pd.DataFrame({"open": p_normal, "high": p_normal + 1, "low": p_normal - 1, "close": p_normal, "volume": v_normal}, index=idx),
-        "CTSIUSDT": pd.DataFrame({"open": p_dump, "high": p_dump + 0.5, "low": p_dump - 0.5, "close": p_dump, "volume": v_dump}, index=idx),
-        "MAGICUSDT": pd.DataFrame({"open": p_pump, "high": p_pump + 0.5, "low": p_pump - 0.5, "close": p_pump, "volume": v_pump}, index=idx),
-        "OGNUSDT": pd.DataFrame({"open": p_breakout, "high": p_breakout + 0.5, "low": p_breakout - 0.5, "close": p_breakout, "volume": v_breakout}, index=idx),
+        "BTCUSDT": pd.DataFrame(
+            {"open": p_normal, "high": p_normal + 1, "low": p_normal - 1, "close": p_normal, "volume": v_normal},
+            index=idx,
+        ),
+        "CTSIUSDT": pd.DataFrame(
+            {"open": p_dump, "high": p_dump + 0.5, "low": p_dump - 0.5, "close": p_dump, "volume": v_dump}, index=idx
+        ),
+        "MAGICUSDT": pd.DataFrame(
+            {"open": p_pump, "high": p_pump + 0.5, "low": p_pump - 0.5, "close": p_pump, "volume": v_pump}, index=idx
+        ),
+        "OGNUSDT": pd.DataFrame(
+            {
+                "open": p_breakout,
+                "high": p_breakout + 0.5,
+                "low": p_breakout - 0.5,
+                "close": p_breakout,
+                "volume": v_breakout,
+            },
+            index=idx,
+        ),
     }
 
     funding = {

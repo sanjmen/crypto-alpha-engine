@@ -4,12 +4,13 @@ Unit Tests for ShadowTradingDaemon.
 
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.domain.entities import Order, Portfolio, Position
-from src.domain.enums import MarketRegime, OrderSide, OrderStatus, OrderType, PositionSide
+from src.domain.entities import Order
+from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.execution.database import ShadowDatabase
 from src.execution.execution_router import SmartExecutionRouter
 from src.execution.shadow_broker import ShadowExecutionBroker
@@ -30,14 +31,16 @@ def generate_mock_klines(n_bars: int = 100, base_price: float = 90_000.0) -> pd.
     volumes = np.random.uniform(50, 200, n_bars)
 
     dates = pd.date_range(end=datetime.now(timezone.utc), periods=n_bars, freq="1h")
-    return pd.DataFrame({
-        "timestamp": dates,
-        "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": closes,
-        "volume": volumes,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        }
+    )
 
 
 @pytest.fixture
@@ -115,7 +118,7 @@ def test_daemon_fast_cycle(daemon: ShadowTradingDaemon):
 
 def test_daemon_rebalance_cycle(daemon: ShadowTradingDaemon):
     """Verifies multi-strategy portfolio rebalance signal execution and deadband logic."""
-    orders = daemon.run_rebalance_cycle()
+    daemon.run_rebalance_cycle()
     assert daemon.last_rebalance_time is not None
 
     # Verify that rebalance snapshot was saved in database
@@ -170,15 +173,18 @@ def test_daemon_anomaly_scan(daemon: ShadowTradingDaemon):
 
     # Generate synthetic flush klines (price dropping from 1.0 to 0.50)
     import numpy as np
+
     closes = np.linspace(1.0, 0.50, 30)
-    synthetic_klines = pd.DataFrame({
-        "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
-        "open": closes * 1.01,
-        "high": closes * 1.02,
-        "low": closes * 0.99,
-        "close": closes,
-        "volume": np.full(30, 100_000.0),
-    })
+    synthetic_klines = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
+            "open": closes * 1.01,
+            "high": closes * 1.02,
+            "low": closes * 0.99,
+            "close": closes,
+            "volume": np.full(30, 100_000.0),
+        }
+    )
     daemon.fetch_symbol_klines = MagicMock(return_value=synthetic_klines)
 
     orders = daemon.run_anomaly_scan()
@@ -323,14 +329,16 @@ def test_retoque_2_anomaly_asymmetric_cooldown_and_profit_lock(daemon: ShadowTra
         }
     }
     closes = np.linspace(1.0, 0.50, 30)
-    synthetic_klines = pd.DataFrame({
-        "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
-        "open": closes * 1.01,
-        "high": closes * 1.02,
-        "low": closes * 0.99,
-        "close": closes,
-        "volume": np.full(30, 100_000.0),
-    })
+    synthetic_klines = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
+            "open": closes * 1.01,
+            "high": closes * 1.02,
+            "low": closes * 0.99,
+            "close": closes,
+            "volume": np.full(30, 100_000.0),
+        }
+    )
     daemon.fetch_symbol_klines = MagicMock(return_value=synthetic_klines)
 
     # Replace DB get_trades with empty list so manual cooldown timestamp is tested directly
@@ -353,6 +361,7 @@ def test_three_shields_offline_rebalance_intracycle_drift_and_crypto_only_filter
     C) Crypto-Only Anomaly Filter: Blocks TradFi stocks/ETFs (INTC, INTW, MVLL, SOXS) and gapped/flat-bar symbols.
     """
     from datetime import datetime, timedelta, timezone
+
     from src.strategies.extreme_anomaly import OversoldBounceStrategy
 
     # --- Shield A: Offline Rebalance Guard ---
@@ -365,7 +374,7 @@ def test_three_shields_offline_rebalance_intracycle_drift_and_crypto_only_filter
 
     # Restore network connectivity -> rebalance succeeds and advances last_rebalance_time
     daemon.exchange.fetch_ohlcv.side_effect = None
-    orders_online = daemon.run_rebalance_cycle()
+    daemon.run_rebalance_cycle()
     assert daemon.last_rebalance_time is not None
 
     # --- Shield B: Intra-Cycle Neutrality Guard ---
@@ -398,14 +407,16 @@ def test_three_shields_offline_rebalance_intracycle_drift_and_crypto_only_filter
         "MVLL/USDT": {"price": 19.0, "bid": 18.9, "ask": 19.1, "change_24h": -20.0, "volume_24h": 50_000_000.0},
     }
     closes = np.linspace(100.0, 50.0, 30)
-    synthetic_klines = pd.DataFrame({
-        "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
-        "open": closes * 1.01,
-        "high": closes * 1.02,
-        "low": closes * 0.99,
-        "close": closes,
-        "volume": np.full(30, 100_000.0),
-    })
+    synthetic_klines = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=30, freq="1h", tz="UTC"),
+            "open": closes * 1.01,
+            "high": closes * 1.02,
+            "low": closes * 0.99,
+            "close": closes,
+            "volume": np.full(30, 100_000.0),
+        }
+    )
     daemon.fetch_symbol_klines = MagicMock(return_value=synthetic_klines)
     tradfi_orders = daemon.run_anomaly_scan()
     assert len(tradfi_orders) == 0
@@ -429,17 +440,19 @@ def test_nov3_anomaly_open_pos_tracking_and_48h_timestop(daemon: ShadowTradingDa
         quantity=80.0,
         strategy="Extreme Drop Bounce",
     )
-    daemon.exchange.fetch_tickers = MagicMock(return_value={
-        "DOS/USDT:USDT": {
-            "last": 0.1950,
-            "bid": 0.1949,
-            "ask": 0.1951,
-            "high": 0.2000,
-            "low": 0.1850,
-            "percentage": -2.5,
-            "quoteVolume": 5_000_000.0,  # Below 20M scan threshold and not top 10 loser
+    daemon.exchange.fetch_tickers = MagicMock(
+        return_value={
+            "DOS/USDT:USDT": {
+                "last": 0.1950,
+                "bid": 0.1949,
+                "ask": 0.1951,
+                "high": 0.2000,
+                "low": 0.1850,
+                "percentage": -2.5,
+                "quoteVolume": 5_000_000.0,  # Below 20M scan threshold and not top 10 loser
+            }
         }
-    })
+    )
     tickers = daemon.fetch_live_tickers()
     assert "DOS/USDT" in tickers
     assert tickers["DOS/USDT"]["price"] == 0.1950
@@ -453,7 +466,7 @@ def test_nov3_anomaly_open_pos_tracking_and_48h_timestop(daemon: ShadowTradingDa
     assert "DOSUSDT" in daemon.anomaly_last_exit
 
 
-def test_m13_issue_50_dynamic_confluence_anomaly_sizing(daemon: ShadowTradingDaemon):
+def test_dynamic_confluence_anomaly_sizing(daemon: ShadowTradingDaemon):
     """
     Tests Issue #50 (Dynamic Confluence Position Sizing $10.00 - $25.00):
     1) Marginal low-dispersion setups receive near-minimum sizing (~$10-$13).
@@ -497,7 +510,7 @@ def test_nov5_core_bracket_cooldown_and_neutrality_recentering(daemon: ShadowTra
        normal same-direction allocation is permitted again.
     """
     from datetime import datetime, timedelta, timezone
-    from src.domain.entities import Order
+
     from src.domain.enums import OrderStatus, OrderType
 
     now = datetime.now(timezone.utc)
@@ -560,16 +573,18 @@ def test_nov5_core_bracket_cooldown_and_neutrality_recentering(daemon: ShadowTra
 
     # 5. Verify SQLite hydration of `core_bracket_last_exit` across daemon restarts
     daemon.core_bracket_last_exit.clear()
-    daemon.broker.db.get_trades = MagicMock(return_value=[
-        {
-            "timestamp": (now - timedelta(minutes=15)).isoformat(),
-            "symbol": "ETH/USDT",
-            "side": "SELL",
-            "order_id": "shd_tp_9dbfd234fa",
-            "realized_pnl": 23.20,
-            "strategy": "F7_HighLiq_Size (Quality)",
-        }
-    ])
+    daemon.broker.db.get_trades = MagicMock(
+        return_value=[
+            {
+                "timestamp": (now - timedelta(minutes=15)).isoformat(),
+                "symbol": "ETH/USDT",
+                "side": "SELL",
+                "order_id": "shd_tp_9dbfd234fa",
+                "realized_pnl": 23.20,
+                "strategy": "F7_HighLiq_Size (Quality)",
+            }
+        ]
+    )
     daemon._refresh_anomaly_cooldowns()
     assert "ETHUSDT" in daemon.core_bracket_last_exit
     assert daemon.core_bracket_last_exit["ETHUSDT"][1] == PositionSide.LONG
@@ -588,7 +603,15 @@ def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: 
     from src.strategies.extreme_anomaly import OversoldBounceStrategy
 
     # 1. Verify expanded TradFi equity/ETF/commodity bases are blocked
-    for tradfi_sym in ["SNDK/USDT", "UVXY/USDT", "DELL/USDT", "QCOM/USDT", "RKLB/USDT", "SAMSUNG/USDT", "ANTHROPIC/USDT"]:
+    for tradfi_sym in [
+        "SNDK/USDT",
+        "UVXY/USDT",
+        "DELL/USDT",
+        "QCOM/USDT",
+        "RKLB/USDT",
+        "SAMSUNG/USDT",
+        "ANTHROPIC/USDT",
+    ]:
         assert daemon._is_tradfi_or_gapped_symbol(tradfi_sym) is True
 
     # 2. Seed a stale zombie ticker ("ZOMBIE/USDT") that is NOT in Core symbols and NOT an open position
@@ -599,17 +622,19 @@ def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: 
         "change_24h": -20.0,
         "volume_24h": 30_000_000.0,
     }
-    daemon.exchange.fetch_tickers = MagicMock(return_value={
-        "BTC/USDT:USDT": {
-            "last": 75000.0,
-            "bid": 74999.0,
-            "ask": 75001.0,
-            "high": 76000.0,
-            "low": 74000.0,
-            "percentage": -1.5,
-            "quoteVolume": 500_000_000.0,
+    daemon.exchange.fetch_tickers = MagicMock(
+        return_value={
+            "BTC/USDT:USDT": {
+                "last": 75000.0,
+                "bid": 74999.0,
+                "ask": 75001.0,
+                "high": 76000.0,
+                "low": 74000.0,
+                "percentage": -1.5,
+                "quoteVolume": 500_000_000.0,
+            }
         }
-    })
+    )
     refreshed = daemon.fetch_live_tickers()
     assert "ZOMBIE/USDT" not in refreshed
     assert "BTC/USDT" in refreshed
@@ -629,14 +654,16 @@ def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: 
         }
     }
     closes = np.linspace(0.2800, 0.1800, 30)
-    fresh_klines = pd.DataFrame({
-        "timestamp": pd.date_range("2026-11-08", periods=30, freq="1h", tz="UTC"),
-        "open": closes * 1.01,
-        "high": closes * 1.02,
-        "low": closes * 0.99,
-        "close": closes,
-        "volume": np.full(30, 150_000.0),
-    })
+    fresh_klines = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-11-08", periods=30, freq="1h", tz="UTC"),
+            "open": closes * 1.01,
+            "high": closes * 1.02,
+            "low": closes * 0.99,
+            "close": closes,
+            "volume": np.full(30, 150_000.0),
+        }
+    )
     daemon.fetch_symbol_klines = MagicMock(return_value=fresh_klines)
     daemon.broker.db.get_trades = MagicMock(return_value=[])
 
@@ -764,7 +791,7 @@ def test_nov15_zombie_stub_pruning_signflip_deadband_and_anomaly_guards():
         "LINKUSDT": 0.0536,
         "ETHUSDT": 0.0465,
         "NEARUSDT": 0.0111,  # 4.1% of Long leg (< 5% -> pruned!)
-        "XRPUSDT": 0.0084,   # 3.2% of Long leg (< 5% -> pruned!)
+        "XRPUSDT": 0.0084,  # 3.2% of Long leg (< 5% -> pruned!)
         "SOLUSDT": 0.0066,
         "BNBUSDT": 0.0031,
         "ADAUSDT": 0.0010,
@@ -816,29 +843,54 @@ def test_nov15_zombie_stub_pruning_signflip_deadband_and_anomaly_guards():
     h_jct[-2] = 0.00284  # Massive upper blow-off wick
     v_jct = np.full(30, 1000.0)
     v_jct[-1] = 5000.0
-    df_jct = pd.DataFrame({"open": c_jct, "high": h_jct, "low": c_jct * 0.99, "close": c_jct, "volume": v_jct}, index=idx)
+    df_jct = pd.DataFrame(
+        {"open": c_jct, "high": h_jct, "low": c_jct * 0.99, "close": c_jct, "volume": v_jct}, index=idx
+    )
     eb = EarlyBreakoutStrategy(pump_threshold_4h=0.08, volume_multiplier=2.5)
     assert len(eb.generate_signals({"JCT/USDT": df_jct})) == 0
 
     # 2b. EVAA/USDT vertical +16% 1h short-squeeze bar -> PumpFundingFade must wait for deceleration
     c_evaa = np.linspace(1.80, 2.41, 30)
     c_evaa[-1] = 2.80  # +16.2% in the final 1h bar
-    df_evaa = pd.DataFrame({"open": c_evaa, "high": c_evaa * 1.01, "low": c_evaa * 0.99, "close": c_evaa, "volume": np.full(30, 1000.0)}, index=idx)
+    df_evaa = pd.DataFrame(
+        {"open": c_evaa, "high": c_evaa * 1.01, "low": c_evaa * 0.99, "close": c_evaa, "volume": np.full(30, 1000.0)},
+        index=idx,
+    )
     pf = PumpFundingFadeStrategy(pump_threshold_24h=0.25, min_funding_rate=0.0005)
-    assert len(pf.generate_signals({"EVAA/USDT": df_evaa}, funding_data={"EVAA/USDT": pd.DataFrame([{"funding_rate": 0.0010}])})) == 0
+    assert (
+        len(
+            pf.generate_signals(
+                {"EVAA/USDT": df_evaa}, funding_data={"EVAA/USDT": pd.DataFrame([{"funding_rate": 0.0010}])}
+            )
+        )
+        == 0
+    )
 
     # 2c. BTW/USDT vertical -6.6% crash bar closing at low -> OversoldBounce must not catch falling knife
     c_btw = np.linspace(0.80, 0.605, 30)
     c_btw[-1] = 0.565  # -6.6% 1h crash bar
-    df_btw = pd.DataFrame({"open": c_btw * 1.01, "high": c_btw * 1.01, "low": c_btw, "close": c_btw, "volume": np.full(30, 1000.0)}, index=idx)
+    df_btw = pd.DataFrame(
+        {"open": c_btw * 1.01, "high": c_btw * 1.01, "low": c_btw, "close": c_btw, "volume": np.full(30, 1000.0)},
+        index=idx,
+    )
     ob = OversoldBounceStrategy(dump_threshold_24h=-0.15, rsi_threshold=28.0)
     assert len(ob.generate_signals({"BTW/USDT": df_btw})) == 0
 
     # 2d. SOPH/USDT negative 4h/1h freefall -> ExtremeFundingHarvester must block LONG entry
     c_soph = np.linspace(0.00160, 0.00138, 30)
-    df_soph = pd.DataFrame({"open": c_soph, "high": c_soph * 1.01, "low": c_soph * 0.99, "close": c_soph, "volume": np.full(30, 1000.0)}, index=idx)
+    df_soph = pd.DataFrame(
+        {"open": c_soph, "high": c_soph * 1.01, "low": c_soph * 0.99, "close": c_soph, "volume": np.full(30, 1000.0)},
+        index=idx,
+    )
     fh = ExtremeFundingHarvesterStrategy()
-    assert len(fh.generate_signals({"SOPH/USDT": df_soph}, funding_data={"SOPH/USDT": pd.DataFrame([{"funding_rate": -0.0030}])})) == 0
+    assert (
+        len(
+            fh.generate_signals(
+                {"SOPH/USDT": df_soph}, funding_data={"SOPH/USDT": pd.DataFrame([{"funding_rate": -0.0030}])}
+            )
+        )
+        == 0
+    )
 
     # 3. Verify Core symbol exclusion in run_anomaly_scan and Orphan Harvester Hedge cleanup
     db = ShadowDatabase(db_path=":memory:")
@@ -1024,7 +1076,15 @@ def test_chop_range_arb_specialist_and_adaptive_chop_tp():
         median_vol=0.003,
         conviction=0.60,
         factor_weights={"macro": 0.0, "med": 0.0, "fast": 0.0, "rev": 0.65, "carry": 0.0, "liq": 0.0, "size": 0.35},
-        factor_tstats={"macro": -0.60, "med": -0.55, "fast": -0.40, "rev": 0.50, "carry": -0.20, "liq": -0.30, "size": 0.10},
+        factor_tstats={
+            "macro": -0.60,
+            "med": -0.55,
+            "fast": -0.40,
+            "rev": 0.50,
+            "carry": -0.20,
+            "liq": -0.30,
+            "size": 0.10,
+        },
         asset_betas={"BTCUSDT": 1.0, "APTUSDT": 1.1},
         portfolio_beta=0.0,
         chop_specialist_tstat=1.45,
@@ -1109,11 +1169,3 @@ def test_chop_range_arb_specialist_and_adaptive_chop_tp():
             assert abs(v) >= 160.0
 
     db.close()
-
-
-
-
-
-
-
-

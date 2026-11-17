@@ -55,7 +55,7 @@ class MetaStrategyAllocator:
         seven_factor_engine: SevenFactorOnlineEngine | None = None,
         stepped_leverage_controller: SteppedLeverageController | None = None,
         use_seven_factor_engine: bool = False,
-    ):
+    ) -> None:
         self.momentum_strategy = momentum_strategy or CrossSectionalMomentumStrategy()
         self.stat_arb_strategy = stat_arb_strategy or StatArbMeanReversionStrategy()
         self.carry_strategy = carry_strategy or FundingCarryArbitrageStrategy()
@@ -87,25 +87,21 @@ class MetaStrategyAllocator:
     def compute_regime_weights(self, regime: MarketRegime) -> dict[str, float]:
         """
         Adjusts strategy allocation weights conditioned on the detected regime.
-        - TRENDING: Boost Momentum, reduce Mean-Reversion.
-        - RANGING: Boost Mean-Reversion, reduce Momentum.
-        - VOLATILE: De-risk directional strategies, preserve Carry and cash buffer.
         """
         if self.pairs_strategy:
             if regime == MarketRegime.TRENDING:
                 return {"momentum": 0.50, "stat_arb": 0.10, "carry": 0.20, "pairs": 0.20}
-            elif regime == MarketRegime.RANGING:
+            if regime == MarketRegime.RANGING:
                 return {"momentum": 0.15, "stat_arb": 0.25, "carry": 0.25, "pairs": 0.35}
-            elif regime == MarketRegime.VOLATILE:
+            if regime == MarketRegime.VOLATILE:
                 return {"momentum": 0.10, "stat_arb": 0.10, "carry": 0.20, "pairs": 0.10}
             return self.base_weights
 
         if regime == MarketRegime.TRENDING:
             return {"momentum": 0.60, "stat_arb": 0.10, "carry": 0.30}
-        elif regime == MarketRegime.RANGING:
+        if regime == MarketRegime.RANGING:
             return {"momentum": 0.15, "stat_arb": 0.55, "carry": 0.30}
-        elif regime == MarketRegime.VOLATILE:
-            # Scaled down (50% gross target) to manage tail-risk volatility
+        if regime == MarketRegime.VOLATILE:
             return {"momentum": 0.10, "stat_arb": 0.10, "carry": 0.30}
         return self.base_weights
 
@@ -118,34 +114,23 @@ class MetaStrategyAllocator:
         """
         Allocates risk capital across strategies using Hierarchical Risk Parity (HRP).
         Optionally blends HRP risk-balanced weights with market regime tilts.
-
-        Args:
-            strategy_returns: DataFrame where columns are strategy names ('momentum', 'stat_arb', 'carry')
-                              and rows are historical periodic returns.
-            regime: Optional detected market regime to apply conditional tilt.
-            regime_blend_ratio: Weight given to regime tilt (0.0 = pure HRP, 1.0 = pure regime).
-
-        Returns:
-            Dict mapping strategy names to normalized capital weights summing to 1.0.
         """
         if strategy_returns.empty or strategy_returns.shape[1] < 2:
             return self.compute_regime_weights(regime) if regime else self.base_weights
 
-        # 1. Compute HRP weights from strategy returns covariance
         hrp_weights_s = self.hrp_allocator.allocate_from_returns(strategy_returns)
         hrp_dict = hrp_weights_s.to_dict()
 
         if regime is None or regime_blend_ratio <= 0.0:
             return hrp_dict
 
-        # 2. Blend with regime weights
         regime_dict = self.compute_regime_weights(regime)
-        blended = {}
+        blended: dict[str, float] = {}
         all_keys = set(hrp_dict.keys()) | set(regime_dict.keys())
-        for k in all_keys:
-            w_hrp = hrp_dict.get(k, 1.0 / len(all_keys))
-            w_reg = regime_dict.get(k, 1.0 / len(all_keys))
-            blended[k] = (1.0 - regime_blend_ratio) * w_hrp + regime_blend_ratio * w_reg
+        for key in all_keys:
+            w_hrp = hrp_dict.get(key, 1.0 / len(all_keys))
+            w_reg = regime_dict.get(key, 1.0 / len(all_keys))
+            blended[key] = (1.0 - regime_blend_ratio) * w_hrp + regime_blend_ratio * w_reg
 
         total = sum(blended.values())
         return {k: v / total for k, v in blended.items()} if total > 0 else hrp_dict
@@ -156,7 +141,6 @@ class MetaStrategyAllocator:
     ) -> dict[str, float]:
         """
         Directly allocates capital across the asset universe using Hierarchical Risk Parity.
-        Bypasses Markowitz quadratic programming matrix inversion.
         """
         if asset_returns.empty:
             return {}
@@ -167,26 +151,23 @@ class MetaStrategyAllocator:
         """
         Detects prevailing market regime from benchmark asset (BTC or ETH).
         """
-        benchmark_df = market_data.get("BTCUSDT")
-        if benchmark_df is None:
-            benchmark_df = market_data.get("BTC/USDT:USDT")
-        if benchmark_df is None:
-            benchmark_df = market_data.get("ETHUSDT")
-        if benchmark_df is None:
-            benchmark_df = market_data.get("ETH/USDT:USDT")
+        benchmark_df: pd.DataFrame | None = None
+        for key in ("BTCUSDT", "BTC/USDT", "BTC/USDT:USDT", "ETHUSDT", "ETH/USDT", "ETH/USDT:USDT"):
+            if key in market_data and market_data[key] is not None:
+                benchmark_df = market_data[key]
+                break
         if benchmark_df is None and len(market_data) > 0:
             benchmark_df = next(iter(market_data.values()))
 
         if benchmark_df is None or len(benchmark_df) < 50:
             return MarketRegime.RANGING
 
-        opens = benchmark_df["open"].values
-        highs = benchmark_df["high"].values
-        lows = benchmark_df["low"].values
-        closes = benchmark_df["close"].values
-
-        regime = self.regime_classifier.classify(opens, highs, lows, closes)
-        return regime
+        return self.regime_classifier.classify(
+            benchmark_df["open"].values,
+            benchmark_df["high"].values,
+            benchmark_df["low"].values,
+            benchmark_df["close"].values,
+        )
 
     def generate_seven_factor_allocations(
         self,
@@ -208,11 +189,11 @@ class MetaStrategyAllocator:
         """
         regime = self.detect_market_regime(market_data)
         engine = self.seven_factor_engine or SevenFactorOnlineEngine()
-        lev_ctrl = self.stepped_leverage_controller or SteppedLeverageController(
+        leverage_controller = self.stepped_leverage_controller or SteppedLeverageController(
             initial_capital=max(portfolio.total_equity, 1000.0)
         )
 
-        sf_res = engine.allocate_latest(
+        seven_factor_result = engine.allocate_latest(
             bars_1h=market_data,
             funding_rates=funding_data,
             bars_15m=bars_15m,
@@ -222,52 +203,54 @@ class MetaStrategyAllocator:
             smart_money=smart_money_data,
             quarterly_basis=quarterly_basis_data,
         )
-        self.last_seven_factor_result = sf_res
+        self.last_seven_factor_result = seven_factor_result
 
-        eff_unit_weights = dict(sf_res.unit_weights)
+        effective_unit_weights = dict(seven_factor_result.unit_weights)
         if cooldown_blocked_sides:
-            for sym_k, w_val in list(eff_unit_weights.items()):
-                clean_k = sym_k.replace("/", "")
-                blocked_side = cooldown_blocked_sides.get(clean_k) or cooldown_blocked_sides.get(sym_k)
-                if blocked_side is not None:
-                    if (w_val > 0 and blocked_side == PositionSide.LONG) or (
-                        w_val < 0 and blocked_side == PositionSide.SHORT
-                    ):
-                        eff_unit_weights[sym_k] = 0.0
+            for sym_key, weight_val in list(effective_unit_weights.items()):
+                clean_key = sym_key.replace("/", "")
+                blocked_side = cooldown_blocked_sides.get(clean_key) or cooldown_blocked_sides.get(sym_key)
+                if blocked_side is not None and (
+                    (weight_val > 0 and blocked_side == PositionSide.LONG)
+                    or (weight_val < 0 and blocked_side == PositionSide.SHORT)
+                ):
+                    effective_unit_weights[sym_key] = 0.0
 
         equity = max(float(portfolio.total_equity), 1.0)
         if current_weights is None and portfolio.positions:
             current_weights = {}
             for sym, pos in portfolio.positions.items():
-                df_s = market_data.get(sym)
-                if df_s is not None and not df_s.empty:
-                    px = float(df_s["close"].iloc[-1])
-                    current_weights[sym] = (pos.quantity * px) / equity
+                if pos.side == PositionSide.FLAT or abs(pos.quantity) <= 1e-8:
+                    continue
+                df_sym = market_data.get(sym)
+                if df_sym is not None and not df_sym.empty:
+                    price = float(df_sym["close"].iloc[-1])
+                    signed_qty = -abs(pos.quantity) if pos.side == PositionSide.SHORT else abs(pos.quantity)
+                    current_weights[sym] = (signed_qty * price) / equity
 
-        final_weights, lev_snap = lev_ctrl.scale_and_deadband_weights(
-            unit_weights=eff_unit_weights,
+        final_weights, leverage_snapshot = leverage_controller.scale_and_deadband_weights(
+            unit_weights=effective_unit_weights,
             current_weights=current_weights,
             current_equity=equity,
-            vol_scalar=sf_res.vol_scalar,
+            vol_scalar=seven_factor_result.vol_scalar,
         )
-        self.last_leverage_snapshot = lev_snap
+        self.last_leverage_snapshot = leverage_snapshot
 
-        # Identify dominant active factor for telemetry label
         top_factor_key = (
-            max(sf_res.factor_weights, key=sf_res.factor_weights.get)
-            if sf_res.factor_weights
+            max(seven_factor_result.factor_weights, key=seven_factor_result.factor_weights.get)
+            if seven_factor_result.factor_weights
             else "macro"
         )
         top_factor_label = FACTOR_LABELS.get(top_factor_key, f"7Factor:{top_factor_key}")
 
         net_dollar_positions: dict[str, float] = {}
-        for sym, w in final_weights.items():
-            dollar_notional = float(w * equity)
+        for sym, weight in final_weights.items():
+            dollar_notional = float(weight * equity)
             if abs(dollar_notional) > 1.0:
                 net_dollar_positions[sym] = dollar_notional
                 self.last_dominant_strategy[sym] = top_factor_label
 
-        return net_dollar_positions, regime, sf_res.factor_weights
+        return net_dollar_positions, regime, seven_factor_result.factor_weights
 
     def generate_portfolio_allocations(
         self,
@@ -306,37 +289,57 @@ class MetaStrategyAllocator:
                 cooldown_blocked_sides=cooldown_blocked_sides,
             )
 
-        # 1. Detect market regime
         regime = self.detect_market_regime(market_data)
 
-        # 2. Compute strategy weights (HRP or Regime-conditioned)
         if use_hrp and strategy_returns is not None and not strategy_returns.empty:
             strat_weights = self.compute_hrp_strategy_weights(strategy_returns, regime=regime)
         else:
             strat_weights = self.compute_regime_weights(regime)
 
-        # 3. Generate sub-strategy signals
         signals_mom = self.momentum_strategy.generate_signals(market_data)
         signals_arb = self.stat_arb_strategy.generate_signals(market_data)
         signals_cry = self.carry_strategy.generate_signals(market_data, funding_data=funding_data)
         signals_prs = self.pairs_strategy.generate_signals(market_data) if self.pairs_strategy else []
-        signals_bnc = self.oversold_bounce_strategy.generate_signals(market_data) if self.oversold_bounce_strategy else []
+        signals_bnc = (
+            self.oversold_bounce_strategy.generate_signals(market_data) if self.oversold_bounce_strategy else []
+        )
         signals_brk = self.early_breakout_strategy.generate_signals(market_data) if self.early_breakout_strategy else []
-        signals_fad = self.funding_fade_strategy.generate_signals(market_data, funding_data=funding_data) if self.funding_fade_strategy else []
+        signals_fad = (
+            self.funding_fade_strategy.generate_signals(market_data, funding_data=funding_data)
+            if self.funding_fade_strategy
+            else []
+        )
 
-        # 4. Size positions per strategy
         alloc_mom = self.momentum_strategy.allocate_weights(signals_mom, portfolio, volatilities)
         alloc_arb = self.stat_arb_strategy.allocate_weights(signals_arb, portfolio, volatilities)
         alloc_cry = self.carry_strategy.allocate_weights(signals_cry, portfolio, volatilities)
-        alloc_prs = self.pairs_strategy.allocate_weights(signals_prs, portfolio, volatilities) if self.pairs_strategy else {}
-        alloc_bnc = self.oversold_bounce_strategy.allocate_weights(signals_bnc, portfolio, volatilities) if self.oversold_bounce_strategy else {}
-        alloc_brk = self.early_breakout_strategy.allocate_weights(signals_brk, portfolio, volatilities) if self.early_breakout_strategy else {}
-        alloc_fad = self.funding_fade_strategy.allocate_weights(signals_fad, portfolio, volatilities) if self.funding_fade_strategy else {}
+        alloc_prs = (
+            self.pairs_strategy.allocate_weights(signals_prs, portfolio, volatilities) if self.pairs_strategy else {}
+        )
+        alloc_bnc = (
+            self.oversold_bounce_strategy.allocate_weights(signals_bnc, portfolio, volatilities)
+            if self.oversold_bounce_strategy
+            else {}
+        )
+        alloc_brk = (
+            self.early_breakout_strategy.allocate_weights(signals_brk, portfolio, volatilities)
+            if self.early_breakout_strategy
+            else {}
+        )
+        alloc_fad = (
+            self.funding_fade_strategy.allocate_weights(signals_fad, portfolio, volatilities)
+            if self.funding_fade_strategy
+            else {}
+        )
 
-        # 5. Net positions across strategies: Sum(weight_k * pos_k) + anomaly event overlays
         all_symbols = (
-            set(alloc_mom.keys()) | set(alloc_arb.keys()) | set(alloc_cry.keys()) |
-            set(alloc_prs.keys()) | set(alloc_bnc.keys()) | set(alloc_brk.keys()) | set(alloc_fad.keys())
+            set(alloc_mom.keys())
+            | set(alloc_arb.keys())
+            | set(alloc_cry.keys())
+            | set(alloc_prs.keys())
+            | set(alloc_bnc.keys())
+            | set(alloc_brk.keys())
+            | set(alloc_fad.keys())
         )
         net_dollar_positions: dict[str, float] = {}
 
@@ -346,21 +349,21 @@ class MetaStrategyAllocator:
         w_prs = strat_weights.get("pairs", 0.25) if self.pairs_strategy else 0.0
 
         for sym in all_symbols:
-            pos_m = alloc_mom.get(sym, 0.0) * w_mom
-            pos_a = alloc_arb.get(sym, 0.0) * w_arb
-            pos_c = alloc_cry.get(sym, 0.0) * w_cry
-            pos_p = alloc_prs.get(sym, 0.0) * w_prs
+            pos_mom = alloc_mom.get(sym, 0.0) * w_mom
+            pos_arb = alloc_arb.get(sym, 0.0) * w_arb
+            pos_cry = alloc_cry.get(sym, 0.0) * w_cry
+            pos_prs = alloc_prs.get(sym, 0.0) * w_prs
             pos_bnc = alloc_bnc.get(sym, 0.0)
             pos_brk = alloc_brk.get(sym, 0.0)
             pos_fad = alloc_fad.get(sym, 0.0)
-            net_pos = pos_m + pos_a + pos_c + pos_p + pos_bnc + pos_brk + pos_fad
-            if abs(net_pos) > 1.0:  # Ignore microscopic dust
+            net_pos = pos_mom + pos_arb + pos_cry + pos_prs + pos_bnc + pos_brk + pos_fad
+            if abs(net_pos) > 1.0:
                 net_dollar_positions[sym] = float(net_pos)
                 contribs = {
-                    "Cross-Sectional Momentum": abs(pos_m),
-                    "StatArb Mean-Reversion": abs(pos_a),
-                    "Funding Carry Arbitrage": abs(pos_c),
-                    "Cointegrated Pairs": abs(pos_p),
+                    "Cross-Sectional Momentum": abs(pos_mom),
+                    "StatArb Mean-Reversion": abs(pos_arb),
+                    "Funding Carry Arbitrage": abs(pos_cry),
+                    "Cointegrated Pairs": abs(pos_prs),
                     "Extreme Drop Bounce": abs(pos_bnc),
                     "Early Breakout": abs(pos_brk),
                     "Pump & Funding Fade": abs(pos_fad),

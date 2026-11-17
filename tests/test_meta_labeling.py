@@ -48,12 +48,14 @@ def test_secondary_meta_classifier_fit_evaluate_and_size():
     n_samples = 300
 
     # Meta-features: regime, volatility, spread, signal strength
-    features = pd.DataFrame({
-        "vol_ratio": np.random.uniform(0.5, 2.5, n_samples),
-        "hurts_h": np.random.uniform(0.3, 0.7, n_samples),
-        "amihud_illiq": np.random.exponential(1.0, n_samples),
-        "primary_abs_score": np.random.uniform(0.1, 1.0, n_samples),
-    })
+    features = pd.DataFrame(
+        {
+            "vol_ratio": np.random.uniform(0.5, 2.5, n_samples),
+            "hurts_h": np.random.uniform(0.3, 0.7, n_samples),
+            "amihud_illiq": np.random.exponential(1.0, n_samples),
+            "primary_abs_score": np.random.uniform(0.1, 1.0, n_samples),
+        }
+    )
 
     # True success probability increases with signal strength and Hurst persistence
     true_logit = 2.0 * features["primary_abs_score"] + 1.5 * (features["hurts_h"] - 0.5) - 0.5

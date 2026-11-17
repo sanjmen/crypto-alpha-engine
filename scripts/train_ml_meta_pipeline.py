@@ -13,10 +13,10 @@ Executes end-to-end quantitative ML workflow across liquid crypto perpetuals:
 """
 
 import argparse
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -65,18 +65,18 @@ def extract_features_and_targets(
     """
     Computes multi-factor alpha features and forward returns for a single asset.
     """
-    c = df["close"].values
-    o = df["open"].values
-    h = df["high"].values
-    l = df["low"].values
-    v = df["volume"].values
-    tb = df["taker_buy_vol"].values if "taker_buy_vol" in df.columns else v * 0.5
+    close_prices = df["close"].values
+    open_prices = df["open"].values
+    high_prices = df["high"].values
+    low_prices = df["low"].values
+    volumes = df["volume"].values
+    taker_buy_vols = df["taker_buy_vol"].values if "taker_buy_vol" in df.columns else volumes * 0.5
 
-    n = len(c)
+    num_obs = len(close_prices)
     idx = df.index
 
     # 1. Momentum factors
-    log_ret = np.log(c / np.roll(c, 1))
+    log_ret = np.log(close_prices / np.roll(close_prices, 1))
     log_ret[0] = 0.0
 
     mom_6h = pd.Series(log_ret, index=idx).rolling(6).sum().values
@@ -85,34 +85,42 @@ def extract_features_and_targets(
     mom_72h = pd.Series(log_ret, index=idx).rolling(72).sum().values
 
     # 2. Volatility factors (Garman-Klass & Parkinson rolling 24h)
-    gk_vol = np.zeros(n)
-    park_vol = np.zeros(n)
-    for i in range(24, n):
-        gk_vol[i] = garman_klass_volatility(o[i-24:i], h[i-24:i], l[i-24:i], c[i-24:i])
-        park_vol[i] = parkinson_volatility(h[i-24:i], l[i-24:i])
+    gk_vol = np.zeros(num_obs)
+    park_vol = np.zeros(num_obs)
+    for i in range(24, num_obs):
+        gk_vol[i] = garman_klass_volatility(
+            open_prices[i - 24 : i],
+            high_prices[i - 24 : i],
+            low_prices[i - 24 : i],
+            close_prices[i - 24 : i],
+        )
+        park_vol[i] = parkinson_volatility(
+            high_prices[i - 24 : i],
+            low_prices[i - 24 : i],
+        )
 
     safe_park = np.where(park_vol > 1e-6, park_vol, 1e-6)
     vol_ratio = np.where(park_vol > 1e-6, gk_vol / safe_park, 1.0)
     vol_ratio = np.nan_to_num(vol_ratio, nan=1.0, posinf=1.0, neginf=1.0)
 
     # 3. Microstructure & Order Flow Imbalance
-    amihud = np.zeros(n)
-    for i in range(24, n):
-        amihud[i] = amihud_illiquidity(c[i-24:i], v[i-24:i])
+    amihud = np.zeros(num_obs)
+    for i in range(24, num_obs):
+        amihud[i] = amihud_illiquidity(close_prices[i - 24 : i], volumes[i - 24 : i])
     # Log transform illiquidity to stabilize distribution
     log_amihud = np.log1p(amihud * 1e6)
 
-    taker_ratio = np.where(v > 1e-4, tb / v, 0.5)
+    taker_ratio = np.where(volumes > 1e-4, taker_buy_vols / volumes, 0.5)
     order_flow_imb = pd.Series(taker_ratio - 0.5, index=idx).rolling(12).mean().values
 
     # 4. Fractal persistence: Hurst exponent
-    hurst_vals = np.full(n, 0.5)
-    for i in range(72, n, 6):  # Compute every 6 bars for efficiency
-        h_est = estimate_hurst_rs(c[i-72:i])
-        hurst_vals[i:min(i+6, n)] = h_est
+    hurst_vals = np.full(num_obs, 0.5)
+    for i in range(72, num_obs, 6):  # Compute every 6 bars for efficiency
+        h_est = estimate_hurst_rs(close_prices[i - 72 : i])
+        hurst_vals[i : min(i + 6, num_obs)] = h_est
 
     # 5. Forward return target (24h forward return)
-    fwd_ret = (np.roll(c, -horizon_bars) - c) / c
+    fwd_ret = (np.roll(close_prices, -horizon_bars) - close_prices) / close_prices
     fwd_ret[-horizon_bars:] = np.nan
 
     features = pd.DataFrame(
@@ -136,7 +144,11 @@ def extract_features_and_targets(
 
     # Drop warm-up window
     warmup = 72
-    return features.iloc[warmup:-horizon_bars], targets.iloc[warmup:-horizon_bars], vol_series.iloc[warmup:-horizon_bars]
+    return (
+        features.iloc[warmup:-horizon_bars],
+        targets.iloc[warmup:-horizon_bars],
+        vol_series.iloc[warmup:-horizon_bars],
+    )
 
 
 def run_pipeline(
@@ -321,7 +333,9 @@ def run_pipeline(
     print(f"[+] Out-of-Sample Brier Score: {report.brier_score:.4f}")
     print(f"[+] Unfiltered Win Rate: {report.precision_unfiltered:.2%}")
     print(f"[+] Meta-Filtered Win Rate (P > 0.5): {report.precision_filtered:.2%}")
-    print(f"[+] Precision Uplift: +{(report.precision_filtered - report.precision_unfiltered)*100:.2f} percentage points")
+    print(
+        f"[+] Precision Uplift: +{(report.precision_filtered - report.precision_unfiltered) * 100:.2f} percentage points"
+    )
     print(f"[+] Trades Executed Ratio: {report.trades_executed_ratio:.2%}")
     print(f"[+] Theoretical Sharpe Uplift: {report.expected_sharpe_uplift:.2f}x")
 
@@ -393,9 +407,9 @@ def generate_markdown_report(
     p = tuning_result.best_params
 
     md_content = f"""# Quantitative ML Alpha Optimization & Meta-Labeling Report
-**Phase 4 Execution: Issues #21 (M7) & #35 (M10)**  
-**Generated:** `{timestamp_str}`  
-**Universe:** `{len(symbols)} liquid crypto perpetual contracts` ({', '.join(symbols[:5])}...)
+**Phase 4 Execution: Issues #21 (M7) & #35 (M10)**
+**Generated:** `{timestamp_str}`
+**Universe:** `{len(symbols)} liquid crypto perpetual contracts` ({", ".join(symbols[:5])}...)
 
 ---
 
@@ -407,7 +421,7 @@ By decoupling the primary directional decision from the secondary trade executio
 - **Out-of-Sample Rank IC (Purged CV)**: `+{tuning_result.best_score:.4f}`
 - **Meta-Classifier AUC-ROC**: `{report.auc_roc:.4f}`
 - **Baseline Unfiltered Precision**: `{report.precision_unfiltered:.2%}`
-- **Meta-Filtered Precision ($P > 0.5$)**: `{report.precision_filtered:.2%}` (**+{(report.precision_filtered - report.precision_unfiltered)*100:.2f} pp**)
+- **Meta-Filtered Precision ($P > 0.5$)**: `{report.precision_filtered:.2%}` (**+{(report.precision_filtered - report.precision_unfiltered) * 100:.2f} pp**)
 - **Annualized Sharpe Ratio**: `{sharpe_unfiltered:.2f}` (Unfiltered) $\\longrightarrow$ **`{sharpe_meta:.2f}`** (Meta-Labeled Kelly Sizing)
 
 ---
@@ -436,16 +450,16 @@ Bayesian Tree-structured Parzen Estimator (TPE) optimization was executed over t
 
 | Parameter | Optimal Value | Description |
 | :--- | :--- | :--- |
-| **`learning_rate`** | `{p.get('learning_rate', 0.03):.4f}` | Shrinkage step size for gradient boosting |
-| **`num_leaves`** | `{p.get('num_leaves', 15)}` | Maximum tree leaves per base learner |
-| **`max_depth`** | `{p.get('max_depth', 4)}` | Maximum tree depth preventing combinatorial overfitting |
-| **`min_child_samples`** | `{p.get('min_child_samples', 20)}` | Minimum sample count required in terminal leaf |
-| **`subsample`** | `{p.get('subsample', 0.8):.4f}` | Row subsampling fraction per boosting round |
-| **`colsample_bytree`** | `{p.get('colsample_bytree', 0.8):.4f}` | Feature fraction randomly selected per tree |
-| **`reg_alpha` (L1)** | `{p.get('reg_alpha', 0.1):.4e}` | Lasso sparsity regularization |
-| **`reg_lambda` (L2)** | `{p.get('reg_lambda', 1.0):.4e}` | Ridge curvature penalty |
-| **`ridge_alpha`** | `{p.get('ridge_alpha', 100.0):.2f}` | L2 regularization for linear component |
-| **`ridge_weight`** | `{p.get('ridge_weight', 0.5):.2f}` | Blending weight allocated to Ridge model |
+| **`learning_rate`** | `{p.get("learning_rate", 0.03):.4f}` | Shrinkage step size for gradient boosting |
+| **`num_leaves`** | `{p.get("num_leaves", 15)}` | Maximum tree leaves per base learner |
+| **`max_depth`** | `{p.get("max_depth", 4)}` | Maximum tree depth preventing combinatorial overfitting |
+| **`min_child_samples`** | `{p.get("min_child_samples", 20)}` | Minimum sample count required in terminal leaf |
+| **`subsample`** | `{p.get("subsample", 0.8):.4f}` | Row subsampling fraction per boosting round |
+| **`colsample_bytree`** | `{p.get("colsample_bytree", 0.8):.4f}` | Feature fraction randomly selected per tree |
+| **`reg_alpha` (L1)** | `{p.get("reg_alpha", 0.1):.4e}` | Lasso sparsity regularization |
+| **`reg_lambda` (L2)** | `{p.get("reg_lambda", 1.0):.4e}` | Ridge curvature penalty |
+| **`ridge_alpha`** | `{p.get("ridge_alpha", 100.0):.2f}` | L2 regularization for linear component |
+| **`ridge_weight`** | `{p.get("ridge_weight", 0.5):.2f}` | Blending weight allocated to Ridge model |
 
 **Best Out-of-Sample Rank IC:** `+{tuning_result.best_score:.4f}`
 
@@ -459,9 +473,9 @@ Bayesian Tree-structured Parzen Estimator (TPE) optimization was executed over t
 - **Vertical Time Horizon**: `{tb_config.holding_period_bars} hours`
 
 ### Execution Path Outcomes
-- **Profit Take Hit (`PT`)**: `{touch_dist.get('pt', 0.0):.2%}`
-- **Stop Loss Hit (`SL`)**: `{touch_dist.get('sl', 0.0):.2%}`
-- **Vertical Timeout (`VERTICAL`)**: `{touch_dist.get('vertical', 0.0):.2%}`
+- **Profit Take Hit (`PT`)**: `{touch_dist.get("pt", 0.0):.2%}`
+- **Stop Loss Hit (`SL`)**: `{touch_dist.get("sl", 0.0):.2%}`
+- **Vertical Timeout (`VERTICAL`)**: `{touch_dist.get("vertical", 0.0):.2%}`
 - **Average Sample Uniqueness ($\\bar{{u}}$)**: `{avg_uniqueness:.4f}` (AFML Ch. 4 concurrent label weighting)
 
 ---
@@ -528,7 +542,8 @@ def generate_plotly_tearsheet(
             name="Unfiltered Primary Model",
             line={"color": "#EF553B", "width": 2},
         ),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
     fig.add_trace(
         go.Scatter(
@@ -537,7 +552,8 @@ def generate_plotly_tearsheet(
             name="Meta-Labeled Kelly Sized",
             line={"color": "#00CC96", "width": 2.5},
         ),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
 
     # 2. Optuna optimization history
@@ -552,7 +568,8 @@ def generate_plotly_tearsheet(
                 marker={"color": "#636EFA", "size": 7},
                 line={"color": "#AB63FA", "dash": "dot"},
             ),
-            row=1, col=2,
+            row=1,
+            col=2,
         )
 
     # 3. Probability distribution
@@ -564,7 +581,8 @@ def generate_plotly_tearsheet(
             marker_color="#FFA15A",
             opacity=0.75,
         ),
-        row=2, col=1,
+        row=2,
+        col=1,
     )
     # Add vertical veto threshold line at 0.5
     fig.add_vline(x=0.5, line_dash="dash", line_color="red", row=2, col=1)
@@ -578,7 +596,7 @@ def generate_plotly_tearsheet(
     for b in range(len(bins) - 1):
         mask = bin_indices == b
         if np.sum(mask) > 0:
-            bin_centers.append(f"{bins[b]:.1f}-{bins[b+1]:.1f}")
+            bin_centers.append(f"{bins[b]:.1f}-{bins[b + 1]:.1f}")
             bin_win_rates.append(float(np.mean(y_true[mask]) * 100))
 
     fig.add_trace(
@@ -588,7 +606,8 @@ def generate_plotly_tearsheet(
             name="Empirical Win Rate %",
             marker_color="#19D3F3",
         ),
-        row=2, col=2,
+        row=2,
+        col=2,
     )
 
     fig.update_layout(
@@ -604,8 +623,15 @@ def generate_plotly_tearsheet(
 
 def main():
     parser = argparse.ArgumentParser(description="Institutional ML & Meta-Labeling Pipeline")
-    parser.add_argument("--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path")
-    parser.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,NEARUSDT", help="Comma-separated symbols")
+    parser.add_argument(
+        "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path"
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,NEARUSDT",
+        help="Comma-separated symbols",
+    )
     parser.add_argument("--trials", type=int, default=20, help="Number of Optuna Bayesian trials")
     parser.add_argument("--max-bars", type=int, default=4000, help="Max 1h bars per symbol")
     parser.add_argument("--output-dir", type=str, default="reports", help="Reports output directory")

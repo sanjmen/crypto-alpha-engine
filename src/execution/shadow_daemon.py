@@ -5,12 +5,12 @@ reconciles live mark-to-market prices, enforces passive Maker execution alpha,
 triggers 8h multi-strategy rebalancing, and settles real funding cashflows in SQLite.
 """
 
+import contextlib
+from datetime import datetime, timezone
 import logging
-import os
 from pathlib import Path
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -62,15 +62,85 @@ ANOMALY_STRATEGIES: set[str] = {
 }
 
 NON_CRYPTO_TRADFI_BASES: set[str] = {
-    "AAOI", "AAPL", "AMD", "AMZN", "ANTHROPIC", "APP", "AXTI", "BE", "BILL",
-    "BMNR", "BZ", "CBRS", "CHIP", "CL", "COHR", "COIN", "CONL", "CRCL", "CRWV",
-    "CSOPSKHYNIX2L", "CXMT", "DELL", "EWZ", "FLNC", "GOOGL", "HOOD", "INTC",
-    "INTW", "IREN", "KORU", "KSTR", "LITE", "META", "MINIMAX", "MRNA", "MRVL",
-    "MSFT", "MSTR", "MSTU", "MSTZ", "MUU", "MVLL", "NATGAS", "NBIS", "NFLX",
-    "NOW", "NVDA", "NVDL", "NVDS", "ORCL", "PLTR", "QCOM", "QQQ", "RKLB",
-    "SAMSUNG", "SKDD", "SKHY", "SKHYNIX", "SKUU", "SMCI", "SNDK", "SNXX",
-    "SOXL", "SOXS", "SPY", "SQQQ", "STXX", "TQQQ", "TSLA", "TSLL", "TSLS",
-    "UNITREE", "USDBRL", "UVXY", "WDC", "XAG", "XAU", "ZHIPU", "ZHONGJI",
+    "AAOI",
+    "AAPL",
+    "AMD",
+    "AMZN",
+    "ANTHROPIC",
+    "APP",
+    "AXTI",
+    "BE",
+    "BILL",
+    "BMNR",
+    "BZ",
+    "CBRS",
+    "CHIP",
+    "CL",
+    "COHR",
+    "COIN",
+    "CONL",
+    "CRCL",
+    "CRWV",
+    "CSOPSKHYNIX2L",
+    "CXMT",
+    "DELL",
+    "EWZ",
+    "FLNC",
+    "GOOGL",
+    "HOOD",
+    "INTC",
+    "INTW",
+    "IREN",
+    "KORU",
+    "KSTR",
+    "LITE",
+    "META",
+    "MINIMAX",
+    "MRNA",
+    "MRVL",
+    "MSFT",
+    "MSTR",
+    "MSTU",
+    "MSTZ",
+    "MUU",
+    "MVLL",
+    "NATGAS",
+    "NBIS",
+    "NFLX",
+    "NOW",
+    "NVDA",
+    "NVDL",
+    "NVDS",
+    "ORCL",
+    "PLTR",
+    "QCOM",
+    "QQQ",
+    "RKLB",
+    "SAMSUNG",
+    "SKDD",
+    "SKHY",
+    "SKHYNIX",
+    "SKUU",
+    "SMCI",
+    "SNDK",
+    "SNXX",
+    "SOXL",
+    "SOXS",
+    "SPY",
+    "SQQQ",
+    "STXX",
+    "TQQQ",
+    "TSLA",
+    "TSLL",
+    "TSLS",
+    "UNITREE",
+    "USDBRL",
+    "UVXY",
+    "WDC",
+    "XAG",
+    "XAU",
+    "ZHIPU",
+    "ZHONGJI",
 }
 
 
@@ -89,7 +159,7 @@ class ShadowTradingDaemon:
         fast_interval_sec: float = 10.0,
         rebalance_interval_sec: float = 28_800.0,  # 8 hours
         min_rebalance_notional: float = 50.0,
-        turnover_deadband: float = 0.04,          # 4% deadband to eliminate fee drag
+        turnover_deadband: float = 0.04,  # 4% deadband to eliminate fee drag
         rate_limiter: ExchangeRateLimiter | None = None,
         ws_client: ResilientWebSocketClient | None = None,
         min_volume_24h_usd: float = 20_000_000.0,
@@ -197,9 +267,7 @@ class ShadowTradingDaemon:
             enable_quarterly_basis=bool(enable_quarterly_basis),
         )
         self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
-        self.auto_close_anomalies_when_disabled = bool(
-            self.feature_flags.auto_close_anomalies_when_disabled
-        )
+        self.auto_close_anomalies_when_disabled = bool(self.feature_flags.auto_close_anomalies_when_disabled)
         self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
         self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
         self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
@@ -219,15 +287,17 @@ class ShadowTradingDaemon:
         if exchange_client:
             self.exchange = exchange_client
         else:
-            self.exchange = ccxt.binance({
-                "enableRateLimit": True,
-                "timeout": 20000,
-                "options": {
-                    "defaultType": "future",
-                    "fetchMarkets": {"types": ["linear"]},
-                    "fetchCurrencies": False,
-                },
-            })
+            self.exchange = ccxt.binance(
+                {
+                    "enableRateLimit": True,
+                    "timeout": 20000,
+                    "options": {
+                        "defaultType": "future",
+                        "fetchMarkets": {"types": ["linear"]},
+                        "fetchCurrencies": False,
+                    },
+                }
+            )
             self._install_linear_market_aliases(self.exchange)
 
         self.is_running = False
@@ -236,14 +306,15 @@ class ShadowTradingDaemon:
         db_inst = getattr(self.broker, "db", None)
         if db_inst:
             if hasattr(db_inst, "save_feature_flags"):
-                try:
+                with contextlib.suppress(Exception):
                     db_inst.save_feature_flags(self.feature_flags.to_dict())
-                except Exception:
-                    pass
             latest_reb = db_inst.get_latest_rebalance_snapshot()
             if latest_reb and latest_reb.get("timestamp"):
                 try:
-                    self.last_rebalance_time = datetime.fromisoformat(str(latest_reb["timestamp"]))
+                    parsed_reb = datetime.fromisoformat(str(latest_reb["timestamp"]))
+                    if parsed_reb.tzinfo is None:
+                        parsed_reb = parsed_reb.replace(tzinfo=timezone.utc)
+                    self.last_rebalance_time = parsed_reb
                 except Exception:
                     self.last_rebalance_time = None
             if hasattr(db_inst, "get_latest_seven_factor_telemetry"):
@@ -378,9 +449,8 @@ class ShadowTradingDaemon:
             exit_ts, exited_side = self.core_bracket_last_exit[clean_sym]
             elapsed_sec = (now_dt - exit_ts).total_seconds()
             if 0.0 <= elapsed_sec < self.core_bracket_cooldown_sec:
-                same_dir = (
-                    (target_val > 0 and exited_side == PositionSide.LONG)
-                    or (target_val < 0 and exited_side == PositionSide.SHORT)
+                same_dir = (target_val > 0 and exited_side == PositionSide.LONG) or (
+                    target_val < 0 and exited_side == PositionSide.SHORT
                 )
                 if same_dir:
                     filtered[sym_key] = 0.0
@@ -599,10 +669,7 @@ class ShadowTradingDaemon:
         if ticks:
             fresh_clean = {k.replace("/", "") for k in ticks}
             keep_clean = fresh_clean | base_clean | open_pos_clean
-            self.latest_tickers = {
-                k: v for k, v in self.latest_tickers.items()
-                if k.replace("/", "") in keep_clean
-            }
+            self.latest_tickers = {k: v for k, v in self.latest_tickers.items() if k.replace("/", "") in keep_clean}
             self.latest_tickers.update(ticks)
         return self.latest_tickers
 
@@ -620,10 +687,16 @@ class ShadowTradingDaemon:
             mkts = orig_load(*args, **kwargs)
             if isinstance(mkts, dict):
                 for k, m in list(mkts.items()):
-                    if isinstance(k, str) and k.endswith(":USDT") and isinstance(m, dict):
-                        if m.get("swap", True) and m.get("linear", True) and not m.get("delivery", False):
-                            short_sym = k.split(":")[0]
-                            mkts[short_sym] = m
+                    if (
+                        isinstance(k, str)
+                        and k.endswith(":USDT")
+                        and isinstance(m, dict)
+                        and m.get("swap", True)
+                        and m.get("linear", True)
+                        and not m.get("delivery", False)
+                    ):
+                        short_sym = k.split(":")[0]
+                        mkts[short_sym] = m
             return mkts
 
         exchange.load_markets = _wrapped_load_markets
@@ -631,9 +704,13 @@ class ShadowTradingDaemon:
     def _resolve_ccxt_symbol(self, symbol: str) -> str:
         """Resolves 'SYM/USDT' to 'SYM/USDT:USDT' when the contract is futures-only in CCXT markets."""
         loaded_markets = getattr(self.exchange, "markets", None)
-        if isinstance(loaded_markets, dict) and loaded_markets:
-            if symbol not in loaded_markets and f"{symbol}:USDT" in loaded_markets:
-                return f"{symbol}:USDT"
+        if (
+            isinstance(loaded_markets, dict)
+            and loaded_markets
+            and symbol not in loaded_markets
+            and f"{symbol}:USDT" in loaded_markets
+        ):
+            return f"{symbol}:USDT"
         return symbol
 
     def fetch_symbol_klines(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
@@ -749,12 +826,14 @@ class ShadowTradingDaemon:
                 f_cache = pd.read_parquet(fund_path).tail(max(limit, 250))
                 if not f_cache.empty and "funding_rate" in f_cache.columns:
                     ts_s = self._normalize_timestamp_series(f_cache["timestamp"])
-                    for ts_val, fr_val in zip(ts_s, f_cache["funding_rate"]):
-                        settled_records.append({
-                            "timestamp": pd.Timestamp(ts_val).round("1h"),
-                            "fundingRate": float(fr_val),
-                            "funding_rate": float(fr_val),
-                        })
+                    for ts_val, fr_val in zip(ts_s, f_cache["funding_rate"], strict=False):
+                        settled_records.append(
+                            {
+                                "timestamp": pd.Timestamp(ts_val).round("1h"),
+                                "fundingRate": float(fr_val),
+                                "funding_rate": float(fr_val),
+                            }
+                        )
             except Exception:
                 pass
 
@@ -777,11 +856,13 @@ class ShadowTradingDaemon:
                                 else pd.Timestamp.now(tz="UTC").floor("1h")
                             )
                             f_r = float(item["fundingRate"])
-                            settled_records.append({
-                                "timestamp": ts_dt,
-                                "fundingRate": f_r,
-                                "funding_rate": f_r,
-                            })
+                            settled_records.append(
+                                {
+                                    "timestamp": ts_dt,
+                                    "fundingRate": f_r,
+                                    "funding_rate": f_r,
+                                }
+                            )
                             live_hist_fetched = True
         except Exception:
             pass
@@ -812,11 +893,13 @@ class ShadowTradingDaemon:
                 f_r = float(fr["fundingRate"])
                 now_hour = pd.Timestamp.now(tz="UTC").floor("1h")
                 if now_hour not in settled_hours:
-                    records.append({
-                        "timestamp": now_hour,
-                        "fundingRate": f_r,
-                        "funding_rate": f_r,
-                    })
+                    records.append(
+                        {
+                            "timestamp": now_hour,
+                            "fundingRate": f_r,
+                            "funding_rate": f_r,
+                        }
+                    )
         except Exception:
             pass
 
@@ -864,10 +947,12 @@ class ShadowTradingDaemon:
                         if isinstance(r, dict) and r.get("sumOpenInterest") is not None:
                             ts_ms = int(r.get("timestamp") or 0)
                             if ts_ms > 0:
-                                live_records.append({
-                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
-                                    "sumOpenInterest": float(r["sumOpenInterest"]),
-                                })
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "sumOpenInterest": float(r["sumOpenInterest"]),
+                                    }
+                                )
         except Exception:
             pass
 
@@ -882,9 +967,7 @@ class ShadowTradingDaemon:
 
         merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
         merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
         if self.enable_warm_start and live_records:
             try:
@@ -927,11 +1010,13 @@ class ShadowTradingDaemon:
                         if isinstance(r, (list, tuple)) and len(r) >= 11:
                             ts_ms = int(r[0])
                             if ts_ms > 0:
-                                live_records.append({
-                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
-                                    "quote_volume": float(r[7]),
-                                    "taker_buy_quote_volume": float(r[10]),
-                                })
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "quote_volume": float(r[7]),
+                                        "taker_buy_quote_volume": float(r[10]),
+                                    }
+                                )
         except Exception:
             pass
 
@@ -946,9 +1031,7 @@ class ShadowTradingDaemon:
 
         merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
         merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
         if self.enable_warm_start and live_records:
             try:
@@ -989,10 +1072,12 @@ class ShadowTradingDaemon:
                         if isinstance(r, (list, tuple)) and len(r) >= 5:
                             ts_ms = int(r[0])
                             if ts_ms > 0:
-                                live_records.append({
-                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
-                                    "close": float(r[4]),
-                                })
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "close": float(r[4]),
+                                    }
+                                )
         except Exception:
             pass
 
@@ -1007,9 +1092,7 @@ class ShadowTradingDaemon:
 
         merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
         merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
         if self.enable_warm_start and live_records:
             try:
@@ -1076,12 +1159,14 @@ class ShadowTradingDaemon:
                             if ts_ms > 0 and g_val > 0 and w_val and w_val > 0:
                                 w_clip = float(np.clip(w_val, 0.05, 20.0))
                                 g_clip = float(np.clip(g_val, 0.05, 20.0))
-                                live_records.append({
-                                    "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
-                                    "top_pos_ls_ratio": w_clip,
-                                    "global_acc_ls_ratio": g_clip,
-                                    "smart_money_div": float(np.log(w_clip / g_clip)),
-                                })
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "top_pos_ls_ratio": w_clip,
+                                        "global_acc_ls_ratio": g_clip,
+                                        "smart_money_div": float(np.log(w_clip / g_clip)),
+                                    }
+                                )
         except Exception:
             pass
 
@@ -1096,9 +1181,7 @@ class ShadowTradingDaemon:
 
         merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
         merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
         if self.enable_warm_start and live_records:
             try:
@@ -1153,11 +1236,7 @@ class ShadowTradingDaemon:
                             ann_raw = r.get("annualizedBasisRate")
                             if ts_ms > 0 and (b_rate_raw is not None or ann_raw is not None):
                                 b_rate = float(b_rate_raw or 0.0)
-                                ann_rate = (
-                                    float(ann_raw)
-                                    if (ann_raw not in (None, ""))
-                                    else float(b_rate * 4.0)
-                                )
+                                ann_rate = float(ann_raw) if (ann_raw not in (None, "")) else float(b_rate * 4.0)
                                 live_records.append(
                                     {
                                         "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
@@ -1179,9 +1258,7 @@ class ShadowTradingDaemon:
 
         merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
         merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         )
         if self.enable_warm_start and live_records:
             try:
@@ -1366,11 +1443,7 @@ class ShadowTradingDaemon:
         if not t_map and chop_w < 0.25:
             return eff_tp, eff_lock_trig, eff_lock_lvl
 
-        max_tr = (
-            max((float(t_map.get(k, 0.0)) for k in ("macro", "med", "fast")), default=1.0)
-            if t_map
-            else 1.0
-        )
+        max_tr = max((float(t_map.get(k, 0.0)) for k in ("macro", "med", "fast")), default=1.0) if t_map else 1.0
         if not (chop_w >= 0.25 or max_tr <= 0.0):
             return eff_tp, eff_lock_trig, eff_lock_lvl
 
@@ -1474,14 +1547,22 @@ class ShadowTradingDaemon:
                     try:
                         pend = db.get_pending_orders(symbol=sym)
                         if isinstance(pend, list):
-                            has_tp = any(
-                                o.order_type == OrderType.TAKE_PROFIT and abs(o.quantity - pos.quantity) <= 1e-6
-                                for o in pend
-                            ) if tp is not None else not any(o.order_type == OrderType.TAKE_PROFIT for o in pend)
-                            has_sl = any(
-                                o.order_type == OrderType.STOP_LOSS and abs(o.quantity - pos.quantity) <= 1e-6
-                                for o in pend
-                            ) if sl is not None else not any(o.order_type == OrderType.STOP_LOSS for o in pend)
+                            has_tp = (
+                                any(
+                                    o.order_type == OrderType.TAKE_PROFIT and abs(o.quantity - pos.quantity) <= 1e-6
+                                    for o in pend
+                                )
+                                if tp is not None
+                                else not any(o.order_type == OrderType.TAKE_PROFIT for o in pend)
+                            )
+                            has_sl = (
+                                any(
+                                    o.order_type == OrderType.STOP_LOSS and abs(o.quantity - pos.quantity) <= 1e-6
+                                    for o in pend
+                                )
+                                if sl is not None
+                                else not any(o.order_type == OrderType.STOP_LOSS for o in pend)
+                            )
                             if not (has_tp and has_sl):
                                 needs_refresh = True
                     except Exception:
@@ -1569,9 +1650,7 @@ class ShadowTradingDaemon:
             # Auto-close orphan Funding Harvester Hedge if no Extreme Funding Harvester position remains open
             if pos.strategy == "Funding Harvester Hedge":
                 has_active_harvester = any(
-                    p.side != PositionSide.FLAT
-                    and p.quantity > 0
-                    and p.strategy == "Extreme Funding Harvester"
+                    p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy == "Extreme Funding Harvester"
                     for p in self.broker.portfolio.positions.values()
                 )
                 if not has_active_harvester:
@@ -1679,7 +1758,7 @@ class ShadowTradingDaemon:
                     logger.info(
                         f"🔒 Ratcheted Stop-Loss for {sym} ({pos.side.value}): "
                         f"${old_sl:,.4f} -> ${candidate_sl:,.4f} "
-                        f"(Peak: ${pos.peak_price:,.4f} [{peak_ret*100:+.1f}%], "
+                        f"(Peak: ${pos.peak_price:,.4f} [{peak_ret * 100:+.1f}%], "
                         f"Guaranteed SL PnL: {pos.sl_pnl_pct:+.1f}%)"
                     )
 
@@ -1703,18 +1782,15 @@ class ShadowTradingDaemon:
         # Collect symbols to evaluate: curated universe + any open core positions
         # (Exclude isolated satellite anomaly positions so 4h rebalance doesn't flatten their TP/SL brackets)
         open_pos_symbols = [
-            s for s, p in portfolio.positions.items()
-            if p.side != PositionSide.FLAT
-            and p.quantity > 0
-            and p.strategy not in ANOMALY_STRATEGIES
+            s
+            for s, p in portfolio.positions.items()
+            if p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy not in ANOMALY_STRATEGIES
         ]
         base_clean_set = {s.replace("/", "") for s in self.symbols}
         scan_symbols = list(dict.fromkeys(list(self.symbols) + open_pos_symbols))
         use_7f = bool(getattr(self.allocator, "use_seven_factor_engine", False))
         bars_15m: dict[str, pd.DataFrame] = {}
-        is_mock_kline_fn = isinstance(
-            getattr(self, "fetch_warm_klines", None), MagicMock
-        ) or isinstance(
+        is_mock_kline_fn = isinstance(getattr(self, "fetch_warm_klines", None), MagicMock) or isinstance(
             getattr(self, "fetch_symbol_klines", None), MagicMock
         )
         live_kline_ok_count = 0
@@ -1794,12 +1870,7 @@ class ShadowTradingDaemon:
         total_equity = max(portfolio.total_equity, 1.0)
         current_weights_map: dict[str, float] = {}
         for sym, pos in portfolio.positions.items():
-            if (
-                pos
-                and pos.side != PositionSide.FLAT
-                and pos.quantity > 0
-                and pos.strategy not in ANOMALY_STRATEGIES
-            ):
+            if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and pos.strategy not in ANOMALY_STRATEGIES:
                 px = current_prices.get(sym) or pos.current_price or pos.entry_price
                 signed_val = (-pos.quantity * px) if pos.side == PositionSide.SHORT else (pos.quantity * px)
                 current_weights_map[sym.replace("/", "")] = signed_val / total_equity
@@ -1880,7 +1951,11 @@ class ShadowTradingDaemon:
                         self.broker.cancel_order(pending_ord.id, sym)
 
             # 1. Minimum notional gate (relaxed for anomaly test sizing; full closes allowed down to $5 exchange floor)
-            min_notional = min(self.min_rebalance_notional, self.anomaly_size) if self.enable_anomalies else self.min_rebalance_notional
+            min_notional = (
+                min(self.min_rebalance_notional, self.anomaly_size)
+                if self.enable_anomalies
+                else self.min_rebalance_notional
+            )
             is_full_close = current_qty > 0 and abs(target_val) < 1e-6
             if abs(dollar_delta) < min_notional and not (is_full_close and abs(dollar_delta) >= 5.0):
                 continue
@@ -1897,7 +1972,7 @@ class ShadowTradingDaemon:
                 )
             if not (use_7f and lev_snap is not None):
                 effective_deadband = self.turnover_deadband
-                is_new_position = (current_qty == 0.0 and abs(target_val) > 0)
+                is_new_position = current_qty == 0.0 and abs(target_val) > 0
                 delta_turnover = abs(dollar_delta) / total_equity
                 if not is_new_position and delta_turnover < effective_deadband and abs(target_val) > 0:
                     continue
@@ -1932,7 +2007,9 @@ class ShadowTradingDaemon:
 
             order_qty = abs(dollar_delta) / price
             side = OrderSide.BUY if dollar_delta > 0 else OrderSide.SELL
-            strat_label = dominant_strats.get(clean_sym) or (pos.strategy if pos and pos.strategy else "Cross-Sectional Momentum")
+            strat_label = dominant_strats.get(clean_sym) or (
+                pos.strategy if pos and pos.strategy else "Cross-Sectional Momentum"
+            )
 
             # Route as passive Maker limit order with Level-2 OBI Adaptive Routing (Issue #47)
             try:
@@ -2015,7 +2092,9 @@ class ShadowTradingDaemon:
             ws_state = self.ws_client.state.value if self.ws_client else "POLLING_REST"
             elapsed_sec = max(1.0, (self.last_rebalance_time - self.start_time).total_seconds())
             tps = self.total_ticks_processed / elapsed_sec
-            last_tick_iso = self.last_tick_time.isoformat() if self.last_tick_time else self.last_rebalance_time.isoformat()
+            last_tick_iso = (
+                self.last_tick_time.isoformat() if self.last_tick_time else self.last_rebalance_time.isoformat()
+            )
             self.broker.db.update_daemon_heartbeat(
                 ws_state=ws_state,
                 symbols_count=len(self.symbols),
@@ -2046,9 +2125,7 @@ class ShadowTradingDaemon:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error settling funding for {sym}: {e}")
 
-        if getattr(self.broker, "enable_yield_collateral", False) and hasattr(
-            self.broker, "settle_collateral_yield"
-        ):
+        if getattr(self.broker, "enable_yield_collateral", False) and hasattr(self.broker, "settle_collateral_yield"):
             try:
                 y_cf = self.broker.settle_collateral_yield()
                 if y_cf > 0:
@@ -2100,13 +2177,9 @@ class ShadowTradingDaemon:
                     self.auto_close_anomalies_when_disabled = bool(
                         self.feature_flags.auto_close_anomalies_when_disabled
                     )
-                    self.enable_hard_equity_floor = bool(
-                        self.feature_flags.enable_hard_equity_floor
-                    )
+                    self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
                     self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
-                    self.enable_intracycle_rebalance = bool(
-                        self.feature_flags.enable_intracycle_rebalance
-                    )
+                    self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
                     self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
                     self.enable_smart_money = bool(self.feature_flags.enable_smart_money)
                     self.enable_quarterly_basis = bool(self.feature_flags.enable_quarterly_basis)
@@ -2137,7 +2210,7 @@ class ShadowTradingDaemon:
             return True
 
         raw_eq = float(portfolio.total_equity)
-        if self.enable_hard_equity_floor and self.equity_floor_usd > 0.0 and 100.0 < raw_eq <= self.equity_floor_usd:
+        if self.enable_hard_equity_floor and self.equity_floor_usd > 0.0 and 0.0 < raw_eq <= self.equity_floor_usd:
             confirmed_eq = raw_eq
             if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
                 try:
@@ -2146,11 +2219,9 @@ class ShadowTradingDaemon:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"Live sync during equity floor verification note: {exc}")
 
-            if 100.0 < confirmed_eq <= self.equity_floor_usd:
+            if 0.0 < confirmed_eq <= self.equity_floor_usd:
                 self.is_halted = True
-                self.halt_reason = (
-                    f"HARD_EQUITY_FLOOR_BREACH (${confirmed_eq:,.2f} <= ${self.equity_floor_usd:,.2f})"
-                )
+                self.halt_reason = f"HARD_EQUITY_FLOOR_BREACH (${confirmed_eq:,.2f} <= ${self.equity_floor_usd:,.2f})"
                 logger.critical(
                     f"🚨 [Regla #2 - PISO DURO DE CAPITAL] {self.halt_reason} — "
                     f"Flattening all positions and halting trading!"
@@ -2256,10 +2327,8 @@ class ShadowTradingDaemon:
         }
         db_inst = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
         if db_inst and hasattr(db_inst, "save_shield_invariants_telemetry"):
-            try:
+            with contextlib.suppress(Exception):
                 db_inst.save_shield_invariants_telemetry(status=status_str, details=report)
-            except Exception:
-                pass
         return report
 
     def is_intracycle_rebalance_needed(self, now: datetime | None = None) -> bool:
@@ -2287,12 +2356,7 @@ class ShadowTradingDaemon:
         core_long_usd = 0.0
         core_short_usd = 0.0
         for pos in portfolio.positions.values():
-            if (
-                pos
-                and pos.side != PositionSide.FLAT
-                and pos.quantity > 0
-                and pos.strategy not in ANOMALY_STRATEGIES
-            ):
+            if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and pos.strategy not in ANOMALY_STRATEGIES:
                 if pos.side == PositionSide.LONG:
                     core_long_usd += pos.market_value
                 elif pos.side == PositionSide.SHORT:
@@ -2310,7 +2374,7 @@ class ShadowTradingDaemon:
             logger.info(
                 f"⚖️ Intra-cycle Core neutrality drift detected: "
                 f"Long=${core_long_usd:,.1f} vs Short=${core_short_usd:,.1f} "
-                f"(Gross=${core_gross_usd:,.1f}, Net Drift={net_drift_pct*100:.1f}% >= {self.intracycle_drift_threshold_pct*100:.1f}%). "
+                f"(Gross=${core_gross_usd:,.1f}, Net Drift={net_drift_pct * 100:.1f}% >= {self.intracycle_drift_threshold_pct * 100:.1f}%). "
                 f"Triggering automatic neutrality rebalance."
             )
             return True
@@ -2360,13 +2424,9 @@ class ShadowTradingDaemon:
 
         portfolio = self.broker.get_portfolio()
         all_open_positions = {
-            s: p for s, p in portfolio.positions.items()
-            if p.quantity > 0 and p.side != PositionSide.FLAT
+            s: p for s, p in portfolio.positions.items() if p.quantity > 0 and p.side != PositionSide.FLAT
         }
-        active_anomaly_positions = {
-            s: p for s, p in all_open_positions.items()
-            if p.strategy in ANOMALY_STRATEGIES
-        }
+        active_anomaly_positions = {s: p for s, p in all_open_positions.items() if p.strategy in ANOMALY_STRATEGIES}
 
         if len(active_anomaly_positions) >= self.max_anomaly_positions:
             self.last_anomaly_scan_time = datetime.now(timezone.utc)
@@ -2468,11 +2528,7 @@ class ShadowTradingDaemon:
 
             pct = float(t.get("change_24h", 0.0))
             f_uni = float(universe_funding.get(clean_sym, universe_funding.get(sym, 0.0)))
-            is_price_anomaly = (
-                pct <= -15.0
-                or (self.anomaly_breakout_min_24h_pct <= pct <= 22.0)
-                or pct >= 25.0
-            )
+            is_price_anomaly = pct <= -15.0 or (self.anomaly_breakout_min_24h_pct <= pct <= 22.0) or pct >= 25.0
             is_extreme_funding = abs(f_uni) >= self.harvester_min_abs_funding
             if is_price_anomaly or is_extreme_funding:
                 candidates.append((sym, pct, float(t.get("price", 0.0))))
@@ -2617,9 +2673,7 @@ class ShadowTradingDaemon:
                     sigs = harvester_strat.generate_signals({sym: df}, funding_data={sym: df_fh})
                     if sigs:
                         sig_h = sigs[0]
-                        notional_usd, conf_sc = _resolve_notional(
-                            "Extreme Funding Harvester", sig_h.metadata or {}
-                        )
+                        notional_usd, conf_sc = _resolve_notional("Extreme Funding Harvester", sig_h.metadata or {})
                         qty = round(notional_usd / price, 6 if price < 1.0 else 4)
                         if qty > 0:
                             side_h = OrderSide.BUY if sig_h.score >= 0 else OrderSide.SELL
@@ -2689,7 +2743,7 @@ class ShadowTradingDaemon:
                                                     break
                                 logger.info(
                                     f"Harvester Executed: {side_h.value} on {sym} @ ${fill_p:,.4f} "
-                                    f"[Funding: {f_harv*100:+.3f}% | Size: ${notional_usd:.2f}] (TP: ${tp}, SL: ${sl})"
+                                    f"[Funding: {f_harv * 100:+.3f}% | Size: ${notional_usd:.2f}] (TP: ${tp}, SL: ${sl})"
                                 )
                                 continue
                             except Exception as e:
@@ -2726,20 +2780,22 @@ class ShadowTradingDaemon:
         anomaly_orders = []
         if self.enable_anomalies:
             anomaly_due = False
-            if self.last_anomaly_scan_time is None or (now - self.last_anomaly_scan_time).total_seconds() >= self.anomaly_scan_interval_sec:
+            if (
+                self.last_anomaly_scan_time is None
+                or (now - self.last_anomaly_scan_time).total_seconds() >= self.anomaly_scan_interval_sec
+            ):
                 anomaly_due = True
             if anomaly_due:
                 anomaly_orders = self.run_anomaly_scan()
 
         # 3. Check if rebalance is due (scheduled 4h interval or intra-cycle neutrality drift)
         rebalance_due = False
-        if self.last_rest_tickers_ok:
-            if (
-                self.last_rebalance_time is None
-                or (now - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec
-                or self.is_intracycle_rebalance_needed(now)
-            ):
-                rebalance_due = True
+        if self.last_rest_tickers_ok and (
+            self.last_rebalance_time is None
+            or (now - self.last_rebalance_time).total_seconds() >= self.rebalance_interval_sec
+            or self.is_intracycle_rebalance_needed(now)
+        ):
+            rebalance_due = True
 
         rebalance_orders = []
         if rebalance_due:
@@ -2750,10 +2806,7 @@ class ShadowTradingDaemon:
         if (
             now.minute in (0, 1)
             and now.hour in (0, 8, 16)
-            and (
-                self.last_funding_check_time is None
-                or (now - self.last_funding_check_time).total_seconds() > 300
-            )
+            and (self.last_funding_check_time is None or (now - self.last_funding_check_time).total_seconds() > 300)
         ):
             funding_due = True
 

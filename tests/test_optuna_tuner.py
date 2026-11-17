@@ -29,10 +29,7 @@ def synthetic_tuning_data():
 
     # Continuous targets correlated with factors
     targets_cont = (
-        0.5 * features["mom"]
-        - 0.3 * features["vol"]
-        + 0.4 * features["smart"]
-        + 0.2 * np.random.randn(n_samples)
+        0.5 * features["mom"] - 0.3 * features["vol"] + 0.4 * features["smart"] + 0.2 * np.random.randn(n_samples)
     )
 
     # Binary targets for meta-classification

@@ -39,16 +39,18 @@ def test_tick_processing_and_buffer():
     )
 
     # Simulate Binance combined stream bookTicker payload
-    mock_msg = json.dumps({
-        "stream": "btcusdt@bookTicker",
-        "data": {
-            "s": "BTCUSDT",
-            "b": "60000.00",
-            "a": "60002.00",
-            "B": "1.5",
-            "A": "2.0",
+    mock_msg = json.dumps(
+        {
+            "stream": "btcusdt@bookTicker",
+            "data": {
+                "s": "BTCUSDT",
+                "b": "60000.00",
+                "a": "60002.00",
+                "B": "1.5",
+                "A": "2.0",
+            },
         }
-    })
+    )
 
     client._process_ws_message(mock_msg)
 

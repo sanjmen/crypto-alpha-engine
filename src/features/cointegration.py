@@ -1,6 +1,6 @@
 """
 Multi-Asset Cointegration & Ornstein-Uhlenbeck Spread Analysis Engine.
-Issue #22: Statistical Arbitrage & Cointegration Testing for Pair Baskets.
+Statistical Arbitrage & Cointegration Testing for Pair Baskets.
 
 Implements:
 1. Engle-Granger Two-Step Cointegration Test for synthetic pairs.
@@ -22,19 +22,20 @@ from src.features.hurst import estimate_hurst_variance_time
 @dataclass
 class CointegrationResult:
     """Encapsulates the statistical results of a cointegration & mean-reversion test."""
+
     symbols: list[str]
-    method: str                              # 'engle_granger' or 'johansen'
-    hedge_ratios: dict[str, float]           # Symbol to weight/multiplier
-    intercept: float                         # Spread constant offset
-    test_statistic: float                    # t-stat or trace stat
-    p_value: float                           # Cointegration significance
-    critical_value_95: float                 # 95% confidence critical value
-    is_cointegrated: bool                    # Statistically stationary spread
-    half_life_bars: float                    # OU mean-reversion half life (in bars/hours)
-    ou_theta: float                          # Mean-reversion velocity
-    ou_mu: float                             # Equilibrium mean
-    hurst_exponent: float                    # Anti-persistence metric (H < 0.45)
-    is_tradable: bool                        # Passed all statistical & fractal filters
+    method: str  # 'engle_granger' or 'johansen'
+    hedge_ratios: dict[str, float]  # Symbol to weight/multiplier
+    intercept: float  # Spread constant offset
+    test_statistic: float  # t-stat or trace stat
+    p_value: float  # Cointegration significance
+    critical_value_95: float  # 95% confidence critical value
+    is_cointegrated: bool  # Statistically stationary spread
+    half_life_bars: float  # OU mean-reversion half life (in bars/hours)
+    ou_theta: float  # Mean-reversion velocity
+    ou_mu: float  # Equilibrium mean
+    hurst_exponent: float  # Anti-persistence metric (H < 0.45)
+    is_tradable: bool  # Passed all statistical & fractal filters
 
 
 class OrnsteinUhlenbeckCalibrator:
@@ -62,34 +63,31 @@ class OrnsteinUhlenbeckCalibrator:
             sigma: Spread diffusion volatility.
             half_life: Time (in bars/dt units) to revert half the deviation.
         """
-        s = np.asarray(spread, dtype=np.float64)
-        n = len(s)
-        if n < 5:
-            return 0.0, float(np.mean(s)) if n > 0 else 0.0, 0.0, float("inf")
+        spread_arr = np.asarray(spread, dtype=np.float64)
+        spread_arr = spread_arr[np.isfinite(spread_arr)]
+        num_obs = len(spread_arr)
+        if num_obs < 5 or float(np.std(spread_arr)) < 1e-12:
+            return 0.0, float(np.mean(spread_arr)) if num_obs > 0 else 0.0, 0.0, float("inf")
 
-        s_lag = s[:-1]
-        delta_s = s[1:] - s_lag
+        spread_lag = spread_arr[:-1]
+        delta_spread = spread_arr[1:] - spread_lag
 
-        # Linear regression: delta_s = a + b * s_lag
-        poly = np.polyfit(s_lag, delta_s, 1)
-        b = float(poly[0])
-        a = float(poly[1])
+        poly = np.polyfit(spread_lag, delta_spread, 1)
+        slope_b = float(poly[0])
+        intercept_a = float(poly[1])
 
-        # If b >= 0, the process is explosive or random walk (theta <= 0)
-        if b >= 0.0:
+        # Valid continuous-time OU mean-reversion requires -1.0 < slope_b < 0.0
+        if slope_b >= 0.0 or slope_b <= -1.0:
             theta = 1e-6
             half_life = float("inf")
-            mu = float(np.mean(s))
+            mu = float(np.mean(spread_arr))
         else:
-            # 1 + b = e^(-theta * dt) ==> theta = -ln(1 + b) / dt
-            # For small b: theta approx -b / dt
-            factor = max(1.0 + b, 1e-6)
+            factor = max(1.0 + slope_b, 1e-6)
             theta = -float(np.log(factor)) / dt
-            mu = -a / b
+            mu = -intercept_a / slope_b
             half_life = float(np.log(2.0)) / max(theta, 1e-6)
 
-        # Residual volatility
-        resids = delta_s - (a + b * s_lag)
+        resids = delta_spread - (intercept_a + slope_b * spread_lag)
         sigma = float(np.std(resids))
 
         return theta, mu, sigma, half_life
@@ -108,7 +106,7 @@ class EngleGrangerTester:
         min_half_life: float = 2.0,
         max_half_life: float = 72.0,
         hurst_threshold: float = 0.45,
-    ):
+    ) -> None:
         self.p_value_threshold = p_value_threshold
         self.min_half_life = min_half_life
         self.max_half_life = max_half_life
@@ -125,8 +123,7 @@ class EngleGrangerTester:
         Tests if pair (Y, X) forms a stationary cointegrated spread.
         """
         df = pd.DataFrame({"y": y_series, "x": x_series}).dropna()
-        n = len(df)
-        if n < 30:
+        if len(df) < 30:
             return CointegrationResult(
                 symbols=[y_symbol, x_symbol],
                 method="engle_granger",
@@ -143,28 +140,20 @@ class EngleGrangerTester:
                 is_tradable=False,
             )
 
-        y = df["y"].values
-        x = df["x"].values
+        y_vals = df["y"].values
+        x_vals = df["x"].values
 
-        # 1. Engle-Granger test via statsmodels
-        t_stat, p_val, crit_vals = coint(y, x)
+        t_stat, p_val, crit_vals = coint(y_vals, x_vals)
         crit_95 = float(crit_vals[1])
 
-        # 2. OLS hedge ratio: beta and alpha
-        poly = np.polyfit(x, y, 1)
+        poly = np.polyfit(x_vals, y_vals, 1)
         beta = float(poly[0])
         alpha = float(poly[1])
 
-        # 3. Construct synthetic spread: S_t = Y_t - beta * X_t
-        spread = y - beta * x - alpha
-
-        # 4. Calibrate Ornstein-Uhlenbeck dynamics
+        spread = y_vals - beta * x_vals - alpha
         theta, mu, _, half_life = OrnsteinUhlenbeckCalibrator.calibrate(spread)
-
-        # 5. Compute Fractal Hurst exponent on spread residuals
         hurst_val = float(estimate_hurst_variance_time(spread))
 
-        # 6. Evaluate tradability criteria
         is_coint = bool(p_val <= self.p_value_threshold)
         is_mean_rev = bool(hurst_val < self.hurst_threshold)
         is_valid_hl = bool(self.min_half_life <= half_life <= self.max_half_life)
@@ -200,11 +189,32 @@ class JohansenBasketTester:
         min_half_life: float = 2.0,
         max_half_life: float = 72.0,
         hurst_threshold: float = 0.45,
-    ):
+    ) -> None:
+        if significance_level not in (0, 1, 2):
+            raise ValueError("significance_level must be 0 (90%), 1 (95%), or 2 (99%).")
         self.significance_level = significance_level
         self.min_half_life = min_half_life
         self.max_half_life = max_half_life
         self.hurst_threshold = hurst_threshold
+
+    @staticmethod
+    def _default_untradable_result(symbols: list[str]) -> CointegrationResult:
+        k_assets = len(symbols)
+        return CointegrationResult(
+            symbols=symbols,
+            method="johansen",
+            hedge_ratios={sym: 1.0 / max(k_assets, 1) for sym in symbols},
+            intercept=0.0,
+            test_statistic=0.0,
+            p_value=1.0,
+            critical_value_95=15.0,
+            is_cointegrated=False,
+            half_life_bars=float("inf"),
+            ou_theta=0.0,
+            ou_mu=0.0,
+            hurst_exponent=0.5,
+            is_tradable=False,
+        )
 
     def test_basket(
         self,
@@ -216,77 +226,38 @@ class JohansenBasketTester:
         clean_df = prices_df.dropna()
         symbols = list(clean_df.columns)
         k_assets = len(symbols)
-        n = len(clean_df)
 
-        if n < 50 or k_assets < 2:
-            return CointegrationResult(
-                symbols=symbols,
-                method="johansen",
-                hedge_ratios={s: 1.0 / max(k_assets, 1) for s in symbols},
-                intercept=0.0,
-                test_statistic=0.0,
-                p_value=1.0,
-                critical_value_95=15.0,
-                is_cointegrated=False,
-                half_life_bars=float("inf"),
-                ou_theta=0.0,
-                ou_mu=0.0,
-                hurst_exponent=0.5,
-                is_tradable=False,
-            )
+        if len(clean_df) < 50 or k_assets < 2:
+            return self._default_untradable_result(symbols)
 
-        X = clean_df.values
+        price_matrix = clean_df.values
 
-        # Johansen test: det_order=0 (constant in cointegration space), k_ar_diff=1
         try:
-            jres = coint_johansen(X, det_order=0, k_ar_diff=1)
+            jres = coint_johansen(price_matrix, det_order=0, k_ar_diff=1)
         except (ValueError, np.linalg.LinAlgError):
-            # Fallback for numerical instability
-            return CointegrationResult(
-                symbols=symbols,
-                method="johansen",
-                hedge_ratios={s: 1.0 / max(k_assets, 1) for s in symbols},
-                intercept=0.0,
-                test_statistic=0.0,
-                p_value=1.0,
-                critical_value_95=15.0,
-                is_cointegrated=False,
-                half_life_bars=float("inf"),
-                ou_theta=0.0,
-                ou_mu=0.0,
-                hurst_exponent=0.5,
-                is_tradable=False,
-            )
+            return self._default_untradable_result(symbols)
 
-        # Trace statistic for r=0 (at least 1 cointegrating relationship)
         trace_stat = float(np.real(jres.lr1[0]))
         crit_95 = float(jres.cvt[0, self.significance_level])
         is_coint = bool(trace_stat > crit_95)
 
-        # Extract normalized principal cointegrating vector (eigenvector corresponding to largest eigenvalue)
         eigenvec = np.real(jres.evec[:, 0])
-        # Normalize so primary asset has weight 1.0
         norm_factor = eigenvec[0] if abs(eigenvec[0]) > 1e-8 else 1.0
         beta_weights = eigenvec / norm_factor
 
         hedge_ratios = {symbols[i]: float(beta_weights[i]) for i in range(k_assets)}
 
-        # Construct basket spread: S_t = X * beta
-        spread = X @ beta_weights
+        spread = price_matrix @ beta_weights
         alpha = float(np.mean(spread))
         spread_centered = spread - alpha
 
-        # Calibrate OU dynamics
         theta, mu, _, half_life = OrnsteinUhlenbeckCalibrator.calibrate(spread_centered)
-
-        # Hurst exponent
         hurst_val = float(estimate_hurst_variance_time(spread_centered))
 
         is_mean_rev = bool(hurst_val < self.hurst_threshold)
         is_valid_hl = bool(self.min_half_life <= half_life <= self.max_half_life)
         is_tradable = is_coint and is_mean_rev and is_valid_hl
 
-        # Approximate p-value proxy from trace test ratio
         p_val_proxy = max(0.001, min(0.99, 0.05 * (crit_95 / max(trace_stat, 1e-6))))
 
         return CointegrationResult(
@@ -318,7 +289,7 @@ class SpreadZScoreEngine:
         entry_zscore: float = 2.0,
         exit_zscore: float = 0.5,
         stop_loss_zscore: float = 3.5,
-    ):
+    ) -> None:
         self.lookback_window = lookback_window
         self.entry_zscore = entry_zscore
         self.exit_zscore = exit_zscore
@@ -342,11 +313,12 @@ class SpreadZScoreEngine:
         spread: pd.Series,
     ) -> tuple[pd.Series, pd.Series, pd.Series]:
         """
-        Computes rolling mean, rolling standard deviation, and rolling z-score.
+        Computes strictly causal rolling mean, rolling standard deviation, and rolling z-score.
         """
-        rolling_mean = spread.rolling(self.lookback_window, min_periods=max(10, self.lookback_window // 3)).mean()
-        rolling_std = spread.rolling(self.lookback_window, min_periods=max(10, self.lookback_window // 3)).std()
-        rolling_std = rolling_std.replace(0.0, np.nan).bfill().fillna(1e-4)
+        min_p = max(10, self.lookback_window // 3)
+        rolling_mean = spread.rolling(self.lookback_window, min_periods=min_p).mean()
+        rolling_std = spread.rolling(self.lookback_window, min_periods=min_p).std()
+        rolling_std = rolling_std.replace(0.0, np.nan).ffill().fillna(1e-4)
 
         zscore = (spread - rolling_mean) / rolling_std
         return zscore.fillna(0.0), rolling_mean, rolling_std

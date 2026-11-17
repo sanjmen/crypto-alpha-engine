@@ -187,7 +187,7 @@ def test_shadow_broker_dynamic_impact_execution(tmp_path):
         volatility=0.008,
         volume=50_000_000.0,
         depth_1pct_usd=2_000_000.0,  # 5% depth ceiling is $100,000
-        cs_spread=0.0002,             # 2 bps spread
+        cs_spread=0.0002,  # 2 bps spread
     )
 
     # Small order: 0.5 BTC = $25,000 (well within capacity)

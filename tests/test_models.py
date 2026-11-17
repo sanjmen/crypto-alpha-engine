@@ -1,10 +1,9 @@
 import numpy as np
-import pytest
 
 from src.domain.enums import MarketRegime
 from src.models.gmm_regime import GaussianMixtureJumpDetector
-from src.models.student_t_model import StudentTDensityEstimator
 from src.models.regime_classifier import MarketRegimeClassifier
+from src.models.student_t_model import StudentTDensityEstimator
 
 
 def test_gmm_jump_detector():

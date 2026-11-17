@@ -43,13 +43,15 @@ def test_annualized_funding_rate():
 
 
 def test_compute_all_derivatives_features():
-    df = pd.DataFrame({
-        "open_interest": [100.0, 110.0, 120.0, 130.0],
-        "top_trader_ratio": [1.5, 1.6, 1.7, 1.8],
-        "retail_ratio": [1.2, 1.2, 1.1, 1.0],
-        "taker_long_short_ratio": [1.2, 1.5, 1.8, 2.0],
-        "funding_rate": [0.0001, 0.0001, 0.0002, 0.0003]
-    })
+    df = pd.DataFrame(
+        {
+            "open_interest": [100.0, 110.0, 120.0, 130.0],
+            "top_trader_ratio": [1.5, 1.6, 1.7, 1.8],
+            "retail_ratio": [1.2, 1.2, 1.1, 1.0],
+            "taker_long_short_ratio": [1.2, 1.5, 1.8, 2.0],
+            "funding_rate": [0.0001, 0.0001, 0.0002, 0.0003],
+        }
+    )
     res = DerivativesFeatures.compute_all_derivatives_features(df, window=1)
     assert "oi_velocity" in res.columns
     assert "oi_accel" in res.columns

@@ -6,16 +6,16 @@ and sizes positions via inverse-volatility weighting.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
-from src.domain.entities import Signal, Portfolio
-from src.features.volatility import parkinson_volatility
+from src.domain.entities import Portfolio, Signal
 from src.features.microstructure import amihud_illiquidity
+from src.features.volatility import parkinson_volatility
 from src.models.alpha_predictor import CrossSectionalAlphaPredictor
-from src.risk.vol_targeting import VolatilityTargetingSizer
 from src.ports.model_ports import IStrategy
+from src.risk.vol_targeting import VolatilityTargetingSizer
 
 
 class CrossSectionalMomentumStrategy(IStrategy):
@@ -27,81 +27,78 @@ class CrossSectionalMomentumStrategy(IStrategy):
 
     def __init__(
         self,
-        predictor: Optional[CrossSectionalAlphaPredictor] = None,
+        predictor: CrossSectionalAlphaPredictor | None = None,
         target_annual_vol: float = 0.20,
         max_leverage: float = 2.0,
-    ):
+    ) -> None:
         self.predictor = predictor or CrossSectionalAlphaPredictor()
         self.risk_manager = VolatilityTargetingSizer(
             target_annual_vol=target_annual_vol,
             max_leverage=max_leverage,
         )
 
-    def extract_features(self, df_bars: pd.DataFrame, symbol: str) -> Optional[pd.Series]:
+    def extract_features(self, bars_df: pd.DataFrame, symbol: str) -> pd.Series | None:
         """
         Extracts point-in-time quantitative factors for an asset from its OHLCV bars.
-        df_bars must have ['open', 'high', 'low', 'close', 'volume'].
+        bars_df must have ['open', 'high', 'low', 'close', 'volume'].
         """
-        if len(df_bars) < 72:
+        if len(bars_df) < 72:
             return None
 
-        closes = df_bars["close"].values
-        highs = df_bars["high"].values
-        lows = df_bars["low"].values
-        volumes = df_bars["volume"].values
+        closes = bars_df["close"].values
+        highs = bars_df["high"].values
+        lows = bars_df["low"].values
+        volumes = bars_df["volume"].values
 
-        # 1. Multi-horizon momentum returns
         ret_12h = float((closes[-1] - closes[-12]) / (closes[-12] + 1e-8))
         ret_24h = float((closes[-1] - closes[-24]) / (closes[-24] + 1e-8))
         ret_72h = float((closes[-1] - closes[-72]) / (closes[-72] + 1e-8))
 
-        # 2. Parkinson Volatility (24 bars)
-        vol_parkinson = float(parkinson_volatility(
-            highs[-24:], lows[-24:], annualize=True
-        ))
+        vol_parkinson = float(parkinson_volatility(highs[-24:], lows[-24:], annualize=True))
 
-        # 3. Amihud Illiquidity (24 bars)
         abs_rets = np.abs(np.diff(closes[-25:]) / (closes[-25:-1] + 1e-8))
         amihud = float(amihud_illiquidity(abs_rets, volumes[-24:]))
 
-        return pd.Series({
-            "symbol": symbol,
-            "ret_12h": ret_12h,
-            "ret_24h": ret_24h,
-            "ret_72h": ret_72h,
-            "vol_parkinson": vol_parkinson,
-            "amihud": amihud,
-        })
+        return pd.Series(
+            {
+                "symbol": symbol,
+                "ret_12h": ret_12h,
+                "ret_24h": ret_24h,
+                "ret_72h": ret_72h,
+                "vol_parkinson": vol_parkinson,
+                "amihud": amihud,
+            }
+        )
 
     def generate_signals(
         self,
-        market_data: Dict[str, pd.DataFrame]
-    ) -> List[Signal]:
+        market_data: dict[str, pd.DataFrame],
+    ) -> list[Signal]:
         """
-        Processes universe market data dict {symbol: df_bars} and generates
+        Processes universe market data dict {symbol: bars_df} and generates
         dollar-neutral alpha signals.
         """
-        feature_rows = []
-        for sym, df in market_data.items():
-            feat = self.extract_features(df, sym)
-            if feat is not None:
-                feature_rows.append(feat)
+        feature_rows: list[pd.Series] = []
+        for symbol, bars_df in market_data.items():
+            features = self.extract_features(bars_df, symbol)
+            if features is not None:
+                feature_rows.append(features)
 
         if not feature_rows:
             return []
 
         universe_features = pd.DataFrame(feature_rows)
 
-        # If predictor is not yet trained, default to composite rank on momentum
         if self.predictor.ridge_model is None:
             composite_score = (
                 0.5 * universe_features["ret_24h"]
                 + 0.3 * universe_features["ret_72h"]
                 + 0.2 * universe_features["ret_12h"]
             )
-            # Demean to dollar-neutral
             demeaned = composite_score - composite_score.mean()
-            norm = (demeaned / (demeaned.abs().max() or 1.0)).values
+            raw_max_abs = float(demeaned.abs().max())
+            denom = raw_max_abs if (np.isfinite(raw_max_abs) and raw_max_abs > 1e-12) else 1.0
+            normalized_scores = (demeaned / denom).fillna(0.0).values
 
             now = datetime.now(timezone.utc)
             return [
@@ -112,21 +109,19 @@ class CrossSectionalMomentumStrategy(IStrategy):
                     confidence=float(min(1.0, abs(score))),
                     horizon_minutes=60,
                 )
-                for sym, score in zip(universe_features["symbol"], norm)
+                for sym, score in zip(universe_features["symbol"], normalized_scores, strict=False)
             ]
 
         return self.predictor.predict(universe_features)
 
     def allocate_weights(
         self,
-        signals: List[Signal],
+        signals: list[Signal],
         portfolio: Portfolio,
-        volatilities: Dict[str, float],
-    ) -> Dict[str, float]:
+        volatilities: dict[str, float],
+    ) -> dict[str, float]:
         """
         Sizes dollar weights across universe using inverse-volatility targeting.
         """
-        fractional_weights = self.risk_manager.size_positions(
-            signals, volatilities, market_neutral=True
-        )
+        fractional_weights = self.risk_manager.size_positions(signals, volatilities, market_neutral=True)
         return {sym: w * portfolio.total_equity for sym, w in fractional_weights.items()}

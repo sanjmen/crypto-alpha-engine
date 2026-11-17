@@ -2,10 +2,7 @@
 Fractional Kelly Criterion Position Sizing Engine.
 """
 
-from typing import Dict, List
 import numpy as np
-
-from src.domain.entities import Signal
 
 
 class FractionalKellySizer:
@@ -16,10 +13,10 @@ class FractionalKellySizer:
 
     def __init__(
         self,
-        fraction: float = 0.25,              # Quarter-Kelly (conservative, avoids drawdown)
+        fraction: float = 0.25,  # Quarter-Kelly (conservative, avoids drawdown)
         risk_free_rate: float = 0.0,
-        max_position_fraction: float = 0.15, # Max 15% in any single trade
-    ):
+        max_position_fraction: float = 0.15,  # Max 15% in any single trade
+    ) -> None:
         self.fraction = fraction
         self.risk_free_rate = risk_free_rate
         self.max_position_fraction = max_position_fraction
@@ -29,7 +26,9 @@ class FractionalKellySizer:
         expected_return: float,
         variance: float,
     ) -> float:
-        var = max(variance, 1e-6)
-        excess_return = expected_return - self.risk_free_rate
-        raw_kelly = (excess_return / var) * self.fraction
+        if not (np.isfinite(expected_return) and np.isfinite(variance)):
+            return 0.0
+        clamped_variance = max(float(variance), 1e-6)
+        excess_return = float(expected_return) - self.risk_free_rate
+        raw_kelly = (excess_return / clamped_variance) * self.fraction
         return float(np.clip(raw_kelly, -self.max_position_fraction, self.max_position_fraction))

@@ -15,24 +15,26 @@ Features:
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+import logging
+from typing import TYPE_CHECKING, Any
 
 from src.alerts.dispatcher import AlertDispatcher
 from src.alerts.templates import format_position_drift_alert
 from src.domain.entities import Order, Portfolio
-from src.domain.enums import OrderStatus
-from src.execution.database import ShadowDatabase
+from src.domain.enums import OrderStatus, PositionSide
+
+if TYPE_CHECKING:
+    from src.execution.database import ShadowDatabase
 
 logger = logging.getLogger(__name__)
 
 
 def normalize_symbol(symbol: str) -> str:
     """Normalizes symbol string across various CCXT and exchange representations."""
-    return symbol.replace("/", "").replace(":", "").upper()
+    return symbol.replace("/", "").replace(":USDT", "").replace(":", "").upper()
 
 
 class ReconciliationStatus(str, Enum):
@@ -111,10 +113,10 @@ class PositionReconciliationEngine:
         alert_dispatcher: AlertDispatcher | None = None,
         max_relative_drift: float = 0.001,  # 0.1% relative tolerance
         min_absolute_drift: float = 1e-4,  # Minimal absolute quantity to avoid dust float noise
-        max_cash_drift: float = 10.0,       # $10.0 cash margin discrepancy threshold
+        max_cash_drift: float = 10.0,  # $10.0 cash margin discrepancy threshold
         auto_halt_trading: bool = True,
         cancel_orphan_orders: bool = True,
-    ):
+    ) -> None:
         self.exchange = exchange_client
         self.db = database
         self.alerts = alert_dispatcher
@@ -156,23 +158,19 @@ class PositionReconciliationEngine:
 
             norm_sym = normalize_symbol(sym)
 
-            # 1. CCXT signed contracts or amount
             contracts = pos.get("contracts")
             side = str(pos.get("side", "")).lower()
-
-            # 2. Raw Binance positionAmt
             pos_amt = pos.get("info", {}).get("positionAmt")
 
-            qty: float = 0.0
+            qty = 0.0
             if pos_amt is not None:
                 qty = float(pos_amt)
             elif contracts is not None:
-                c = float(contracts)
-                qty = -c if side == "short" else c
+                c_val = float(contracts)
+                qty = -abs(c_val) if side == "short" else c_val
             elif "amount" in pos:
                 qty = float(pos["amount"])
 
-            # Filter out near-zero dust positions
             if abs(qty) > 1e-7:
                 positions_map[norm_sym] = qty
 
@@ -188,44 +186,46 @@ class PositionReconciliationEngine:
         """
         drifts: list[PositionDrift] = []
 
-        # Local positions map
         local_map: dict[str, float] = {}
-        for sym, pos in local_portfolio.positions.items():
-            norm_sym = normalize_symbol(sym)
-            local_map[norm_sym] = pos.quantity
+        for symbol, position in local_portfolio.positions.items():
+            if position.side == PositionSide.FLAT or abs(position.quantity) <= 1e-7:
+                continue
+            norm_sym = normalize_symbol(symbol)
+            signed_qty = -abs(position.quantity) if position.side == PositionSide.SHORT else abs(position.quantity)
+            local_map[norm_sym] = signed_qty
 
         all_symbols = set(local_map.keys()) | set(exchange_positions.keys())
 
-        for sym in sorted(all_symbols):
-            local_q = local_map.get(sym, 0.0)
-            exch_q = exchange_positions.get(sym, 0.0)
+        for symbol in sorted(all_symbols):
+            local_qty = local_map.get(symbol, 0.0)
+            exchange_qty = exchange_positions.get(symbol, 0.0)
 
-            abs_drift = abs(local_q - exch_q)
-            max_mag = max(abs(local_q), abs(exch_q))
+            abs_drift = abs(local_qty - exchange_qty)
+            max_mag = max(abs(local_qty), abs(exchange_qty))
             rel_drift = (abs_drift / max_mag) if max_mag > 1e-6 else 0.0
 
-            # Drift triggers only if absolute quantity exceeds dust threshold AND relative drift exceeds limit
             exceeds = (abs_drift >= self.min_absolute_drift) and (rel_drift > self.max_relative_drift)
 
             detail_msg = "OK"
             if exceeds:
-                if local_q == 0.0 and exch_q != 0.0:
-                    detail_msg = f"Untracked exchange position of {exch_q:+.4f}"
-                elif local_q != 0.0 and exch_q == 0.0:
-                    detail_msg = f"Ghost internal position of {local_q:+.4f} (closed or liquidated on exchange)"
+                if local_qty == 0.0 and exchange_qty != 0.0:
+                    detail_msg = f"Untracked exchange position of {exchange_qty:+.4f}"
+                elif local_qty != 0.0 and exchange_qty == 0.0:
+                    detail_msg = f"Ghost internal position of {local_qty:+.4f} (closed or liquidated on exchange)"
                 else:
-                    detail_msg = f"Size mismatch: internal={local_q:+.4f} vs exchange={exch_q:+.4f}"
+                    detail_msg = f"Size mismatch: internal={local_qty:+.4f} vs exchange={exchange_qty:+.4f}"
 
-            drift_item = PositionDrift(
-                symbol=sym,
-                local_qty=local_q,
-                exchange_qty=exch_q,
-                absolute_drift=abs_drift,
-                relative_drift=rel_drift,
-                exceeds_threshold=exceeds,
-                details=detail_msg,
+            drifts.append(
+                PositionDrift(
+                    symbol=symbol,
+                    local_qty=local_qty,
+                    exchange_qty=exchange_qty,
+                    absolute_drift=abs_drift,
+                    relative_drift=rel_drift,
+                    exceeds_threshold=exceeds,
+                    details=detail_msg,
+                )
             )
-            drifts.append(drift_item)
 
         return drifts
 
@@ -240,40 +240,56 @@ class PositionReconciliationEngine:
         """
         orphan_orders: list[OrphanOrder] = []
 
-        local_order_ids = {o.id: o for o in (local_open_orders or []) if o.status in (OrderStatus.PENDING,)}
+        local_order_ids = {
+            order.id: order
+            for order in (local_open_orders or [])
+            if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
+        }
 
-        for ex_ord in exchange_open_orders:
-            ex_id = str(ex_ord.get("id", ""))
-            client_id = str(ex_ord.get("clientOrderId", ""))
-            sym = str(ex_ord.get("symbol", ""))
-            side = str(ex_ord.get("side", ""))
-            qty = float(ex_ord.get("amount") or 0.0)
-            price = float(ex_ord.get("price") or 0.0) if ex_ord.get("price") else None
+        for ex_order in exchange_open_orders:
+            ex_id = str(ex_order.get("id", ""))
+            client_id = str(ex_order.get("clientOrderId", ""))
+            symbol = str(ex_order.get("symbol", ""))
+            side = str(ex_order.get("side", ""))
+            quantity = float(ex_order.get("amount") or 0.0)
+            price = float(ex_order.get("price") or 0.0) if ex_order.get("price") else None
 
-            # Check if order is tracked locally
             if ex_id not in local_order_ids and client_id not in local_order_ids:
                 canceled = False
                 if self.cancel_orphan_orders and hasattr(self.exchange, "cancel_order"):
                     try:
-                        self.exchange.cancel_order(ex_id, sym)
+                        self.exchange.cancel_order(ex_id, symbol)
                         canceled = True
-                        logger.warning(f"Automatically canceled orphan exchange order {ex_id} on {sym}.")
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(f"Failed to cancel orphan order {ex_id}: {e}")
+                        logger.warning(f"Automatically canceled orphan exchange order {ex_id} on {symbol}.")
+                    except Exception as err:  # noqa: BLE001
+                        logger.error(f"Failed to cancel orphan order {ex_id}: {err}")
 
                 orphan_orders.append(
                     OrphanOrder(
                         order_id=ex_id,
-                        symbol=sym,
+                        symbol=symbol,
                         location="EXCHANGE_ONLY",
                         side=side,
-                        quantity=qty,
+                        quantity=quantity,
                         price=price,
                         canceled_automatically=canceled,
                     )
                 )
 
         return orphan_orders
+
+    def _extract_exchange_cash(self, raw_balance: dict[str, Any] | None) -> float:
+        """Extracts USDT total/free balance from CCXT balance dictionary."""
+        if not raw_balance:
+            return 0.0
+        usdt_bal = raw_balance.get("USDT") or raw_balance.get("total", {}).get("USDT")
+        if isinstance(usdt_bal, dict):
+            return float(usdt_bal.get("total") or usdt_bal.get("free") or 0.0)
+        if usdt_bal is not None:
+            return float(usdt_bal)
+        if "free" in raw_balance and "USDT" in raw_balance["free"]:
+            return float(raw_balance["free"]["USDT"])
+        return 0.0
 
     def run_reconciliation(
         self,
@@ -285,61 +301,45 @@ class PositionReconciliationEngine:
     ) -> ReconciliationReport:
         """
         Executes a complete reconciliation pass.
-
-        If exchange data arguments are None, attempts to query them via self.exchange.
         """
         now = datetime.now(timezone.utc)
         self.last_reconciliation_time = now
 
-        # 1. Ingest Exchange Positions
         raw_positions = exchange_positions
         if raw_positions is None and hasattr(self.exchange, "fetch_positions"):
             try:
                 raw_positions = self.exchange.fetch_positions()
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to fetch exchange positions: {e}")
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"Failed to fetch exchange positions: {err}")
                 raw_positions = []
 
         parsed_exchange_positions = self.parse_exchange_positions(raw_positions or [])
         drifts = self.check_position_drifts(local_portfolio, parsed_exchange_positions)
 
-        # 2. Ingest Exchange Balances
         raw_balance = exchange_balance
         if raw_balance is None and hasattr(self.exchange, "fetch_balance"):
             try:
                 raw_balance = self.exchange.fetch_balance()
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to fetch exchange balance: {e}")
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"Failed to fetch exchange balance: {err}")
                 raw_balance = {}
 
-        ex_cash = 0.0
-        if raw_balance:
-            # Check USDT or USD total/free balance
-            usdt_bal = raw_balance.get("USDT") or raw_balance.get("total", {}).get("USDT")
-            if isinstance(usdt_bal, dict):
-                ex_cash = float(usdt_bal.get("total") or usdt_bal.get("free") or 0.0)
-            elif usdt_bal is not None:
-                ex_cash = float(usdt_bal)
-            elif "free" in raw_balance and "USDT" in raw_balance["free"]:
-                ex_cash = float(raw_balance["free"]["USDT"])
-
+        exchange_cash = self._extract_exchange_cash(raw_balance)
         local_cash = local_portfolio.cash
-        cash_drift = abs(local_cash - ex_cash) if ex_cash > 0 else 0.0
+        cash_drift = abs(local_cash - exchange_cash) if exchange_cash > 0 else 0.0
 
-        # 3. Ingest Exchange Open Orders
         raw_orders = exchange_open_orders
         if raw_orders is None and hasattr(self.exchange, "fetch_open_orders"):
             try:
                 raw_orders = self.exchange.fetch_open_orders()
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to fetch exchange open orders: {e}")
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"Failed to fetch exchange open orders: {err}")
                 raw_orders = []
 
         orphans = self.reconcile_open_orders(local_open_orders, raw_orders or [])
 
-        # 4. Determine Reconciliation Status
         violating_drifts = [d for d in drifts if d.exceeds_threshold]
-        has_cash_violation = cash_drift > self.max_cash_drift and ex_cash > 0
+        has_cash_violation = cash_drift > self.max_cash_drift and exchange_cash > 0
 
         status = ReconciliationStatus.IN_SYNC
         summary_items: list[str] = []
@@ -347,8 +347,11 @@ class PositionReconciliationEngine:
         if violating_drifts:
             status = ReconciliationStatus.DRIFT_DETECTED
             summary_items.append(f"{len(violating_drifts)} position drifts exceeded threshold")
-            for vd in violating_drifts:
-                summary_items.append(f"• {vd.symbol}: internal={vd.local_qty:+.4f}, exchange={vd.exchange_qty:+.4f} (drift: {vd.relative_drift*100:.2f}%)")
+            for drift in violating_drifts:
+                summary_items.append(
+                    f"• {drift.symbol}: internal={drift.local_qty:+.4f}, "
+                    f"exchange={drift.exchange_qty:+.4f} (drift: {drift.relative_drift * 100:.2f}%)"
+                )
 
         if orphans:
             if status == ReconciliationStatus.IN_SYNC:
@@ -357,26 +360,26 @@ class PositionReconciliationEngine:
 
         if has_cash_violation:
             status = ReconciliationStatus.FATAL_DESYNC
-            summary_items.append(f"Cash balance drift of ${cash_drift:,.2f} exceeded max ceiling (${self.max_cash_drift:,.2f})")
+            summary_items.append(
+                f"Cash balance drift of ${cash_drift:,.2f} exceeded max ceiling (${self.max_cash_drift:,.2f})"
+            )
 
         if status == ReconciliationStatus.IN_SYNC:
             summary = f"Portfolio in sync with exchange ({len(drifts)} positions verified)."
         else:
             summary = "\n".join(summary_items)
 
-        # 5. Safety Protocol & Circuit Breaker Trip
         if violating_drifts or has_cash_violation:
             if self.auto_halt_trading:
                 self.halt_trading(f"Reconciliation drift failure: {summary}")
 
-            # Send critical alert
             if self.alerts:
-                for vd in violating_drifts:
+                for drift in violating_drifts:
                     alert = format_position_drift_alert(
-                        symbol=vd.symbol,
-                        local_qty=vd.local_qty,
-                        exchange_qty=vd.exchange_qty,
-                        drift_pct=vd.relative_drift,
+                        symbol=drift.symbol,
+                        local_qty=drift.local_qty,
+                        exchange_qty=drift.exchange_qty,
+                        drift_pct=drift.relative_drift,
                     )
                     self.alerts.dispatch(alert)
 
@@ -386,7 +389,7 @@ class PositionReconciliationEngine:
             drifts=drifts,
             orphan_orders=orphans,
             local_cash=local_cash,
-            exchange_cash=ex_cash,
+            exchange_cash=exchange_cash,
             cash_drift=cash_drift,
             trading_halted=self.trading_halted,
             summary=summary,
@@ -394,7 +397,6 @@ class PositionReconciliationEngine:
         )
         self.last_report = report
 
-        # 6. Audit Logging to SQLite
         if self.db:
             try:
                 self.db.save_reconciliation_audit(
@@ -406,7 +408,7 @@ class PositionReconciliationEngine:
                     details=report.to_dict(),
                     timestamp=now,
                 )
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to persist reconciliation audit log: {e}")
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"Failed to persist reconciliation audit log: {err}")
 
         return report

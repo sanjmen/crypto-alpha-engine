@@ -4,7 +4,6 @@ Extracts alpha signals from Open Interest velocity, Smart-vs-Retail sentiment di
 Taker order flow imbalance, and Annualized Funding Rate dynamics.
 """
 
-from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -18,22 +17,24 @@ class DerivativesFeatures:
     @staticmethod
     def open_interest_velocity(
         oi_series: pd.Series,
-        window: int = 12
+        window: int = 12,
     ) -> pd.Series:
         """
-        Computes rate of change (velocity) of Open Interest over a rolling window.
-        delta_OI = (OI_t - OI_{t-k}) / (OI_{t-k} + eps)
+        Computes rate of change (velocity) of Open Interest over a rolling window:
+        delta_OI = (OI_t - OI_{t-k}) / OI_{t-k}
         """
-        eps = 1e-8
-        return (oi_series - oi_series.shift(window)) / (oi_series.shift(window) + eps)
+        lagged_oi = oi_series.shift(window)
+        safe_lagged = lagged_oi.replace(0.0, np.nan)
+        velocity = (oi_series - lagged_oi) / safe_lagged
+        return velocity.where(lagged_oi != 0.0, 0.0)
 
     @staticmethod
     def open_interest_acceleration(
         oi_series: pd.Series,
-        window: int = 12
+        window: int = 12,
     ) -> pd.Series:
         """
-        Computes the second derivative (acceleration) of Open Interest.
+        Computes the second derivative (acceleration) of Open Interest:
         acc_OI = delta_OI_t - delta_OI_{t-k}
         """
         velocity = DerivativesFeatures.open_interest_velocity(oi_series, window=window)
@@ -42,7 +43,7 @@ class DerivativesFeatures:
     @staticmethod
     def smart_money_divergence(
         top_trader_ratio: pd.Series,
-        retail_ratio: pd.Series
+        retail_ratio: pd.Series,
     ) -> pd.Series:
         """
         Measures positioning divergence between Top Traders (Smart Money) and Retail Accounts:
@@ -54,7 +55,7 @@ class DerivativesFeatures:
 
     @staticmethod
     def taker_flow_imbalance(
-        taker_long_short_vol_ratio: pd.Series
+        taker_long_short_vol_ratio: pd.Series,
     ) -> pd.Series:
         """
         Normalizes Taker Buy/Sell volume ratio into bounded [-1.0, 1.0] imbalance:
@@ -67,10 +68,10 @@ class DerivativesFeatures:
 
     @staticmethod
     def annualized_funding_rate(
-        funding_rate_8h: pd.Series
+        funding_rate_8h: pd.Series,
     ) -> pd.Series:
         """
-        Converts 8-hour funding rate settlements into annualized percentage:
+        Converts 8-hour funding rate settlements into annualized rate:
         Annualized = Rate * 3 settlements/day * 365 days
         """
         return funding_rate_8h * 3.0 * 365.0
@@ -78,7 +79,7 @@ class DerivativesFeatures:
     @staticmethod
     def compute_all_derivatives_features(
         metrics_df: pd.DataFrame,
-        window: int = 12
+        window: int = 12,
     ) -> pd.DataFrame:
         """
         Extracts full feature matrix from raw metrics DataFrame.
@@ -96,13 +97,9 @@ class DerivativesFeatures:
             )
 
         if "taker_long_short_ratio" in df.columns:
-            features["taker_imbalance"] = DerivativesFeatures.taker_flow_imbalance(
-                df["taker_long_short_ratio"]
-            )
+            features["taker_imbalance"] = DerivativesFeatures.taker_flow_imbalance(df["taker_long_short_ratio"])
 
         if "funding_rate" in df.columns:
-            features["funding_ann"] = DerivativesFeatures.annualized_funding_rate(
-                df["funding_rate"]
-            )
+            features["funding_ann"] = DerivativesFeatures.annualized_funding_rate(df["funding_rate"])
 
         return features

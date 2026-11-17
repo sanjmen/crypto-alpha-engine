@@ -11,14 +11,14 @@ Supports:
 
 from __future__ import annotations
 
-import logging
-import os
-import queue
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
+import logging
+import os
+import queue
+import threading
 from typing import Any
 
 import requests
@@ -30,8 +30,8 @@ class AlertPriority(IntEnum):
     """Priority levels: lower integer = higher urgency."""
 
     CRITICAL = 0  # Safety circuit breaker trips, position drift, security breach
-    WARNING = 1   # WebSocket disconnection, high slippage, order retry
-    INFO = 2      # Executed trades, funding cashflows, daily EOD tear sheets
+    WARNING = 1  # WebSocket disconnection, high slippage, order retry
+    INFO = 2  # Executed trades, funding cashflows, daily EOD tear sheets
 
 
 @dataclass(order=True)
@@ -244,7 +244,9 @@ class AlertDispatcher:
 
     def _post_telegram(self, msg: AlertMessage) -> bool:
         """Posts formatted message to Telegram Bot API."""
-        emoji = "🚨" if msg.priority == AlertPriority.CRITICAL else ("⚠️" if msg.priority == AlertPriority.WARNING else "ℹ️")
+        emoji = (
+            "🚨" if msg.priority == AlertPriority.CRITICAL else ("⚠️" if msg.priority == AlertPriority.WARNING else "ℹ️")
+        )
         text = f"{emoji} *{msg.title}*\n\n{msg.body}\n\n`UTC: {msg.timestamp.strftime('%Y-%m-%d %H:%M:%S')}`"
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         payload = {
@@ -257,7 +259,11 @@ class AlertDispatcher:
 
     def _post_discord(self, msg: AlertMessage) -> bool:
         """Posts rich embed to Discord Webhook."""
-        color = 0xFF0000 if msg.priority == AlertPriority.CRITICAL else (0xFFA500 if msg.priority == AlertPriority.WARNING else 0x00FF00)
+        color = (
+            0xFF0000
+            if msg.priority == AlertPriority.CRITICAL
+            else (0xFFA500 if msg.priority == AlertPriority.WARNING else 0x00FF00)
+        )
         embed = {
             "title": msg.title,
             "description": msg.body,

@@ -4,8 +4,8 @@ Credential Masking, and IP Whitelist Verification.
 """
 
 import logging
-import tempfile
 from pathlib import Path
+import tempfile
 from unittest.mock import MagicMock
 
 import pytest
@@ -57,9 +57,7 @@ def test_sensitive_data_masker_and_log_filter():
     masker = SensitiveDataMasker()
     masker.register_credentials(creds)
 
-    raw_text = (
-        f"Connecting to Binance with apiKey={creds.api_key} and secret={creds.api_secret}."
-    )
+    raw_text = f"Connecting to Binance with apiKey={creds.api_key} and secret={creds.api_secret}."
     masked = masker.mask(raw_text)
 
     assert creds.api_key not in masked
@@ -163,14 +161,10 @@ def test_preflight_permission_validator_unrestricted_ip():
 
     # Strict mode should raise UnrestrictedIpError
     with pytest.raises(UnrestrictedIpError):
-        PreFlightPermissionValidator.validate_binance_permissions(
-            unrestricted_payload, strict_ip_whitelist=True
-        )
+        PreFlightPermissionValidator.validate_binance_permissions(unrestricted_payload, strict_ip_whitelist=True)
 
     # Permissive mode should pass with warning
-    report = PreFlightPermissionValidator.validate_binance_permissions(
-        unrestricted_payload, strict_ip_whitelist=False
-    )
+    report = PreFlightPermissionValidator.validate_binance_permissions(unrestricted_payload, strict_ip_whitelist=False)
     assert report.is_safe_for_trading
     assert not report.ip_restricted
     assert len(report.warnings) > 0
@@ -204,9 +198,7 @@ def test_preflight_permission_validator_missing_futures():
     }
 
     with pytest.raises(SecurityViolationError) as exc_info:
-        PreFlightPermissionValidator.validate_binance_permissions(
-            missing_futures_payload, require_futures=True
-        )
+        PreFlightPermissionValidator.validate_binance_permissions(missing_futures_payload, require_futures=True)
     assert "enableFutures is False" in str(exc_info.value)
 
 

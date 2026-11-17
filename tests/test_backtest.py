@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
-import pytest
 
-from src.backtest.engine import VectorizedBacktester, BacktestResult
+from src.backtest.engine import BacktestResult, VectorizedBacktester
 
 
 def test_vectorized_backtester_metrics():

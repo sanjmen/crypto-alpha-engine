@@ -11,26 +11,59 @@ Includes:
 6. Online GARCH(1,1) Recursive Filter with forward projection
 """
 
-from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
 
+def _validate_ohlc_arrays(
+    open_: np.ndarray | pd.Series | list[float],
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
+    close: np.ndarray | pd.Series | list[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Validates and filters OHLC arrays for strictly positive finite prices with high >= low."""
+    open_arr = np.asarray(open_, dtype=np.float64)
+    high_arr = np.asarray(high, dtype=np.float64)
+    low_arr = np.asarray(low, dtype=np.float64)
+    close_arr = np.asarray(close, dtype=np.float64)
+
+    num_bars = len(open_arr)
+    if num_bars == 0 or not (len(high_arr) == num_bars and len(low_arr) == num_bars and len(close_arr) == num_bars):
+        return None
+
+    valid_mask = (
+        np.isfinite(open_arr)
+        & np.isfinite(high_arr)
+        & np.isfinite(low_arr)
+        & np.isfinite(close_arr)
+        & (open_arr > 0)
+        & (high_arr > 0)
+        & (low_arr > 0)
+        & (close_arr > 0)
+        & (high_arr >= low_arr)
+    )
+    if not np.any(valid_mask):
+        return None
+
+    return open_arr[valid_mask], high_arr[valid_mask], low_arr[valid_mask], close_arr[valid_mask]
+
+
 def realized_volatility(
-    prices: Union[np.ndarray, pd.Series, List[float]],
+    prices: np.ndarray | pd.Series | list[float],
     annualize: bool = False,
     periods_per_year: float = 365.25 * 24,  # 1h bars in crypto year
 ) -> float:
     """
-    Computes classical Close-to-Close Realized Volatility.
+    Computes classical Close-to-Close Realized Volatility:
     sigma_RV = sqrt( mean(r_t^2) )
     """
-    p = np.asarray(prices, dtype=np.float64)
-    if len(p) < 2:
+    prices_arr = np.asarray(prices, dtype=np.float64)
+    prices_arr = prices_arr[np.isfinite(prices_arr) & (prices_arr > 0)]
+    if len(prices_arr) < 2:
         return 0.0
 
-    rets = np.diff(np.log(p))
-    rv_var = np.mean(rets**2)
+    rets = np.diff(np.log(prices_arr))
+    rv_var = float(np.mean(rets**2))
     vol = np.sqrt(max(rv_var, 1e-12))
 
     if annualize:
@@ -40,32 +73,32 @@ def realized_volatility(
 
 
 def parkinson_volatility(
-    high: Union[np.ndarray, pd.Series, List[float]],
-    low: Union[np.ndarray, pd.Series, List[float]],
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
     annualize: bool = False,
     periods_per_year: float = 365.25 * 24,
 ) -> float:
     """
-    Computes Parkinson (1980) High-Low Range Volatility estimator.
+    Computes Parkinson (1980) High-Low Range Volatility estimator:
     sigma_P^2 = (1 / (4 * ln(2) * N)) * sum( (ln(H/L))^2 )
     Statistically ~5x more efficient than Close-to-Close volatility.
     """
-    h = np.asarray(high, dtype=np.float64)
-    l = np.asarray(low, dtype=np.float64)
+    high_arr = np.asarray(high, dtype=np.float64)
+    low_arr = np.asarray(low, dtype=np.float64)
 
-    if len(h) == 0 or len(l) == 0 or len(h) != len(l):
+    if len(high_arr) == 0 or len(low_arr) == 0 or len(high_arr) != len(low_arr):
         return 0.0
 
-    valid_mask = (h > 0) & (l > 0) & (h >= l)
+    valid_mask = np.isfinite(high_arr) & np.isfinite(low_arr) & (high_arr > 0) & (low_arr > 0) & (high_arr >= low_arr)
     if not np.any(valid_mask):
         return 0.0
 
-    h_v = h[valid_mask]
-    l_v = l[valid_mask]
+    high_valid = high_arr[valid_mask]
+    low_valid = low_arr[valid_mask]
 
-    log_hl = np.log(h_v / l_v)
+    log_hl = np.log(high_valid / low_valid)
     factor = 1.0 / (4.0 * np.log(2.0))
-    p_var = factor * np.mean(log_hl**2)
+    p_var = float(factor * np.mean(log_hl**2))
     vol = np.sqrt(max(p_var, 1e-12))
 
     if annualize:
@@ -75,40 +108,27 @@ def parkinson_volatility(
 
 
 def garman_klass_volatility(
-    open_: Union[np.ndarray, pd.Series, List[float]],
-    high: Union[np.ndarray, pd.Series, List[float]],
-    low: Union[np.ndarray, pd.Series, List[float]],
-    close: Union[np.ndarray, pd.Series, List[float]],
+    open_: np.ndarray | pd.Series | list[float],
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
+    close: np.ndarray | pd.Series | list[float],
     annualize: bool = False,
     periods_per_year: float = 365.25 * 24,
 ) -> float:
     """
-    Computes Garman-Klass (1980) OHLC Volatility estimator.
+    Computes Garman-Klass (1980) OHLC Volatility estimator:
     sigma_GK^2 = mean( 0.5 * (ln(H/L))^2 - (2*ln(2) - 1) * (ln(C/O))^2 )
     Statistically ~8x more efficient than Close-to-Close volatility.
     """
-    o = np.asarray(open_, dtype=np.float64)
-    h = np.asarray(high, dtype=np.float64)
-    l = np.asarray(low, dtype=np.float64)
-    c = np.asarray(close, dtype=np.float64)
-
-    n = len(o)
-    if n == 0 or not (len(h) == n and len(l) == n and len(c) == n):
+    validated = _validate_ohlc_arrays(open_, high, low, close)
+    if validated is None:
         return 0.0
+    open_valid, high_valid, low_valid, close_valid = validated
 
-    valid_mask = (o > 0) & (h > 0) & (l > 0) & (c > 0) & (h >= l)
-    if not np.any(valid_mask):
-        return 0.0
+    term1 = 0.5 * (np.log(high_valid / low_valid)) ** 2
+    term2 = (2.0 * np.log(2.0) - 1.0) * (np.log(close_valid / open_valid)) ** 2
 
-    o_v = o[valid_mask]
-    h_v = h[valid_mask]
-    l_v = l[valid_mask]
-    c_v = c[valid_mask]
-
-    term1 = 0.5 * (np.log(h_v / l_v))**2
-    term2 = (2.0 * np.log(2.0) - 1.0) * (np.log(c_v / o_v))**2
-
-    gk_var = np.mean(term1 - term2)
+    gk_var = float(np.mean(term1 - term2))
     vol = np.sqrt(max(gk_var, 1e-12))
 
     if annualize:
@@ -118,42 +138,29 @@ def garman_klass_volatility(
 
 
 def rogers_satchell_volatility(
-    open_: Union[np.ndarray, pd.Series, List[float]],
-    high: Union[np.ndarray, pd.Series, List[float]],
-    low: Union[np.ndarray, pd.Series, List[float]],
-    close: Union[np.ndarray, pd.Series, List[float]],
+    open_: np.ndarray | pd.Series | list[float],
+    high: np.ndarray | pd.Series | list[float],
+    low: np.ndarray | pd.Series | list[float],
+    close: np.ndarray | pd.Series | list[float],
     annualize: bool = False,
     periods_per_year: float = 365.25 * 24,
 ) -> float:
     """
-    Computes Rogers-Satchell (1991) Volatility estimator.
+    Computes Rogers-Satchell (1991) Volatility estimator:
     sigma_RS^2 = mean( ln(H/C)*ln(H/O) + ln(L/C)*ln(L/O) )
     Handles non-zero drift robustly.
     """
-    o = np.asarray(open_, dtype=np.float64)
-    h = np.asarray(high, dtype=np.float64)
-    l = np.asarray(low, dtype=np.float64)
-    c = np.asarray(close, dtype=np.float64)
-
-    n = len(o)
-    if n == 0 or not (len(h) == n and len(l) == n and len(c) == n):
+    validated = _validate_ohlc_arrays(open_, high, low, close)
+    if validated is None:
         return 0.0
+    open_valid, high_valid, low_valid, close_valid = validated
 
-    valid_mask = (o > 0) & (h > 0) & (l > 0) & (c > 0) & (h >= l)
-    if not np.any(valid_mask):
-        return 0.0
+    log_hc = np.log(high_valid / close_valid)
+    log_ho = np.log(high_valid / open_valid)
+    log_lc = np.log(low_valid / close_valid)
+    log_lo = np.log(low_valid / open_valid)
 
-    o_v = o[valid_mask]
-    h_v = h[valid_mask]
-    l_v = l[valid_mask]
-    c_v = c[valid_mask]
-
-    u = np.log(h_v / c_v)
-    v = np.log(h_v / o_v)
-    w = np.log(l_v / c_v)
-    x = np.log(l_v / o_v)
-
-    rs_var = np.mean(u * v + w * x)
+    rs_var = float(np.mean(log_hc * log_ho + log_lc * log_lo))
     vol = np.sqrt(max(rs_var, 1e-12))
 
     if annualize:
@@ -164,11 +171,11 @@ def rogers_satchell_volatility(
 
 class OnlineEWMAVolatility:
     """
-    Online recursive Exponentially Weighted Moving Average (EWMA) volatility filter.
+    Online recursive Exponentially Weighted Moving Average (EWMA) volatility filter:
     sigma_t^2 = lambda * sigma_{t-1}^2 + (1 - lambda) * r_t^2
     """
 
-    def __init__(self, decay: float = 0.94, initial_vol: float = 0.02):
+    def __init__(self, decay: float = 0.94, initial_vol: float = 0.02) -> None:
         self.decay = decay
         self.variance = initial_vol**2
         self.step_count = 0
@@ -185,7 +192,7 @@ class OnlineEWMAVolatility:
 
 class OnlineGARCH11:
     """
-    Online recursive GARCH(1,1) filter.
+    Online recursive GARCH(1,1) filter:
     sigma_{t+1}^2 = omega + alpha * r_t^2 + beta * sigma_t^2
     """
 
@@ -195,8 +202,9 @@ class OnlineGARCH11:
         alpha: float = 0.08,
         beta: float = 0.90,
         initial_vol: float = 0.02,
-    ):
-        assert alpha + beta < 1.0, "GARCH(1,1) requires alpha + beta < 1 for stationarity"
+    ) -> None:
+        if not (alpha >= 0.0 and beta >= 0.0 and alpha + beta < 1.0):
+            raise ValueError("GARCH(1,1) requires alpha >= 0, beta >= 0, and alpha + beta < 1 for stationarity.")
         self.omega = omega
         self.alpha = alpha
         self.beta = beta
@@ -218,8 +226,8 @@ class OnlineGARCH11:
         var_long = self.unconditional_variance
 
         cum_var = 0.0
-        v_h = self.variance
+        var_step = self.variance
         for _ in range(horizon_steps):
-            v_h = var_long + (persistence) * (v_h - var_long)
-            cum_var += v_h
+            var_step = var_long + persistence * (var_step - var_long)
+            cum_var += var_step
         return float(cum_var)

@@ -4,11 +4,9 @@ Partitioned by symbol and timeframe with automatic deduplication.
 """
 
 from datetime import datetime, timezone
-import logging
 from pathlib import Path
-from typing import List, Optional
+
 import duckdb
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,7 +14,11 @@ import pyarrow.parquet as pq
 from src.domain.entities import Bar
 from src.domain.enums import Timeframe
 
-logger = logging.getLogger(__name__)
+
+def _to_utc_epoch_seconds(dt: datetime) -> int:
+    """Converts a naive or timezone-aware datetime to UTC seconds since epoch."""
+    utc_dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    return int(utc_dt.timestamp())
 
 
 class ParquetBarStorage:
@@ -24,19 +26,19 @@ class ParquetBarStorage:
     On-disk storage manager for OHLCV bars using Apache Parquet and DuckDB.
     """
 
-    def __init__(self, base_dir: Optional[Path] = None):
+    def __init__(self, base_dir: Path | None = None) -> None:
         if base_dir is None:
             base_dir = Path(__file__).resolve().parent.parent.parent / "data" / "cache" / "bars"
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_file_path(self, symbol: str, timeframe: Timeframe) -> Path:
-        clean_sym = symbol.replace("/", "_").replace(":", "_")
+        clean_symbol = symbol.replace("/", "_").replace(":", "_")
         timeframe_dir = self.base_dir / timeframe.value
         timeframe_dir.mkdir(parents=True, exist_ok=True)
-        return timeframe_dir / f"{clean_sym}.parquet"
+        return timeframe_dir / f"{clean_symbol}.parquet"
 
-    def store_bars(self, symbol: str, timeframe: Timeframe, bars: List[Bar]) -> int:
+    def store_bars(self, symbol: str, timeframe: Timeframe, bars: list[Bar]) -> int:
         """
         Appends bars to the parquet store with timestamp deduplication.
         Returns number of total stored records.
@@ -46,19 +48,21 @@ class ParquetBarStorage:
 
         file_path = self._get_file_path(symbol, timeframe)
 
-        new_data = {
-            "timestamp": [int(b.timestamp.replace(tzinfo=timezone.utc).timestamp()) for b in bars],
-            "symbol": [b.symbol for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-        }
-        new_df = pd.DataFrame(new_data)
+        rows = [
+            {
+                "timestamp": _to_utc_epoch_seconds(bar.timestamp),
+                "symbol": bar.symbol,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+            }
+            for bar in bars
+        ]
+        new_df = pd.DataFrame(rows)
 
         if file_path.exists():
-            # Merge with existing file using DuckDB for instant deduplication
             query = f"""
                 SELECT timestamp, symbol, open, high, low, close, volume
                 FROM (
@@ -83,9 +87,9 @@ class ParquetBarStorage:
         self,
         symbol: str,
         timeframe: Timeframe,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-    ) -> List[Bar]:
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> list[Bar]:
         """
         Retrieves bars within an optional time range.
         """
@@ -93,29 +97,27 @@ class ParquetBarStorage:
         if not file_path.exists():
             return []
 
-        conditions = []
+        conditions: list[str] = []
         if start_time is not None:
-            ts_start = int(start_time.replace(tzinfo=timezone.utc).timestamp())
+            ts_start = _to_utc_epoch_seconds(start_time)
             conditions.append(f"timestamp >= {ts_start}")
         if end_time is not None:
-            ts_end = int(end_time.replace(tzinfo=timezone.utc).timestamp())
+            ts_end = _to_utc_epoch_seconds(end_time)
             conditions.append(f"timestamp <= {ts_end}")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM read_parquet('{file_path}') {where_clause} ORDER BY timestamp ASC"
+        query = f"SELECT timestamp, symbol, open, high, low, close, volume FROM read_parquet('{file_path}') {where_clause} ORDER BY timestamp ASC"
 
         df = duckdb.query(query).to_df()
-        bars: List[Bar] = []
-        for _, row in df.iterrows():
-            bars.append(
-                Bar(
-                    timestamp=datetime.fromtimestamp(row["timestamp"], tz=timezone.utc),
-                    symbol=row["symbol"],
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row["volume"]),
-                )
+        return [
+            Bar(
+                timestamp=datetime.fromtimestamp(float(row.timestamp), tz=timezone.utc),
+                symbol=str(row.symbol),
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=float(row.volume),
             )
-        return bars
+            for row in df.itertuples(index=False)
+        ]

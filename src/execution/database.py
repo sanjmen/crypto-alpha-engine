@@ -4,13 +4,14 @@ Stores accounts, positions, orders, trades, funding settlements, and rebalance s
 Uses SQLite WAL (Write-Ahead Logging) mode for high-concurrency non-blocking reads.
 """
 
+import contextlib
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from src.domain.entities import Order, Position, Trade
@@ -57,7 +58,8 @@ class ShadowDatabase:
             cursor.execute("PRAGMA foreign_keys = ON;")
 
             # 1. Accounts
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -70,10 +72,12 @@ class ShadowDatabase:
                     free_margin REAL NOT NULL,
                     leverage REAL NOT NULL
                 );
-            """)
+            """
+            )
 
             # 2. Positions
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS positions (
                     symbol TEXT PRIMARY KEY,
                     side TEXT NOT NULL CHECK(side IN ('LONG', 'SHORT', 'FLAT')),
@@ -91,28 +95,22 @@ class ShadowDatabase:
                     opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # Schema migrations for existing databases
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE positions ADD COLUMN take_profit REAL;")
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE positions ADD COLUMN stop_loss REAL;")
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE positions ADD COLUMN peak_price REAL DEFAULT 0.0;")
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE positions ADD COLUMN strategy TEXT;")
-            except Exception:
-                pass
 
             # 3. Orders
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS orders (
                     id TEXT PRIMARY KEY,
                     client_order_id TEXT UNIQUE,
@@ -130,15 +128,15 @@ class ShadowDatabase:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE orders ADD COLUMN strategy TEXT;")
-            except Exception:
-                pass
 
             # 4. Trades
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS trades (
                     id TEXT PRIMARY KEY,
                     order_id TEXT NOT NULL,
@@ -154,15 +152,15 @@ class ShadowDatabase:
                     timestamp TEXT NOT NULL,
                     FOREIGN KEY(order_id) REFERENCES orders(id)
                 );
-            """)
+            """
+            )
 
-            try:
+            with contextlib.suppress(Exception):
                 cursor.execute("ALTER TABLE trades ADD COLUMN strategy TEXT;")
-            except Exception:
-                pass
 
             # 5. Funding settlements
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS funding_settlements (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -172,10 +170,12 @@ class ShadowDatabase:
                     position_notional REAL NOT NULL,
                     cashflow_credited REAL NOT NULL
                 );
-            """)
+            """
+            )
 
             # 6. Rebalance snapshots
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS rebalance_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -186,10 +186,12 @@ class ShadowDatabase:
                     target_allocations_json TEXT NOT NULL,
                     executed_delta_json TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 7. Reconciliation audit logs
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS reconciliation_audit_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -200,10 +202,12 @@ class ShadowDatabase:
                     trading_halted INTEGER NOT NULL,
                     details_json TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 8. Daemon Heartbeats & WebSocket Telemetry
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS daemon_heartbeat (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     timestamp TEXT NOT NULL,
@@ -216,10 +220,12 @@ class ShadowDatabase:
                     next_rebalance_in_sec REAL,
                     status TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 9. Market Pulse & 24h Live Rankings
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS market_pulse (
                     symbol TEXT PRIMARY KEY,
                     price REAL NOT NULL,
@@ -229,10 +235,12 @@ class ShadowDatabase:
                     low_24h REAL,
                     updated_at TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 10. 7-Factor Online Engine & Stepped Leverage Telemetry
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS seven_factor_telemetry (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     timestamp TEXT NOT NULL,
@@ -252,26 +260,31 @@ class ShadowDatabase:
                     factor_weights_json TEXT NOT NULL,
                     factor_tstats_json TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 11. Runtime Feature Flags (Hot-Reloadable)
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS feature_flags (
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # 12. Production Shield Invariants Telemetry (3 Reglas de Blindaje)
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS shield_invariants_telemetry (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     timestamp TEXT NOT NULL,
                     status TEXT NOT NULL,
                     details_json TEXT NOT NULL
                 );
-            """)
+            """
+            )
 
             # Indices
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_ts ON accounts(timestamp);")
@@ -485,9 +498,7 @@ class ShadowDatabase:
         """Returns all non-flat positions mapped to domain Position objects."""
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute(
-                "SELECT * FROM positions WHERE side != 'FLAT' AND quantity > 0"
-            )
+            cursor.execute("SELECT * FROM positions WHERE side != 'FLAT' AND quantity > 0")
             rows = cursor.fetchall()
             positions: dict[str, Position] = {}
             for r in rows:
@@ -530,11 +541,7 @@ class ShadowDatabase:
         client_order_id: str | None = None,
     ) -> None:
         """Inserts or updates an order in the database."""
-        created_str = (
-            order.created_at.isoformat()
-            if isinstance(order.created_at, datetime)
-            else str(order.created_at)
-        )
+        created_str = order.created_at.isoformat() if isinstance(order.created_at, datetime) else str(order.created_at)
         updated_str = datetime.now(timezone.utc).isoformat()
         side_val = order.side.value if hasattr(order.side, "value") else str(order.side)
         type_val = order.order_type.value if hasattr(order.order_type, "value") else str(order.order_type)
@@ -632,6 +639,30 @@ class ShadowDatabase:
             )
             return cursor.rowcount > 0
 
+    @staticmethod
+    def _row_to_order(row: sqlite3.Row) -> Order:
+        """Maps a SQLite orders row into a domain Order entity."""
+        status_str = row["status"]
+        status_enum = OrderStatus.CANCELED if status_str == "CANCELLED" else OrderStatus(status_str)
+        col_keys = row.keys() if hasattr(row, "keys") else []
+        strat = str(row["strategy"]) if ("strategy" in col_keys and row["strategy"] is not None) else None
+        created_dt = datetime.fromisoformat(row["created_at"])
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        return Order(
+            id=row["id"],
+            symbol=row["symbol"],
+            side=OrderSide(row["side"]),
+            order_type=OrderType(row["order_type"]),
+            quantity=float(row["quantity"]),
+            price=float(row["price"]) if row["price"] is not None else None,
+            status=status_enum,
+            filled_quantity=float(row["filled_quantity"]),
+            average_fill_price=float(row["average_fill_price"]),
+            created_at=created_dt,
+            strategy=strat,
+        )
+
     def get_order(self, order_id: str) -> Order | None:
         """Retrieves domain Order entity by id."""
         with self._lock:
@@ -640,30 +671,7 @@ class ShadowDatabase:
             row = cursor.fetchone()
             if not row:
                 return None
-
-            status_str = row["status"]
-            # Handle normalized status string
-            if status_str == "CANCELLED":
-                status_enum = OrderStatus.CANCELED
-            else:
-                status_enum = OrderStatus(status_str)
-
-            col_keys = row.keys() if hasattr(row, "keys") else []
-            strat = str(row["strategy"]) if ("strategy" in col_keys and row["strategy"] is not None) else None
-
-            return Order(
-                id=row["id"],
-                symbol=row["symbol"],
-                side=OrderSide(row["side"]),
-                order_type=OrderType(row["order_type"]),
-                quantity=float(row["quantity"]),
-                price=float(row["price"]) if row["price"] is not None else None,
-                status=status_enum,
-                filled_quantity=float(row["filled_quantity"]),
-                average_fill_price=float(row["average_fill_price"]),
-                created_at=datetime.fromisoformat(row["created_at"]),
-                strategy=strat,
-            )
+            return self._row_to_order(row)
 
     def get_pending_orders(self, symbol: str | None = None) -> list[Order]:
         """Retrieves all open or partially filled orders."""
@@ -675,34 +683,19 @@ class ShadowDatabase:
                     (symbol,),
                 )
             else:
-                cursor.execute(
-                    "SELECT * FROM orders WHERE status IN ('PENDING', 'PARTIALLY_FILLED')"
-                )
+                cursor.execute("SELECT * FROM orders WHERE status IN ('PENDING', 'PARTIALLY_FILLED')")
             rows = cursor.fetchall()
-            orders = []
-            for r in rows:
-                status_str = r["status"]
-                status_enum = (
-                    OrderStatus.CANCELED if status_str == "CANCELLED" else OrderStatus(status_str)
-                )
-                col_keys = r.keys() if hasattr(r, "keys") else []
-                strat = str(r["strategy"]) if ("strategy" in col_keys and r["strategy"] is not None) else None
-                orders.append(
-                    Order(
-                        id=r["id"],
-                        symbol=r["symbol"],
-                        side=OrderSide(r["side"]),
-                        order_type=OrderType(r["order_type"]),
-                        quantity=float(r["quantity"]),
-                        price=float(r["price"]) if r["price"] is not None else None,
-                        status=status_enum,
-                        filled_quantity=float(r["filled_quantity"]),
-                        average_fill_price=float(r["average_fill_price"]),
-                        created_at=datetime.fromisoformat(r["created_at"]),
-                        strategy=strat,
-                    )
-                )
-            return orders
+            return [self._row_to_order(r) for r in rows]
+
+    def get_recent_orders(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Returns recent order rows ordered by creation time descending."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(r) for r in cursor.fetchall()]
 
     # -------------------------------------------------------------------------
     # Trade Operations
@@ -716,11 +709,7 @@ class ShadowDatabase:
         strategy: str | None = None,
     ) -> None:
         """Records an executed trade in the database."""
-        ts = (
-            trade.timestamp.isoformat()
-            if isinstance(trade.timestamp, datetime)
-            else str(trade.timestamp)
-        )
+        ts = trade.timestamp.isoformat() if isinstance(trade.timestamp, datetime) else str(trade.timestamp)
         notional = float(trade.price * trade.quantity)
         side_val = trade.side.value if hasattr(trade.side, "value") else str(trade.side)
         strat_val = strategy or getattr(trade, "strategy", None)
@@ -956,9 +945,15 @@ class ShadowDatabase:
                     status = excluded.status;
                 """,
                 (
-                    now, ws_state, symbols_count, total_ticks,
-                    ticks_per_sec, last_tick_time, last_rebalance_time,
-                    next_rebalance_in_sec, status
+                    now,
+                    ws_state,
+                    symbols_count,
+                    total_ticks,
+                    ticks_per_sec,
+                    last_tick_time,
+                    last_rebalance_time,
+                    next_rebalance_in_sec,
+                    status,
                 ),
             )
 
@@ -1005,9 +1000,7 @@ class ShadowDatabase:
     def get_market_pulse(self) -> list[dict[str, Any]]:
         """Retrieves market pulse for all monitored symbols ordered by change_24h descending."""
         with self._lock:
-            rows = self._conn.cursor().execute(
-                "SELECT * FROM market_pulse ORDER BY change_24h DESC;"
-            ).fetchall()
+            rows = self._conn.cursor().execute("SELECT * FROM market_pulse ORDER BY change_24h DESC;").fetchall()
             return [dict(r) for r in rows]
 
     def save_seven_factor_telemetry(
@@ -1082,9 +1075,7 @@ class ShadowDatabase:
     def get_latest_seven_factor_telemetry(self) -> dict[str, Any] | None:
         """Retrieves the latest 7-Factor & Stepped Leverage telemetry snapshot."""
         with self._lock:
-            row = self._conn.cursor().execute(
-                "SELECT * FROM seven_factor_telemetry WHERE id = 1;"
-            ).fetchone()
+            row = self._conn.cursor().execute("SELECT * FROM seven_factor_telemetry WHERE id = 1;").fetchone()
             if not row:
                 return None
             res = dict(row)
@@ -1120,9 +1111,7 @@ class ShadowDatabase:
     def get_feature_flags(self) -> dict[str, Any]:
         """Retrieves all stored feature flags as a dictionary."""
         with self._lock:
-            rows = self._conn.cursor().execute(
-                "SELECT key, value_json FROM feature_flags;"
-            ).fetchall()
+            rows = self._conn.cursor().execute("SELECT key, value_json FROM feature_flags;").fetchall()
             out: dict[str, Any] = {}
             for r in rows:
                 try:
@@ -1155,9 +1144,7 @@ class ShadowDatabase:
     def get_latest_shield_invariants_telemetry(self) -> dict[str, Any] | None:
         """Retrieves the latest production shield & 4 invariants telemetry snapshot."""
         with self._lock:
-            row = self._conn.cursor().execute(
-                "SELECT * FROM shield_invariants_telemetry WHERE id = 1;"
-            ).fetchone()
+            row = self._conn.cursor().execute("SELECT * FROM shield_invariants_telemetry WHERE id = 1;").fetchone()
             if not row:
                 return None
             res = dict(row)

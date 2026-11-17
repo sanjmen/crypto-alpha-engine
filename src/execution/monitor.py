@@ -6,14 +6,16 @@ live WebSocket heartbeat, and 24h market pulse / anomaly radar.
 """
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
-import json
 import logging
 import os
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from src.execution.database import DEFAULT_DB_PATH, ShadowDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +26,10 @@ try:
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
-from src.execution.database import DEFAULT_DB_PATH, ShadowDatabase
 
 
 class ShadowMonitor:
@@ -38,7 +37,7 @@ class ShadowMonitor:
     Renders live telemetry, WebSocket pulse, and risk dashboards from the local SQLite shadow database.
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, console: Optional[Console] = None):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, console: Console | None = None):
         self.db_path = db_path
         self.console = console or (Console() if HAS_RICH else None)
 
@@ -58,21 +57,25 @@ class ShadowMonitor:
                 return None
 
         db = self._get_database()
-        latest_acc = db.get_latest_account()
-        open_positions = db.get_open_positions()
-        recent_orders = db._conn.cursor().execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 10").fetchall()
-        recent_trades = db.get_trades(limit=8)
-        trades_24h = db.get_trades_24h()
-        recent_funding = db.get_funding_settlements(limit=4)
-        latest_rebalance = db.get_latest_rebalance_snapshot()
-        heartbeat = db.get_daemon_heartbeat()
-        market_pulse = db.get_market_pulse()
-        sf_telemetry = (
-            db.get_latest_seven_factor_telemetry()
-            if hasattr(db, "get_latest_seven_factor_telemetry")
-            else None
-        )
-        db.close()
+        try:
+            latest_acc = db.get_latest_account()
+            open_positions = db.get_open_positions()
+            recent_orders = (
+                db.get_recent_orders(limit=10)
+                if hasattr(db, "get_recent_orders")
+                else db._conn.cursor().execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 10").fetchall()
+            )
+            recent_trades = db.get_trades(limit=8)
+            trades_24h = db.get_trades_24h()
+            recent_funding = db.get_funding_settlements(limit=4)
+            latest_rebalance = db.get_latest_rebalance_snapshot()
+            heartbeat = db.get_daemon_heartbeat()
+            market_pulse = db.get_market_pulse()
+            sf_telemetry = (
+                db.get_latest_seven_factor_telemetry() if hasattr(db, "get_latest_seven_factor_telemetry") else None
+            )
+        finally:
+            db.close()
 
         if not latest_acc:
             if HAS_RICH:
@@ -111,16 +114,16 @@ class ShadowMonitor:
 
     def _build_rich_layout(
         self,
-        account: Dict,
-        positions: Dict,
-        orders: List,
-        trades: List,
-        trades_24h: List,
-        funding: List,
-        rebalance: Optional[Dict],
-        heartbeat: Optional[Dict],
-        market_pulse: List[Dict],
-        sf_telemetry: Optional[Dict] = None,
+        account: dict,
+        positions: dict,
+        orders: list,
+        trades: list,
+        trades_24h: list,
+        funding: list,
+        rebalance: dict | None,
+        heartbeat: dict | None,
+        market_pulse: list[dict],
+        sf_telemetry: dict | None = None,
     ) -> Layout:
         layout = Layout()
         layout.split_column(
@@ -165,13 +168,17 @@ class ShadowMonitor:
         # Row 1: Market & Engine Status
         if is_live_prod:
             header_text.append(" MERCADO: ", style="bold white on green")
-            header_text.append(" 🟢 PRODUCCIÓN EN VIVO — Binance USDS-M Futures (Capital Real)  |  ", style="bold green")
+            header_text.append(
+                " 🟢 PRODUCCIÓN EN VIVO — Binance USDS-M Futures (Capital Real)  |  ", style="bold green"
+            )
         elif is_testnet:
             header_text.append(" MERCADO: ", style="bold black on yellow")
             header_text.append(" 🟡 BINANCE FUTURES TESTNET — Entorno de Pruebas API  |  ", style="bold yellow")
         else:
             header_text.append(" MERCADO: ", style="bold white on blue")
-            header_text.append(" 🔵 SHADOW LAB — Binance Futures Mainnet (Solo Lectura - 0 Riesgo de Capital)  |  ", style="cyan")
+            header_text.append(
+                " 🔵 SHADOW LAB — Binance Futures Mainnet (Solo Lectura - 0 Riesgo de Capital)  |  ", style="cyan"
+            )
 
         if heartbeat:
             ws_state = heartbeat.get("ws_state", "CONNECTED")
@@ -216,7 +223,7 @@ class ShadowMonitor:
                 header_text.append("○ DETENIDO / EN ESPERA", style="bold yellow")
                 header_text.append(f" (Último pulso hace {idle_min}m - Inicia --daemon)\n", style="yellow")
 
-            header_text.append(f" TELEMETRÍA EN VIVO: ", style="bold white on dark_green")
+            header_text.append(" TELEMETRÍA EN VIVO: ", style="bold white on dark_green")
             header_text.append(f" Streams Activos: {symbols_count}  |  ", style="bold white")
             header_text.append(f"Ticks Recibidos: {total_ticks:,} (~{tps:.1f} ticks/s)  |  ", style="white")
             header_text.append(f"Último Tick: hace {age_text}  |  ", style="cyan")
@@ -251,12 +258,20 @@ class ShadowMonitor:
             net_usd = long_usd - short_usd
 
             header_text.append("\n ESCALADO 2.5x→5.0x: ", style="bold black on cyan")
-            header_text.append(f" Tier: {u_tier:.1f}x (Activo: {act_lev:.1f}x × Vol72h: {v_sc:.2f}x = {eff_lev:.2f}x)  |  ", style="bold cyan")
-            header_text.append(f"HWM: ${hwm_val:,.2f} → Meta {nxt_tier:.1f}x: ${nxt_hwm:,.2f} [{prog_pct:.1f}%]  |  ", style="bold yellow")
+            header_text.append(
+                f" Tier: {u_tier:.1f}x (Activo: {act_lev:.1f}x × Vol72h: {v_sc:.2f}x = {eff_lev:.2f}x)  |  ",
+                style="bold cyan",
+            )
+            header_text.append(
+                f"HWM: ${hwm_val:,.2f} → Meta {nxt_tier:.1f}x: ${nxt_hwm:,.2f} [{prog_pct:.1f}%]  |  ",
+                style="bold yellow",
+            )
             header_text.append(f"Net $: ${net_usd:+,.2f}  |  Beta BTC: {p_beta:+.3f}", style="bold green")
 
         if is_live_prod:
-            panel_title = "[bold green]CRYPTO-ALPHA-ENGINE: LIVE PRODUCTION TRADING (7-FACTOR CAUSAL ENGINE)[/bold green]"
+            panel_title = (
+                "[bold green]CRYPTO-ALPHA-ENGINE: LIVE PRODUCTION TRADING (7-FACTOR CAUSAL ENGINE)[/bold green]"
+            )
         elif is_testnet:
             panel_title = "[bold yellow]CRYPTO-ALPHA-ENGINE: TESTNET TRADING LAB (7-FACTOR CAUSAL ENGINE)[/bold yellow]"
         else:
@@ -264,7 +279,9 @@ class ShadowMonitor:
         layout["header"].update(Panel(header_text, title=panel_title))
 
         # 2. Left Column: Positions Table
-        pos_table = Table(title="Inventario de Posiciones Abiertas", expand=True, header_style="bold magenta", pad_edge=False)
+        pos_table = Table(
+            title="Inventario de Posiciones Abiertas", expand=True, header_style="bold magenta", pad_edge=False
+        )
         pos_table.add_column("Símbolo", style="bold white", min_width=11, no_wrap=True)
         pos_table.add_column("Factor", style="cyan", min_width=8, no_wrap=True)
         pos_table.add_column("Lado", justify="center", min_width=5, no_wrap=True)
@@ -313,7 +330,9 @@ class ShadowMonitor:
                     sl_pnl_val = p.sl_pnl_usd or 0.0
                     sl_pct_val = p.sl_pnl_pct or 0.0
                     if getattr(p, "is_profit_locked", False) or sl_pnl_val > 0:
-                        sl_text = Text(f"🔒 {sl_price_fmt} (+${sl_pnl_val:,.2f} | {sl_pct_val:+.1f}%)", style="bold green")
+                        sl_text = Text(
+                            f"🔒 {sl_price_fmt} (+${sl_pnl_val:,.2f} | {sl_pct_val:+.1f}%)", style="bold green"
+                        )
                     else:
                         sl_text = Text(f"{sl_price_fmt} (${sl_pnl_val:+,.2f} | {sl_pct_val:+.0f}%)", style="bold red")
                 else:
@@ -372,7 +391,7 @@ class ShadowMonitor:
 
                 pulse_table.add_row(
                     sym,
-                    f"${float(item['price']):,.2f}" if float(item['price']) >= 1.0 else f"${float(item['price']):.4f}",
+                    f"${float(item['price']):,.2f}" if float(item["price"]) >= 1.0 else f"${float(item['price']):.4f}",
                     Text(f"{chg:+.2f}%", style=chg_style),
                     f"${vol_m:,.1f}M",
                     radar,
@@ -468,8 +487,14 @@ class ShadowMonitor:
 
             for s in strat_defs:
                 sid = s["id"]
-                pos_count = sum(1 for p in positions.values() if _strat_match(p.strategy, p.symbol, p.side.value) == sid)
-                matching_trades = [t for t in (trades_24h or []) if _strat_match(t.get("strategy"), t.get("symbol", ""), t.get("side", "")) == sid]
+                pos_count = sum(
+                    1 for p in positions.values() if _strat_match(p.strategy, p.symbol, p.side.value) == sid
+                )
+                matching_trades = [
+                    t
+                    for t in (trades_24h or [])
+                    if _strat_match(t.get("strategy"), t.get("symbol", ""), t.get("side", "")) == sid
+                ]
                 trd_count = len(matching_trades)
                 rpnl = sum(float(t.get("realized_pnl", 0.0)) for t in matching_trades)
 
@@ -509,7 +534,7 @@ class ShadowMonitor:
                 cf_color = "green" if cf >= 0 else "red"
                 fnd_table.add_row(
                     f["symbol"],
-                    f"{float(f['funding_rate'])*100:+.4f}%",
+                    f"{float(f['funding_rate']) * 100:+.4f}%",
                     f["position_side"],
                     Text(f"${cf:+,.2f}", style=cf_color),
                 )
@@ -662,14 +687,22 @@ class ShadowMonitor:
         print("\n" + "=" * 80)
         print(" CRYPTO-ALPHA-ENGINE: LIVE SHADOW TRADING (Binance Mainnet Read-Only)")
         if heartbeat:
-            print(f" Status: ONLINE | Streams: {heartbeat.get('symbols_count')} | Ticks: {heartbeat.get('total_ticks')} (~{heartbeat.get('ticks_per_sec')} t/s)")
-        print(f" Equity: ${equity:,.2f} | Cash: ${cash:,.2f} | uPnL: ${account['unrealized_pnl']:+,.2f} | PnL: ${account['realized_pnl']:+,.2f}")
+            print(
+                f" Status: ONLINE | Streams: {heartbeat.get('symbols_count')} | Ticks: {heartbeat.get('total_ticks')} (~{heartbeat.get('ticks_per_sec')} t/s)"
+            )
+        print(
+            f" Equity: ${equity:,.2f} | Cash: ${cash:,.2f} | uPnL: ${account['unrealized_pnl']:+,.2f} | PnL: ${account['realized_pnl']:+,.2f}"
+        )
         print(" Posiciones Abiertas:")
         for sym, p in positions.items():
-            print(f"  - {sym} ({getattr(p, 'strategy', 'Meta')}): {p.side.value} {p.quantity} @ ${p.entry_price:,.4f} (uPnL: ${p.unrealized_pnl:+,.2f})")
+            print(
+                f"  - {sym} ({getattr(p, 'strategy', 'Meta')}): {p.side.value} {p.quantity} @ ${p.entry_price:,.4f} (uPnL: ${p.unrealized_pnl:+,.2f})"
+            )
         print(" Últimos Trades:")
         for t in trades[:6]:
-            print(f"  - [{t['id'][:10]}] {t['symbol']} {t['side']} {float(t['quantity']):,.2f} @ ${float(t['price']):,.4f} | PnL: ${float(t.get('realized_pnl', 0.0)):+,.2f}")
+            print(
+                f"  - [{t['id'][:10]}] {t['symbol']} {t['side']} {float(t['quantity']):,.2f} @ ${float(t['price']):,.4f} | PnL: ${float(t.get('realized_pnl', 0.0)):+,.2f}"
+            )
         print("=" * 80 + "\n")
 
     def _get_pid_file_path(self) -> str:
@@ -708,7 +741,7 @@ class ShadowMonitor:
         except OSError:
             return True
 
-    def reclaim_stale_monitors(self, proc_root: str = "/proc") -> List[int]:
+    def reclaim_stale_monitors(self, proc_root: str = "/proc") -> list[int]:
         """
         Ensures only one live dashboard process runs at a time per database/container:
         1. Reclaims any previous PID recorded in `<db_path>.monitor.pid`.
@@ -716,13 +749,13 @@ class ShadowMonitor:
            and terminates it before writing the current process PID lockfile.
         """
         my_pid = os.getpid()
-        reclaimed: List[int] = []
+        reclaimed: list[int] = []
         pid_file = self._get_pid_file_path()
 
         # 1. Check PID lockfile
         if os.path.exists(pid_file):
             try:
-                with open(pid_file, "r", encoding="utf-8") as f:
+                with open(pid_file, encoding="utf-8") as f:
                     old_pid = int(f.read().strip())
                 if old_pid > 1 and old_pid != my_pid:
                     cmdline_path = os.path.join(proc_root, str(old_pid), "cmdline")
@@ -768,7 +801,11 @@ class ShadowMonitor:
                         continue
                     if is_testnet_db and ("--shadow" in args_list or "--mainnet" in args_list):
                         continue
-                    if not is_mainnet_db and not is_testnet_db and ("--mainnet" in args_list or "--testnet" in args_list):
+                    if (
+                        not is_mainnet_db
+                        and not is_testnet_db
+                        and ("--mainnet" in args_list or "--testnet" in args_list)
+                    ):
                         continue
                     if self._terminate_pid_safely(pid):
                         reclaimed.append(pid)
@@ -794,7 +831,7 @@ class ShadowMonitor:
         pid_file = self._get_pid_file_path()
         try:
             if os.path.exists(pid_file):
-                with open(pid_file, "r", encoding="utf-8") as f:
+                with open(pid_file, encoding="utf-8") as f:
                     recorded = f.read().strip()
                 if recorded == str(os.getpid()):
                     os.remove(pid_file)
@@ -852,10 +889,8 @@ class ShadowMonitor:
             for sig_name in ("SIGHUP", "SIGTERM"):
                 sig_val = getattr(signal, sig_name, None)
                 if sig_val is not None:
-                    try:
+                    with contextlib.suppress(ValueError, OSError):
                         signal.signal(sig_val, _handle_disconnect_signal)
-                    except (ValueError, OSError):
-                        pass
 
             if not HAS_RICH:
                 print("Running in non-rich mode...")

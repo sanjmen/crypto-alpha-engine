@@ -86,6 +86,7 @@ def test_dry_run_successful_execution():
 
 def test_adapter_initialization_with_credentials():
     from src.security.vault import ExchangeCredentials
+
     creds = ExchangeCredentials(
         exchange_id="binance",
         api_key="mock_key_12345",
@@ -94,4 +95,3 @@ def test_adapter_initialization_with_credentials():
     adapter = CCXTExecutionAdapter(credentials=creds, dry_run=True)
     assert adapter.client.apiKey == "mock_key_12345"
     assert adapter.client.secret == "mock_secret_67890"
-

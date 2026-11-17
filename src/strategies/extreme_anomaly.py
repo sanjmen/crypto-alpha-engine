@@ -1,40 +1,72 @@
 """
 Extreme Anomaly & Illiquid Tail Alpha Strategies.
-Addresses Issue: Extreme 24h Gainers & Losers (Pump & Dump Exploitation).
+Addresses Extreme 24h Gainers & Losers (Pump & Dump Exploitation).
 
-Provides 3 core statistical strategies with dedicated parameter presets
-for both Liquid Core assets and the Illiquid Tail (6 strategies total):
+Provides statistical anomaly strategies with dedicated parameter presets
+for both Liquid Core assets and the Illiquid Tail:
 1. Oversold Flush & Bounce Strategy (LONG on liquidation flushes / severe dumps).
 2. Early Breakout Momentum Strategy (LONG on early volume/price breakout before UI ranking).
 3. Pump & Funding Squeeze Fade Strategy (SHORT on overextended pumps with extreme funding rates).
-
-Features configurable position sizing with a conservative test phase (e.g. $15 USDT for 48-96h)
-and full production scaling (up to $100 USDT).
+4. Extreme Funding Rate Harvester Strategy (LONG/SHORT on extreme perpetual funding rates).
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
 from src.domain.entities import Portfolio, Signal
 from src.ports.model_ports import IStrategy
 
-# Canonical liquid assets vs illiquid tail classification
 LIQUID_CORE_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "NEARUSDT",
+    "SUIUSDT",
+    "APTUSDT",
 ]
 
 ILLIQUID_TAIL_SYMBOLS = [
-    "OGNUSDT", "RLCUSDT", "GTCUSDT", "BATUSDT", "MEMEUSDT", "CTSIUSDT",
-    "1INCHUSDT", "MAGICUSDT", "FLOWUSDT", "SKLUSDT", "IOTAUSDT", "KSMUSDT",
-    "CHZUSDT", "ZILUSDT", "COMPUSDT", "CRVUSDT"
+    "OGNUSDT",
+    "RLCUSDT",
+    "GTCUSDT",
+    "BATUSDT",
+    "MEMEUSDT",
+    "CTSIUSDT",
+    "1INCHUSDT",
+    "MAGICUSDT",
+    "FLOWUSDT",
+    "SKLUSDT",
+    "IOTAUSDT",
+    "KSMUSDT",
+    "CHZUSDT",
+    "ZILUSDT",
+    "COMPUSDT",
+    "CRVUSDT",
 ]
+
+FUNDING_COLUMN_CANDIDATES = ("rate", "funding_rate", "fundingRate", "lastFundingRate", "last_funding_rate")
+
+
+def _extract_latest_funding_rate(funding_df: pd.DataFrame) -> float:
+    """Safely extracts the latest numeric funding rate from a funding DataFrame."""
+    for col in FUNDING_COLUMN_CANDIDATES:
+        if col in funding_df.columns and not funding_df[col].empty:
+            val = pd.to_numeric(funding_df[col].iloc[-1], errors="coerce")
+            if pd.notna(val) and np.isfinite(float(val)):
+                return float(val)
+    return 0.0
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Computes relative strength index (RSI) on price series."""
+    """Computes strictly causal relative strength index (RSI) on price series."""
     if len(series) < period + 1:
         return pd.Series(50.0, index=series.index)
     delta = series.diff()
@@ -43,22 +75,21 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
 
-    # Where avg_loss is 0, RSI is 100 (or 50 if both gain and loss are 0)
     rs = np.where(avg_loss == 0.0, np.where(avg_gain == 0.0, 1.0, 1000.0), avg_gain / (avg_loss + 1e-8))
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    return pd.Series(rsi, index=series.index).bfill().fillna(50.0)
+    return pd.Series(rsi, index=series.index).ffill().fillna(50.0)
 
 
 def compute_anomaly_confluence_size(
     strategy_type: str,
-    metadata: Dict[str, float],
+    metadata: dict[str, float],
     mkt_disp_24h: float = 0.030,
     min_notional: float = 10.0,
     max_notional: float = 25.0,
 ) -> tuple[float, float]:
     """
-    Computes the multi-factor confluence score `c` in [0.0, 1.0] and maps it linearly
-    to a dynamic position size in `[min_notional, max_notional]` (Issue #50).
+    Computes the multi-factor confluence score in [0.0, 1.0] and maps it linearly
+    to a dynamic position size in `[min_notional, max_notional]`.
     Returns `(recommended_notional, confluence_score)`.
     """
     ret_24h = float(metadata.get("ret_24h", 0.0))
@@ -66,40 +97,99 @@ def compute_anomaly_confluence_size(
     rsi = float(metadata.get("rsi", 50.0))
     vol_ratio = float(metadata.get("vol_ratio", 1.5))
     funding_rate = float(metadata.get("funding_rate", 0.0))
-    s_disp = float(np.clip((mkt_disp_24h - 0.020) / 0.030, 0.0, 1.0))
+    dispersion_score = float(np.clip((mkt_disp_24h - 0.020) / 0.030, 0.0, 1.0))
 
-    stype = strategy_type.lower()
-    if "bounce" in stype or "drop" in stype or "oversold" in stype:
-        s_depth = float(np.clip((abs(ret_24h) - 0.18) / 0.08, 0.0, 1.0))
-        s_rsi = float(np.clip((25.0 - rsi) / 12.0, 0.0, 1.0))
-        s_vol = float(np.clip((vol_ratio - 1.2) / 3.0, 0.0, 1.0))
-        conf = float(np.clip(0.35 * s_depth + 0.30 * s_rsi + 0.20 * s_vol + 0.15 * s_disp, 0.0, 1.0))
-    elif "breakout" in stype:
-        s_imp = float(np.clip((ret_4h - 0.10) / 0.06, 0.0, 1.0))
-        s_vol = float(np.clip((vol_ratio - 3.5) / 4.5, 0.0, 1.0))
-        s_sweet = float(1.0 - np.clip(abs(ret_24h - 0.16) / 0.06, 0.0, 1.0))
-        conf = float(np.clip(0.35 * s_imp + 0.30 * s_vol + 0.20 * s_sweet + 0.15 * s_disp, 0.0, 1.0))
-    elif "harvester" in stype:
-        abs_f = abs(funding_rate)
-        s_fund = float(np.clip((abs_f - 0.0012) / 0.0035, 0.0, 1.0))
-        s_vol = float(np.clip((vol_ratio - 1.0) / 3.0, 0.0, 1.0))
+    strategy_key = strategy_type.lower()
+    if "bounce" in strategy_key or "drop" in strategy_key or "oversold" in strategy_key:
+        depth_score = float(np.clip((abs(ret_24h) - 0.18) / 0.08, 0.0, 1.0))
+        rsi_score = float(np.clip((25.0 - rsi) / 12.0, 0.0, 1.0))
+        vol_score = float(np.clip((vol_ratio - 1.2) / 3.0, 0.0, 1.0))
+        confluence = float(
+            np.clip(0.35 * depth_score + 0.30 * rsi_score + 0.20 * vol_score + 0.15 * dispersion_score, 0.0, 1.0)
+        )
+    elif "breakout" in strategy_key:
+        impulse_score = float(np.clip((ret_4h - 0.10) / 0.06, 0.0, 1.0))
+        vol_score = float(np.clip((vol_ratio - 3.5) / 4.5, 0.0, 1.0))
+        sweetspot_score = float(1.0 - np.clip(abs(ret_24h - 0.16) / 0.06, 0.0, 1.0))
+        confluence = float(
+            np.clip(
+                0.35 * impulse_score + 0.30 * vol_score + 0.20 * sweetspot_score + 0.15 * dispersion_score,
+                0.0,
+                1.0,
+            )
+        )
+    elif "harvester" in strategy_key:
+        abs_funding = abs(funding_rate)
+        funding_score = float(np.clip((abs_funding - 0.0012) / 0.0035, 0.0, 1.0))
+        vol_score = float(np.clip((vol_ratio - 1.0) / 3.0, 0.0, 1.0))
         if funding_rate < 0:
-            s_mom = float(np.clip((ret_4h + 0.03) / 0.08, 0.0, 1.0))
+            momentum_score = float(np.clip((ret_4h + 0.03) / 0.08, 0.0, 1.0))
         else:
-            s_mom = float(np.clip((rsi - 58.0) / 22.0, 0.0, 1.0))
-        conf = float(np.clip(0.50 * s_fund + 0.20 * s_vol + 0.15 * s_mom + 0.15 * s_disp, 0.0, 1.0))
-    else:  # Pump & Funding Fade
-        s_pump = float(np.clip((ret_24h - 0.25) / 0.20, 0.0, 1.0))
-        s_fund = float(np.clip((funding_rate - 0.0005) / 0.0015, 0.0, 1.0))
-        s_rsi = float(np.clip((rsi - 72.0) / 15.0, 0.0, 1.0))
-        conf = float(np.clip(0.35 * s_pump + 0.35 * s_fund + 0.15 * s_rsi + 0.15 * s_disp, 0.0, 1.0))
+            momentum_score = float(np.clip((rsi - 58.0) / 22.0, 0.0, 1.0))
+        confluence = float(
+            np.clip(
+                0.50 * funding_score + 0.20 * vol_score + 0.15 * momentum_score + 0.15 * dispersion_score,
+                0.0,
+                1.0,
+            )
+        )
+    else:
+        pump_score = float(np.clip((ret_24h - 0.25) / 0.20, 0.0, 1.0))
+        funding_score = float(np.clip((funding_rate - 0.0005) / 0.0015, 0.0, 1.0))
+        rsi_score = float(np.clip((rsi - 72.0) / 15.0, 0.0, 1.0))
+        confluence = float(
+            np.clip(0.35 * pump_score + 0.35 * funding_score + 0.15 * rsi_score + 0.15 * dispersion_score, 0.0, 1.0)
+        )
 
     span = max(0.0, float(max_notional) - float(min_notional))
-    notional = float(np.round(float(min_notional) + span * conf, 2))
-    return notional, round(conf, 4)
+    notional = float(np.round(float(min_notional) + span * confluence, 2))
+    return notional, round(confluence, 4)
 
 
-class OversoldBounceStrategy(IStrategy):
+class BaseAnomalyStrategy(IStrategy):
+    """
+    Shared base class for event-driven anomaly strategies.
+    Encapsulates universe filtering and capped dollar-weight allocation.
+    """
+
+    def __init__(
+        self,
+        max_position_usd: float = 15.0,
+        max_portfolio_allocation: float = 0.15,
+        symbols_filter: list[str] | None = None,
+        name: str = "BaseAnomaly",
+    ) -> None:
+        self.max_position_usd = max_position_usd
+        self.max_portfolio_allocation = max_portfolio_allocation
+        self.symbols_filter = set(symbols_filter) if symbols_filter else None
+        self.name = name
+
+    def _passes_universe_filter(self, symbol: str, df: pd.DataFrame, min_bars: int = 26) -> bool:
+        if self.symbols_filter and symbol not in self.symbols_filter:
+            return False
+        return len(df) >= min_bars
+
+    def allocate_weights(
+        self,
+        signals: list[Signal],
+        portfolio: Portfolio,
+        volatilities: dict[str, float],
+    ) -> dict[str, float]:
+        allocations: dict[str, float] = {}
+        if not signals:
+            return allocations
+
+        total_equity = max(portfolio.total_equity, 100.0)
+        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
+
+        for sig in signals:
+            sign = 1.0 if sig.score >= 0 else -1.0
+            allocations[sig.symbol] = round(sign * cap_usd * abs(sig.score), 2)
+
+        return allocations
+
+
+class OversoldBounceStrategy(BaseAnomalyStrategy):
     """
     Oversold Flush & Bounce Strategy (LONG).
     Harvests violent mean-reversion bounces after rapid liquidation flushes.
@@ -107,28 +197,28 @@ class OversoldBounceStrategy(IStrategy):
 
     def __init__(
         self,
-        dump_threshold_24h: float = -0.15,      # 24h price drop (e.g. -15% or -18%)
-        rsi_threshold: float = 28.0,            # RSI oversold ceiling
-        max_position_usd: float = 15.0,         # Test mode: $15 USDT (Prod: $100 USDT)
-        max_portfolio_allocation: float = 0.15, # Max 15% of portfolio per asset
-        symbols_filter: Optional[List[str]] = None,
+        dump_threshold_24h: float = -0.15,
+        rsi_threshold: float = 28.0,
+        max_position_usd: float = 15.0,
+        max_portfolio_allocation: float = 0.15,
+        symbols_filter: list[str] | None = None,
         name: str = "OversoldBounce",
-    ):
+    ) -> None:
+        super().__init__(
+            max_position_usd=max_position_usd,
+            max_portfolio_allocation=max_portfolio_allocation,
+            symbols_filter=symbols_filter,
+            name=name,
+        )
         self.dump_threshold_24h = dump_threshold_24h
         self.rsi_threshold = rsi_threshold
-        self.max_position_usd = max_position_usd
-        self.max_portfolio_allocation = max_portfolio_allocation
-        self.symbols_filter = set(symbols_filter) if symbols_filter else None
-        self.name = name
 
-    def generate_signals(self, market_data: Dict[str, pd.DataFrame]) -> List[Signal]:
-        signals: List[Signal] = []
+    def generate_signals(self, market_data: dict[str, pd.DataFrame]) -> list[Signal]:
+        signals: list[Signal] = []
         now = datetime.now(timezone.utc)
 
         for sym, df in market_data.items():
-            if self.symbols_filter and sym not in self.symbols_filter:
-                continue
-            if len(df) < 26:
+            if not self._passes_universe_filter(sym, df, min_bars=26):
                 continue
 
             closes = df["close"]
@@ -140,8 +230,7 @@ class OversoldBounceStrategy(IStrategy):
                 rng_1h = float(df["high"].iloc[-1]) - float(df["low"].iloc[-1])
                 if rng_1h > 1e-8:
                     bar_pos = (float(closes.iloc[-1]) - float(df["low"].iloc[-1])) / rng_1h
-            rsi_series = calculate_rsi(closes, period=14)
-            rsi_curr = float(rsi_series.iloc[-1])
+            rsi_curr = float(calculate_rsi(closes, period=14).iloc[-1])
             vol_ratio = 1.5
             if "volume" in df.columns:
                 volumes = df["volume"]
@@ -149,22 +238,18 @@ class OversoldBounceStrategy(IStrategy):
                 vol_mean_24h = float(volumes.iloc[-25:-1].mean()) + 1e-6
                 vol_ratio = vol_curr / vol_mean_24h
 
-            # Anti-falling-knife guard: block entry during a violent vertical crash bar (ret_1h < -4.0%)
-            # or when the current 1h bar is closing at its dead low without a rejection wick.
             if ret_1h < -0.040 or (ret_1h < -0.025 and bar_pos < 0.25):
                 continue
 
-            # Flush condition: severe 24h drop and oversold RSI
             if ret_24h <= self.dump_threshold_24h and rsi_curr <= self.rsi_threshold:
-                # Severity score between 0.5 and 1.0 based on dump depth
                 score = float(np.clip(abs(ret_24h) / abs(self.dump_threshold_24h), 0.5, 1.0))
                 signals.append(
                     Signal(
                         timestamp=now,
                         symbol=sym,
-                        score=score,  # Positive indicates LONG
+                        score=score,
                         confidence=0.85,
-                        horizon_minutes=1440,  # 24h holding period
+                        horizon_minutes=1440,
                         metadata={
                             "ret_24h": ret_24h,
                             "ret_4h": ret_4h,
@@ -179,26 +264,8 @@ class OversoldBounceStrategy(IStrategy):
 
         return signals
 
-    def allocate_weights(
-        self,
-        signals: List[Signal],
-        portfolio: Portfolio,
-        volatilities: Dict[str, float],
-    ) -> Dict[str, float]:
-        allocations: Dict[str, float] = {}
-        if not signals:
-            return allocations
 
-        total_equity = max(portfolio.total_equity, 100.0)
-        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
-
-        for sig in signals:
-            allocations[sig.symbol] = round(cap_usd * sig.score, 2)
-
-        return allocations
-
-
-class EarlyBreakoutStrategy(IStrategy):
+class EarlyBreakoutStrategy(BaseAnomalyStrategy):
     """
     Early Breakout Momentum Strategy (LONG).
     Catches volume and price breakouts at the beginning of an expansion (+8% in 4h with 2.5x volume),
@@ -207,30 +274,30 @@ class EarlyBreakoutStrategy(IStrategy):
 
     def __init__(
         self,
-        pump_threshold_4h: float = 0.08,        # +8% in 4 hours
-        volume_multiplier: float = 2.5,         # Volume >= 2.5x 24h average
-        max_24h_pump_ceiling: float = 0.22,     # Must NOT have already pumped > 22% (prevents late FOMO)
-        max_position_usd: float = 15.0,         # Test mode: $15 USDT (Prod: $100 USDT)
+        pump_threshold_4h: float = 0.08,
+        volume_multiplier: float = 2.5,
+        max_24h_pump_ceiling: float = 0.22,
+        max_position_usd: float = 15.0,
         max_portfolio_allocation: float = 0.15,
-        symbols_filter: Optional[List[str]] = None,
+        symbols_filter: list[str] | None = None,
         name: str = "EarlyBreakout",
-    ):
+    ) -> None:
+        super().__init__(
+            max_position_usd=max_position_usd,
+            max_portfolio_allocation=max_portfolio_allocation,
+            symbols_filter=symbols_filter,
+            name=name,
+        )
         self.pump_threshold_4h = pump_threshold_4h
         self.volume_multiplier = volume_multiplier
         self.max_24h_pump_ceiling = max_24h_pump_ceiling
-        self.max_position_usd = max_position_usd
-        self.max_portfolio_allocation = max_portfolio_allocation
-        self.symbols_filter = set(symbols_filter) if symbols_filter else None
-        self.name = name
 
-    def generate_signals(self, market_data: Dict[str, pd.DataFrame]) -> List[Signal]:
-        signals: List[Signal] = []
+    def generate_signals(self, market_data: dict[str, pd.DataFrame]) -> list[Signal]:
+        signals: list[Signal] = []
         now = datetime.now(timezone.utc)
 
         for sym, df in market_data.items():
-            if self.symbols_filter and sym not in self.symbols_filter:
-                continue
-            if len(df) < 26:
+            if not self._passes_universe_filter(sym, df, min_bars=26):
                 continue
 
             closes = df["close"]
@@ -246,118 +313,94 @@ class EarlyBreakoutStrategy(IStrategy):
             vol_mean_24h = float(volumes.iloc[-25:-1].mean()) + 1e-6
             vol_ratio = vol_curr / vol_mean_24h
 
-            # Anti-wick-blowoff guard: price must hold within 3.5% of the 4h high (no upper-wick rejection),
-            # the current 1h bar must be constructive (0.0 <= ret_1h <= 0.09), and >=2 of last 4 bars up.
             if float(closes.iloc[-1]) < high_4h * 0.965 or ret_1h < 0.0 or ret_1h > 0.09 or up_bars_4h < 2:
                 continue
 
-            # Early breakout condition
-            if ret_4h >= self.pump_threshold_4h and vol_ratio >= self.volume_multiplier:
-                if ret_24h <= self.max_24h_pump_ceiling:
-                    signals.append(
-                        Signal(
-                            timestamp=now,
-                            symbol=sym,
-                            score=1.0,  # Positive indicates LONG
-                            confidence=0.75,
-                            horizon_minutes=720,  # 12h horizon
-                            metadata={
-                                "ret_24h": ret_24h,
-                                "ret_4h": ret_4h,
-                                "vol_ratio": vol_ratio,
-                                "entry_price": float(closes.iloc[-1]),
-                                "stop_loss": float(closes.iloc[-1] * 0.96),
-                                "take_profit": float(closes.iloc[-1] * 1.15),
-                            },
-                        )
+            if (
+                ret_4h >= self.pump_threshold_4h
+                and vol_ratio >= self.volume_multiplier
+                and ret_24h <= self.max_24h_pump_ceiling
+            ):
+                signals.append(
+                    Signal(
+                        timestamp=now,
+                        symbol=sym,
+                        score=1.0,
+                        confidence=0.75,
+                        horizon_minutes=720,
+                        metadata={
+                            "ret_24h": ret_24h,
+                            "ret_4h": ret_4h,
+                            "vol_ratio": vol_ratio,
+                            "entry_price": float(closes.iloc[-1]),
+                            "stop_loss": float(closes.iloc[-1] * 0.96),
+                            "take_profit": float(closes.iloc[-1] * 1.15),
+                        },
                     )
+                )
 
         return signals
 
-    def allocate_weights(
-        self,
-        signals: List[Signal],
-        portfolio: Portfolio,
-        volatilities: Dict[str, float],
-    ) -> Dict[str, float]:
-        allocations: Dict[str, float] = {}
-        if not signals:
-            return allocations
 
-        total_equity = max(portfolio.total_equity, 100.0)
-        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
-
-        for sig in signals:
-            allocations[sig.symbol] = round(cap_usd, 2)
-
-        return allocations
-
-
-class PumpFundingFadeStrategy(IStrategy):
+class PumpFundingFadeStrategy(BaseAnomalyStrategy):
     """
     Pump & Funding Squeeze Fade Strategy (SHORT).
     Fades overextended blow-off tops where retail FOMO has driven the funding rate
-    to extreme positive levels, profiting both from the inevitable price collapse
-    and collecting the large funding payment.
+    to extreme positive levels.
     """
 
     def __init__(
         self,
-        pump_threshold_24h: float = 0.25,       # +25% in 24h
-        min_funding_rate: float = 0.0005,       # +0.05% per 8h (>= 54% annualized)
-        rsi_ceiling: float = 72.0,              # Overbought RSI exhaustion
-        max_position_usd: float = 15.0,         # Test mode: $15 USDT (Prod: $100 USDT)
+        pump_threshold_24h: float = 0.25,
+        min_funding_rate: float = 0.0005,
+        rsi_ceiling: float = 72.0,
+        max_position_usd: float = 15.0,
         max_portfolio_allocation: float = 0.15,
-        symbols_filter: Optional[List[str]] = None,
+        symbols_filter: list[str] | None = None,
         name: str = "PumpFundingFade",
-    ):
+    ) -> None:
+        super().__init__(
+            max_position_usd=max_position_usd,
+            max_portfolio_allocation=max_portfolio_allocation,
+            symbols_filter=symbols_filter,
+            name=name,
+        )
         self.pump_threshold_24h = pump_threshold_24h
         self.min_funding_rate = min_funding_rate
         self.rsi_ceiling = rsi_ceiling
-        self.max_position_usd = max_position_usd
-        self.max_portfolio_allocation = max_portfolio_allocation
-        self.symbols_filter = set(symbols_filter) if symbols_filter else None
-        self.name = name
 
     def generate_signals(
         self,
-        market_data: Dict[str, pd.DataFrame],
-        funding_data: Optional[Dict[str, pd.DataFrame]] = None,
-    ) -> List[Signal]:
-        signals: List[Signal] = []
+        market_data: dict[str, pd.DataFrame],
+        funding_data: dict[str, pd.DataFrame] | None = None,
+    ) -> list[Signal]:
+        signals: list[Signal] = []
         now = datetime.now(timezone.utc)
 
         for sym, df in market_data.items():
-            if self.symbols_filter and sym not in self.symbols_filter:
-                continue
-            if len(df) < 26:
+            if not self._passes_universe_filter(sym, df, min_bars=26):
                 continue
 
             closes = df["close"]
             ret_24h = float((closes.iloc[-1] - closes.iloc[-25]) / (closes.iloc[-25] + 1e-8))
             ret_1h = float((closes.iloc[-1] - closes.iloc[-2]) / (closes.iloc[-2] + 1e-8)) if len(closes) >= 2 else 0.0
-            rsi_series = calculate_rsi(closes, period=14)
-            rsi_curr = float(rsi_series.iloc[-1])
+            rsi_curr = float(calculate_rsi(closes, period=14).iloc[-1])
 
-            # Anti-vertical-squeeze guard: do not short while the current 1h candle is surging > +2.5%
             if ret_1h > 0.025:
                 continue
 
-            # Extract latest funding rate
             f_rate = 0.0
             if funding_data and sym in funding_data and not funding_data[sym].empty:
-                f_df = funding_data[sym]
-                f_rate = float(f_df["funding_rate"].iloc[-1]) if "funding_rate" in f_df.columns else 0.0
+                f_rate = _extract_latest_funding_rate(funding_data[sym])
             elif "funding_rate" in df.columns:
                 f_rate = float(df["funding_rate"].iloc[-1])
 
-            # Condition: violent pump + overbought RSI + extreme positive funding
             if ret_24h >= self.pump_threshold_24h and f_rate >= self.min_funding_rate and rsi_curr >= self.rsi_ceiling:
                 signals.append(
                     Signal(
                         timestamp=now,
                         symbol=sym,
-                        score=-1.0,  # Negative indicates SHORT
+                        score=-1.0,
                         confidence=0.90,
                         horizon_minutes=1440,
                         metadata={
@@ -373,29 +416,6 @@ class PumpFundingFadeStrategy(IStrategy):
 
         return signals
 
-    def allocate_weights(
-        self,
-        signals: List[Signal],
-        portfolio: Portfolio,
-        volatilities: Dict[str, float],
-    ) -> Dict[str, float]:
-        allocations: Dict[str, float] = {}
-        if not signals:
-            return allocations
-
-        total_equity = max(portfolio.total_equity, 100.0)
-        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
-
-        for sig in signals:
-            # Short target is negative dollar notional
-            allocations[sig.symbol] = round(-cap_usd * abs(sig.score), 2)
-
-        return allocations
-
-
-# -----------------------------------------------------------------------------
-# Factory Presets for the 6 Distinct Strategies
-# -----------------------------------------------------------------------------
 
 def create_liquid_oversold_bounce(test_mode: bool = True) -> OversoldBounceStrategy:
     """Strategy 1: Liquid Core Oversold Flush & Bounce (LONG on BTC/ETH/Major Alts)."""
@@ -463,14 +483,13 @@ def create_illiquid_funding_fade(test_mode: bool = True) -> PumpFundingFadeStrat
     )
 
 
-class ExtremeFundingHarvesterStrategy(IStrategy):
+class ExtremeFundingHarvesterStrategy(BaseAnomalyStrategy):
     """
-    Tier 1B (Issue #56): Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals
-    with Beta-Neutral Hedge metadata.
+    Extreme Funding Rate Harvester across USDS-M Perpetuals with Beta-Neutral Hedge metadata:
     - Deep Negative Funding Squeeze (funding_rate <= -0.15% per interval): LONG entry when
-      price is stabilizing (ret_4h >= -4%, RSI >= 32) to harvest negative funding + short squeeze.
+      price is stabilizing (ret_4h > 0, ret_1h >= 0, RSI >= 35) to harvest negative funding + short squeeze.
     - Extreme Positive Funding Blow-Off (funding_rate >= +0.15% per interval): SHORT entry when
-      momentum is stalling (ret_4h <= +6%, RSI >= 60) to harvest positive funding + post-settlement fade.
+      momentum is stalling (ret_4h <= +2%, ret_1h <= +0.5%, RSI >= 60) to harvest positive funding + post-settlement fade.
     """
 
     def __init__(
@@ -479,38 +498,34 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
         pos_funding_threshold: float = 0.0015,
         max_position_usd: float = 45.0,
         max_portfolio_allocation: float = 0.045,
-        symbols_filter: Optional[List[str]] = None,
+        symbols_filter: list[str] | None = None,
         name: str = "ExtremeFundingHarvester",
-    ):
+    ) -> None:
+        super().__init__(
+            max_position_usd=max_position_usd,
+            max_portfolio_allocation=max_portfolio_allocation,
+            symbols_filter=symbols_filter,
+            name=name,
+        )
         self.neg_funding_threshold = neg_funding_threshold
         self.pos_funding_threshold = pos_funding_threshold
-        self.max_position_usd = max_position_usd
-        self.max_portfolio_allocation = max_portfolio_allocation
-        self.symbols_filter = set(symbols_filter) if symbols_filter else None
-        self.name = name
 
     def generate_signals(
         self,
-        market_data: Dict[str, pd.DataFrame],
-        funding_data: Optional[Dict[str, pd.DataFrame]] = None,
-        benchmark_returns_1h: Optional[pd.Series] = None,
-    ) -> List[Signal]:
-        signals: List[Signal] = []
+        market_data: dict[str, pd.DataFrame],
+        funding_data: dict[str, pd.DataFrame] | None = None,
+        benchmark_returns_1h: pd.Series | None = None,
+    ) -> list[Signal]:
+        signals: list[Signal] = []
         now = datetime.now(timezone.utc)
 
         for sym, df in market_data.items():
-            if self.symbols_filter and sym not in self.symbols_filter:
-                continue
-            if len(df) < 25:
+            if not self._passes_universe_filter(sym, df, min_bars=25):
                 continue
 
             current_funding = 0.0
             if funding_data and sym in funding_data and not funding_data[sym].empty:
-                f_df = funding_data[sym]
-                col = "rate" if "rate" in f_df.columns else (
-                    "funding_rate" if "funding_rate" in f_df.columns else f_df.columns[0]
-                )
-                current_funding = float(f_df[col].iloc[-1])
+                current_funding = _extract_latest_funding_rate(funding_data[sym])
 
             if self.neg_funding_threshold < current_funding < self.pos_funding_threshold:
                 continue
@@ -525,7 +540,6 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
             recent_vol = float(vols.iloc[-4:].mean())
             vol_ratio = recent_vol / (avg_vol_20h + 1e-8)
 
-            # Estimate rolling beta against benchmark if available, else default 1.0
             beta_est = 1.0
             if benchmark_returns_1h is not None and len(benchmark_returns_1h) >= 12:
                 asset_rets = closes.pct_change().dropna().tail(24)
@@ -536,8 +550,6 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
                         cov = float(np.cov(asset_rets.values, bench_rets.values)[0, 1])
                         beta_est = float(np.clip(cov / b_var, 0.50, 1.50))
 
-            # Case 1: Deep Negative Funding Squeeze -> LONG
-            # Require positive 4h and 1h stabilization (ret_4h > 0, ret_1h >= 0) and no severe 24h collapse
             if (
                 current_funding <= self.neg_funding_threshold
                 and ret_4h > 0.0
@@ -564,13 +576,8 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
                         },
                     )
                 )
-            # Case 2: Extreme Positive Funding Blow-Off -> SHORT
-            # Require stalled 4h/1h momentum (ret_4h <= 0.02, ret_1h <= 0.005)
             elif (
-                current_funding >= self.pos_funding_threshold
-                and ret_4h <= 0.02
-                and ret_1h <= 0.005
-                and rsi_val >= 60.0
+                current_funding >= self.pos_funding_threshold and ret_4h <= 0.02 and ret_1h <= 0.005 and rsi_val >= 60.0
             ):
                 raw_score = -min(current_funding / self.pos_funding_threshold * 0.65, 1.0)
                 signals.append(
@@ -594,25 +601,9 @@ class ExtremeFundingHarvesterStrategy(IStrategy):
 
         return signals
 
-    def allocate_weights(
-        self,
-        signals: List[Signal],
-        portfolio: Portfolio,
-        volatilities: Dict[str, float],
-    ) -> Dict[str, float]:
-        allocations: Dict[str, float] = {}
-        if not signals:
-            return allocations
-        total_equity = max(portfolio.total_equity, 100.0)
-        cap_usd = min(self.max_position_usd, total_equity * self.max_portfolio_allocation)
-        for sig in signals:
-            sign = 1.0 if sig.score >= 0 else -1.0
-            allocations[sig.symbol] = round(sign * cap_usd * abs(sig.score), 2)
-        return allocations
-
 
 def create_extreme_funding_harvester(test_mode: bool = False) -> ExtremeFundingHarvesterStrategy:
-    """Factory preset for Tier 1B Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals."""
+    """Factory preset for Extreme Funding Rate Harvester across USDS-M Perpetuals."""
     return ExtremeFundingHarvesterStrategy(
         neg_funding_threshold=-0.0015,
         pos_funding_threshold=0.0015,

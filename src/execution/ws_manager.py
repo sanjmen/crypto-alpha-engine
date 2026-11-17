@@ -12,16 +12,16 @@ Implements:
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-import random
-import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import json
+import logging
+import random
+import threading
+import time
 from typing import Any
 
 import websockets
@@ -44,31 +44,14 @@ class WebSocketConfig:
     """Configuration for Resilient WebSocket Manager."""
 
     ws_base_url: str = "wss://fstream.binance.com/stream"
-    """Binance Futures Combined Stream URL."""
-
     ping_interval_sec: float = 20.0
-    """Interval between WebSocket ping frames."""
-
     heartbeat_timeout_sec: float = 15.0
-    """Max elapsed time without receiving any message before marking connection dead."""
-
     rest_fallback_threshold_sec: float = 10.0
-    """Disconnect duration threshold (seconds) that activates REST polling fallback."""
-
     initial_reconnect_delay_sec: float = 0.5
-    """Base delay for exponential backoff on reconnection."""
-
     max_reconnect_delay_sec: float = 30.0
-    """Maximum backoff delay ceiling for reconnection attempts."""
-
     reconnect_backoff_factor: float = 2.0
-    """Multiplier for exponential backoff."""
-
     max_connection_duration_sec: float = 86100.0  # 23 hours 55 minutes
-    """Pre-empts Binance 24h connection disconnect by triggering seamless rollover."""
-
     tick_buffer_capacity: int = 1000
-    """Number of recent ticks retained in ring buffer."""
 
 
 @dataclass
@@ -95,7 +78,7 @@ class ResilientWebSocketClient:
         config: WebSocketConfig | None = None,
         on_tick: Callable[[PriceTick], None] | None = None,
         rest_poll_callback: Callable[[], dict[str, dict[str, float]]] | None = None,
-    ):
+    ) -> None:
         self.symbols = [s.replace("/", "").replace(":", "").lower() for s in symbols]
         self.config = config or WebSocketConfig()
         self.on_tick_callback = on_tick
@@ -118,7 +101,6 @@ class ResilientWebSocketClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws: Any = None
 
-        # Telemetry
         self.total_reconnects: int = 0
         self.total_24h_rollovers: int = 0
         self.total_rest_fallback_polls: int = 0
@@ -168,7 +150,6 @@ class ResilientWebSocketClient:
         """Supervises the connection and heartbeat monitors concurrently."""
         while not self._stop_event.is_set():
             try:
-                # Run connection loop and heartbeat monitor concurrently
                 await asyncio.gather(
                     self._connection_loop(),
                     self._heartbeat_and_fallback_monitor(),
@@ -211,19 +192,20 @@ class ResilientWebSocketClient:
                         if msg_counter % 50 == 0:
                             await asyncio.sleep(0)
 
-                        # Check for 24-hour rollover pre-emption
-                        if self.connected_since and (time.monotonic() - self.connected_since) >= self.config.max_connection_duration_sec:
+                        if (
+                            self.connected_since
+                            and (time.monotonic() - self.connected_since) >= self.config.max_connection_duration_sec
+                        ):
                             logger.info("Triggering pre-emptive 24h connection rollover.")
                             self.total_24h_rollovers += 1
                             await ws.close(code=1000, reason="24h Periodic Rollover")
                             break
 
-            except (websockets.ConnectionClosed, websockets.WebSocketException, OSError, asyncio.TimeoutError) as e:
-                logger.warning(f"WebSocket disconnected: {e}")
+            except (websockets.ConnectionClosed, websockets.WebSocketException, OSError, asyncio.TimeoutError) as err:
+                logger.warning(f"WebSocket disconnected: {err}")
             except Exception:
                 logger.exception("Unexpected WebSocket error")
 
-            # Record disconnection time
             if self.disconnected_at is None:
                 self.disconnected_at = time.monotonic()
             self._set_state(WebSocketState.DISCONNECTED, "Socket closed")
@@ -233,10 +215,10 @@ class ResilientWebSocketClient:
             if self._stop_event.is_set():
                 break
 
-            # Calculate exponential backoff with jitter
             backoff = min(
                 self.config.max_reconnect_delay_sec,
-                self.config.initial_reconnect_delay_sec * (self.config.reconnect_backoff_factor ** (self.reconnect_attempts - 1)),
+                self.config.initial_reconnect_delay_sec
+                * (self.config.reconnect_backoff_factor ** (self.reconnect_attempts - 1)),
             )
             jitter = random.uniform(0.0, 0.5)
             wait_time = backoff + jitter
@@ -248,7 +230,6 @@ class ResilientWebSocketClient:
         while not self._stop_event.is_set():
             now = time.monotonic()
 
-            # 1. Heartbeat check for dead connection
             if self.state == WebSocketState.CONNECTED:
                 elapsed_since_msg = now - self.last_message_time
                 if elapsed_since_msg > self.config.heartbeat_timeout_sec:
@@ -259,11 +240,13 @@ class ResilientWebSocketClient:
                     if self._ws:
                         try:
                             await self._ws.close(code=1001, reason="Heartbeat timeout")
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug(f"Error closing timed-out WS: {e}")
+                        except Exception as err:  # noqa: BLE001
+                            logger.debug(f"Error closing timed-out WS: {err}")
 
-            # 2. REST Fallback check if disconnected > 10 seconds
-            if self.state in (WebSocketState.DISCONNECTED, WebSocketState.RECONNECTING, WebSocketState.FALLBACK_REST) and self.disconnected_at is not None:
+            if (
+                self.state in (WebSocketState.DISCONNECTED, WebSocketState.RECONNECTING, WebSocketState.FALLBACK_REST)
+                and self.disconnected_at is not None
+            ):
                 disconnect_dur = now - self.disconnected_at
                 if disconnect_dur >= self.config.rest_fallback_threshold_sec:
                     if self.state != WebSocketState.FALLBACK_REST:
@@ -272,7 +255,6 @@ class ResilientWebSocketClient:
                             f"Disconnected for {disconnect_dur:.1f}s >= {self.config.rest_fallback_threshold_sec}s",
                         )
 
-                    # Execute REST fallback polling
                     self._execute_rest_fallback()
 
             await asyncio.sleep(1.0)
@@ -286,23 +268,23 @@ class ResilientWebSocketClient:
             ticks = self.rest_poll_callback()
             now_dt = datetime.now(timezone.utc)
             for sym, data in ticks.items():
-                p = float(data.get("price") or 0.0)
-                b = float(data.get("bid") or p)
-                a = float(data.get("ask") or p)
-                if p > 0:
+                price_val = float(data.get("price") or 0.0)
+                bid_val = float(data.get("bid") or price_val)
+                ask_val = float(data.get("ask") or price_val)
+                if price_val > 0:
                     clean_sym = sym.replace("/", "").replace(":", "").upper()
                     tick = PriceTick(
                         symbol=clean_sym,
-                        price=p,
-                        bid=b,
-                        ask=a,
+                        price=price_val,
+                        bid=bid_val,
+                        ask=ask_val,
                         timestamp=now_dt,
                         source="REST_FALLBACK",
                     )
                     self._record_tick(tick)
             self.total_rest_fallback_polls += 1
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"REST fallback poll failed: {e}")
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"REST fallback poll failed: {err}")
 
     def _process_ws_message(self, message: str) -> None:
         """Parses Binance bookTicker WebSocket payload."""
@@ -311,34 +293,41 @@ class ResilientWebSocketClient:
 
         try:
             data = json.loads(message)
-            # Binance combined stream wraps payload in {"stream": "...", "data": {...}}
             stream_data = data.get("data", data)
             symbol = stream_data.get("s")
-            bid_p = stream_data.get("b")
-            ask_p = stream_data.get("a")
+            bid_raw = stream_data.get("b")
+            ask_raw = stream_data.get("a")
 
-            if symbol and bid_p and ask_p:
-                sym_up = symbol.upper()
-                b = float(bid_p)
-                a = float(ask_p)
-                prev = self.latest_ticks.get(sym_up)
-                last_emit = self._last_emit_mono.get(sym_up, 0.0)
-                if prev is not None and prev.bid == b and prev.ask == a and (now - last_emit) < 0.25:
+            if symbol and bid_raw and ask_raw:
+                symbol_upper = symbol.upper()
+                bid_price = float(bid_raw)
+                ask_price = float(ask_raw)
+                if bid_price <= 0 or ask_price <= 0 or bid_price > ask_price:
                     return
-                self._last_emit_mono[sym_up] = now
-                mid = (b + a) / 2.0
+                with self._lock:
+                    previous_tick = self.latest_ticks.get(symbol_upper)
+                    last_emit_mono = self._last_emit_mono.get(symbol_upper, 0.0)
+                    if (
+                        previous_tick is not None
+                        and previous_tick.bid == bid_price
+                        and previous_tick.ask == ask_price
+                        and (now - last_emit_mono) < 0.25
+                    ):
+                        return
+                    self._last_emit_mono[symbol_upper] = now
+                mid_price = (bid_price + ask_price) / 2.0
                 tick = PriceTick(
-                    symbol=sym_up,
-                    price=mid,
-                    bid=b,
-                    ask=a,
+                    symbol=symbol_upper,
+                    price=mid_price,
+                    bid=bid_price,
+                    ask=ask_price,
                     timestamp=datetime.now(timezone.utc),
                     source="WS",
                 )
                 self._record_tick(tick)
 
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Failed to parse WS message: {e}")
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"Failed to parse WS message: {err}")
 
     def _record_tick(self, tick: PriceTick) -> None:
         """Records tick in local lookup and ring buffer, and fires consumer callback."""
@@ -349,8 +338,8 @@ class ResilientWebSocketClient:
         if self.on_tick_callback:
             try:
                 self.on_tick_callback(tick)
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Error in on_tick callback: {e}")
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"Error in on_tick callback: {err}")
 
     def get_latest_tick(self, symbol: str) -> PriceTick | None:
         """Returns the most recent price tick for a symbol."""
@@ -368,7 +357,11 @@ class ResilientWebSocketClient:
     def get_stats(self) -> dict[str, Any]:
         """Returns connection manager operational metrics."""
         with self._lock:
-            uptime = (time.monotonic() - self.connected_since) if self.connected_since and self.state == WebSocketState.CONNECTED else 0.0
+            uptime = (
+                (time.monotonic() - self.connected_since)
+                if self.connected_since and self.state == WebSocketState.CONNECTED
+                else 0.0
+            )
             disconnect_dur = (time.monotonic() - self.disconnected_at) if self.disconnected_at else 0.0
 
             return {

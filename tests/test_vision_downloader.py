@@ -1,5 +1,3 @@
-from pathlib import Path
-import pytest
 import pandas as pd
 
 from src.data.binance_vision_downloader import BinanceVisionDownloader
@@ -29,16 +27,18 @@ def test_vision_downloader_save_parquet(tmp_path):
     assert parquet_file.exists()
 
     # Append overlapping data (dedup test)
-    df_overlapping = pd.DataFrame({
-        "open_time": [1704070800000, 1704074400000],
-        "open": ["42100.0", "42250.0"],
-        "high": ["42300.0", "42400.0"],
-        "low": ["42050.0", "42100.0"],
-        "close": ["42250.0", "42350.0"],
-        "volume": ["200.1", "180.0"],
-        "trade_count": [1500, 1300],
-        "taker_buy_base_vol": ["110.0", "95.0"],
-    })
+    df_overlapping = pd.DataFrame(
+        {
+            "open_time": [1704070800000, 1704074400000],
+            "open": ["42100.0", "42250.0"],
+            "high": ["42300.0", "42400.0"],
+            "low": ["42050.0", "42100.0"],
+            "close": ["42250.0", "42350.0"],
+            "volume": ["200.1", "180.0"],
+            "trade_count": [1500, 1300],
+            "taker_buy_base_vol": ["110.0", "95.0"],
+        }
+    )
     count2 = downloader.save_klines_to_parquet("BTCUSDT", Timeframe.H1, df_overlapping)
     assert count2 == 3  # 2 + 1 new = 3
 
@@ -78,4 +78,3 @@ def test_vision_downloader_save_funding(tmp_path):
 
     funding_file = tmp_path / "funding" / "BTCUSDT.parquet"
     assert funding_file.exists()
-

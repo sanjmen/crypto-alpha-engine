@@ -3,6 +3,7 @@ Unit tests for PaperExecutionBroker.
 """
 
 import pytest
+
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.execution.paper_broker import PaperExecutionBroker
 
@@ -19,7 +20,7 @@ def test_market_buy_and_sell_order():
     broker = PaperExecutionBroker(
         initial_cash=100_000.0,
         taker_fee_pct=0.0004,
-        slippage_bps=2.0,   # 0.02% slippage
+        slippage_bps=2.0,  # 0.02% slippage
     )
     broker.set_market_price("BTCUSDT", 50_000.0)
 

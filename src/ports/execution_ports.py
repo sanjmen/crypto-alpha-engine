@@ -4,11 +4,13 @@ Defines abstract contracts for order execution, order management,
 and portfolio state tracking across simulated paper trading and live exchanges.
 """
 
-from typing import Dict, List, Optional, Protocol
+from typing import Protocol, runtime_checkable
+
 from src.domain.entities import Order, Portfolio, Trade
 from src.domain.enums import OrderSide, OrderType
 
 
+@runtime_checkable
 class IExecutionClient(Protocol):
     """
     Abstract interface for order execution engines and exchange brokers.
@@ -24,7 +26,7 @@ class IExecutionClient(Protocol):
         side: OrderSide,
         order_type: OrderType,
         quantity: float,
-        price: Optional[float] = None,
+        price: float | None = None,
     ) -> Order:
         """Submits an order to the execution venue."""
         ...
@@ -37,6 +39,6 @@ class IExecutionClient(Protocol):
         """Queries the current status of an order."""
         ...
 
-    def get_trade_history(self) -> List[Trade]:
+    def get_trade_history(self) -> list[Trade]:
         """Retrieves history of executed trades."""
         ...

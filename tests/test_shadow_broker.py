@@ -2,14 +2,11 @@
 Unit Tests for ShadowExecutionBroker with SQLite WAL Persistence.
 """
 
-from datetime import datetime, timezone
 import pytest
 
-from src.domain.entities import Order, Position
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
 from src.execution.database import ShadowDatabase
 from src.execution.live_broker import (
-    MaxDrawdownStopError,
     MaxLeverageExceededError,
     MaxOrderNotionalExceededError,
 )
@@ -98,9 +95,7 @@ def test_passive_maker_order_execution(broker: ShadowExecutionBroker):
     assert len(pending) == 1
 
     # Tick arrives with low touching 3,485.0
-    fresh_ticks = {
-        "ETH/USDT": {"low": 3_485.0, "high": 3_510.0, "bid": 3_488.0, "ask": 3_490.0}
-    }
+    fresh_ticks = {"ETH/USDT": {"low": 3_485.0, "high": 3_510.0, "bid": 3_488.0, "ask": 3_490.0}}
     filled = broker.check_pending_orders(fresh_ticks)
     assert len(filled) == 1
     assert filled[0].id == order.id
@@ -344,5 +339,3 @@ def test_position_reversal_clears_brackets_and_cancels_orders(broker: ShadowExec
     assert db_pos["take_profit"] is None
     assert db_pos["stop_loss"] is None
     assert db_pos["strategy"] == "Cross-Sectional Momentum"
-
-

@@ -1,7 +1,6 @@
 import numpy as np
-import pytest
 
-from src.features.microstructure import corwin_schultz_spread, roll_effective_spread, amihud_illiquidity
+from src.features.microstructure import amihud_illiquidity, corwin_schultz_spread, roll_effective_spread
 
 
 def test_corwin_schultz_spread():

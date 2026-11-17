@@ -35,6 +35,7 @@ def test_token_bucket_refill_and_consumption():
 
 def test_token_bucket_async_acquire():
     """Tests non-blocking asynchronous token acquisition."""
+
     async def _test():
         bucket = TokenBucket(capacity=2.0, refill_rate=10.0)
 

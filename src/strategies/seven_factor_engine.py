@@ -18,12 +18,11 @@ Implements the empirical discoveries from the 22-month (2025-2026) research:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
 
-
-FACTOR_NAMES: Tuple[str, ...] = (
+FACTOR_NAMES: tuple[str, ...] = (
     "macro",
     "med",
     "fast",
@@ -33,7 +32,7 @@ FACTOR_NAMES: Tuple[str, ...] = (
     "size",
 )
 
-FACTOR_LABELS: Dict[str, str] = {
+FACTOR_LABELS: dict[str, str] = {
     "macro": "F1_Macro_Idio_PB (7d-30d)",
     "med": "F2_Med_Idio_PB (3d-7d)",
     "fast": "F3_Fast_Swing_PB (12h-48h)",
@@ -43,7 +42,7 @@ FACTOR_LABELS: Dict[str, str] = {
     "size": "F7_HighLiq_Size (Quality)",
 }
 
-DEFAULT_PRIORS: Dict[str, float] = {
+DEFAULT_PRIORS: dict[str, float] = {
     "macro": 0.25,
     "med": 0.14,
     "fast": 0.19,
@@ -53,7 +52,7 @@ DEFAULT_PRIORS: Dict[str, float] = {
     "size": 0.22,
 }
 
-ALT_SECTOR_CLUSTERS: Dict[str, Tuple[str, ...]] = {
+ALT_SECTOR_CLUSTERS: dict[str, tuple[str, ...]] = {
     "AI_COMPUTE": ("FETUSDT", "RENDERUSDT"),
     "FAST_L1": ("SOLUSDT", "SUIUSDT", "AVAXUSDT"),
     "ALT_L1": ("NEARUSDT", "APTUSDT"),
@@ -66,16 +65,16 @@ ALT_SECTOR_CLUSTERS: Dict[str, Tuple[str, ...]] = {
 class SevenFactorAllocationResult:
     """Output snapshot of the 7-Factor Causal Online Engine at a rebalance timestamp."""
 
-    unit_weights: Dict[str, float]
+    unit_weights: dict[str, float]
     vol_scalar: float
     port_vol_72h: float
     median_vol: float
     conviction: float
-    factor_weights: Dict[str, float]
-    factor_tstats: Dict[str, float]
-    asset_betas: Dict[str, float]
+    factor_weights: dict[str, float]
+    factor_tstats: dict[str, float]
+    asset_betas: dict[str, float]
     portfolio_beta: float
-    asset_composite_scores: Dict[str, float] = field(default_factory=dict)
+    asset_composite_scores: dict[str, float] = field(default_factory=dict)
     cmf_tstat: float = 0.0
     cmf_blend_weight: float = 0.0
     smart_money_tstat: float = 0.0
@@ -85,7 +84,7 @@ class SevenFactorAllocationResult:
     basis_regime_label: str = "NEUTRAL"
     chop_specialist_tstat: float = 0.0
     chop_overlay_weight: float = 0.0
-    asset_vol_24h: Dict[str, float] = field(default_factory=dict)
+    asset_vol_24h: dict[str, float] = field(default_factory=dict)
 
 
 def make_continuous_neutral_weights(
@@ -123,9 +122,9 @@ def make_continuous_neutral_weights(
 
 def cap_side_weights_waterfill(
     w_df: pd.DataFrame,
-    max_side_share: Optional[float] = 0.30,
-    max_cluster_share: Optional[float] = None,
-    sector_clusters: Optional[Dict[str, Tuple[str, ...]]] = None,
+    max_side_share: float | None = 0.30,
+    max_cluster_share: float | None = None,
+    sector_clusters: dict[str, tuple[str, ...]] | None = None,
 ) -> pd.DataFrame:
     """
     Caps each asset's share of the Long leg (and Short leg) at `max_side_share` (e.g. 30%)
@@ -140,7 +139,7 @@ def cap_side_weights_waterfill(
 
     clusters_map = sector_clusters if sector_clusters is not None else ALT_SECTOR_CLUSTERS
     clean_cols = [str(c).split(":")[0].replace("/", "") for c in w_df.columns]
-    cluster_indices: List[List[int]] = []
+    cluster_indices: list[list[int]] = []
     if has_clust_cap and clusters_map:
         for syms in clusters_map.values():
             c_idx = [clean_cols.index(s) for s in syms if s in clean_cols]
@@ -218,20 +217,22 @@ class SevenFactorOnlineEngine:
 
     def __init__(
         self,
-        lookbacks: Tuple[int, int, int] = (36, 96, 240),
-        priors: Optional[Dict[str, float]] = None,
+        lookbacks: tuple[int, int, int] = (36, 96, 240),
+        priors: dict[str, float] | None = None,
         factor_power: float = 1.7,
         comb_power: float = 1.3,
-        vol_scalar_bounds: Tuple[float, float] = (0.55, 1.15),
-        conviction_bounds: Tuple[float, float] = (0.35, 1.15),
+        vol_scalar_bounds: tuple[float, float] = (0.55, 1.15),
+        conviction_bounds: tuple[float, float] = (0.35, 1.15),
         factor_turnover_penalty: float = 0.0001,
-        comb_ema_span: Optional[float] = 3.0,
-        trend_waterfill_cap: Optional[float] = 0.30,
+        comb_ema_span: float | None = 3.0,
+        trend_waterfill_cap: float | None = 0.30,
         trend_waterfill_threshold: float = 0.20,
-        alt_cluster_cap: Optional[float] = 0.48,
-        f6_min_tstat: Optional[float] = 0.75,
-        f5_min_tstat: Optional[float] = None,
-        min_tstat_by_factor: Optional[Dict[str, float]] = None,
+        alt_cluster_cap: float | None = 0.48,
+        f6_min_tstat: float | None = 0.75,
+        f5_min_tstat: float | None = None,
+        liq_min_tstat: float | None = None,
+        carry_min_tstat: float | None = None,
+        min_tstat_by_factor: dict[str, float] | None = None,
         enable_chop_range_arb: bool = False,
         chop_max_alpha: float = 0.75,
         enable_holistic_regime_shields: bool = False,
@@ -247,19 +248,23 @@ class SevenFactorOnlineEngine:
         self.trend_waterfill_cap = trend_waterfill_cap
         self.trend_waterfill_threshold = trend_waterfill_threshold
         self.alt_cluster_cap = alt_cluster_cap
-        self.f6_min_tstat = f6_min_tstat
-        self.f5_min_tstat = f5_min_tstat
+        eff_liq_min_tstat = liq_min_tstat if liq_min_tstat is not None else f6_min_tstat
+        eff_carry_min_tstat = carry_min_tstat if carry_min_tstat is not None else f5_min_tstat
+        self.f6_min_tstat = eff_liq_min_tstat
+        self.f5_min_tstat = eff_carry_min_tstat
+        self.liq_min_tstat = eff_liq_min_tstat
+        self.carry_min_tstat = eff_carry_min_tstat
         self.enable_chop_range_arb = bool(enable_chop_range_arb)
         self.chop_max_alpha = float(chop_max_alpha)
         self.enable_holistic_regime_shields = bool(enable_holistic_regime_shields)
-        self.min_tstat_by_factor: Dict[str, float] = dict(min_tstat_by_factor or {})
-        if f6_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
-            self.min_tstat_by_factor["liq"] = float(f6_min_tstat)
-        if f5_min_tstat is not None and "carry" not in self.min_tstat_by_factor:
-            self.min_tstat_by_factor["carry"] = float(f5_min_tstat)
+        self.min_tstat_by_factor: dict[str, float] = dict(min_tstat_by_factor or {})
+        if eff_liq_min_tstat is not None and "liq" not in self.min_tstat_by_factor:
+            self.min_tstat_by_factor["liq"] = float(eff_liq_min_tstat)
+        if eff_carry_min_tstat is not None and "carry" not in self.min_tstat_by_factor:
+            self.min_tstat_by_factor["carry"] = float(eff_carry_min_tstat)
 
     @staticmethod
-    def _find_btc_column(columns: List[str]) -> Optional[str]:
+    def _find_btc_column(columns: list[str]) -> str | None:
         for c in columns:
             if c.startswith("BTC/") or c == "BTCUSDT":
                 return c
@@ -267,15 +272,15 @@ class SevenFactorOnlineEngine:
 
     def _build_aligned_matrices(
         self,
-        bars_1h: Dict[str, pd.DataFrame],
-        funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        bars_1h: dict[str, pd.DataFrame],
+        funding_rates: dict[str, float | pd.Series | pd.DataFrame] | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Aligns symbol DataFrames onto a common UTC hourly DatetimeIndex.
         Returns (close, volume, dollar_vol, raw_funding, funding_per_bar).
         """
-        close_dict: Dict[str, pd.Series] = {}
-        vol_dict: Dict[str, pd.Series] = {}
+        close_dict: dict[str, pd.Series] = {}
+        vol_dict: dict[str, pd.Series] = {}
 
         for sym, df in bars_1h.items():
             if df is None or df.empty:
@@ -295,7 +300,7 @@ class SevenFactorOnlineEngine:
         if not close_dict:
             raise ValueError("No valid 1h bar series provided to SevenFactorOnlineEngine.")
 
-        close = pd.DataFrame(close_dict).sort_index().ffill().bfill()
+        close = pd.DataFrame(close_dict).sort_index().ffill()
         volume = pd.DataFrame(vol_dict).reindex(close.index).fillna(0.0)
         dollar_vol = close * volume
 
@@ -310,7 +315,7 @@ class SevenFactorOnlineEngine:
                 if isinstance(fr_val, (int, float, np.floating)):
                     raw_funding[sym] = float(fr_val)
                     # Funding settles every 8h (00:00, 08:00, 16:00 UTC)
-                    is_settlement = (close.index.hour % 8 == 0)
+                    is_settlement = close.index.hour % 8 == 0
                     funding_per_bar.loc[is_settlement, sym] = float(fr_val)
                 elif isinstance(fr_val, pd.Series):
                     s = fr_val.copy()
@@ -329,7 +334,7 @@ class SevenFactorOnlineEngine:
                     d_f.index = d_f.index.floor("1h")
                     d_f = d_f[~d_f.index.duplicated(keep="last")].sort_index()
                     reindexed = d_f["fundingRate"].astype(float).reindex(close.index)
-                    is_settlement = (close.index.hour % 8 == 0)
+                    is_settlement = close.index.hour % 8 == 0
                     funding_per_bar.loc[is_settlement, sym] = reindexed.loc[is_settlement].fillna(0.0)
                     raw_funding[sym] = reindexed.ffill().bfill().fillna(0.0)
 
@@ -337,15 +342,15 @@ class SevenFactorOnlineEngine:
 
     @staticmethod
     def _extract_high_low(
-        bars_1h: Dict[str, pd.DataFrame],
+        bars_1h: dict[str, pd.DataFrame],
         close: pd.DataFrame,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Extracts aligned hourly high and low matrices from `bars_1h`, falling back
         to `close` when synthetic test DataFrames only provide close and volume.
         """
-        high_dict: Dict[str, pd.Series] = {}
-        low_dict: Dict[str, pd.Series] = {}
+        high_dict: dict[str, pd.Series] = {}
+        low_dict: dict[str, pd.Series] = {}
         for sym, df in bars_1h.items():
             if df is None or df.empty or sym not in close.columns:
                 continue
@@ -375,16 +380,16 @@ class SevenFactorOnlineEngine:
 
     @staticmethod
     def _extract_open_interest(
-        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        open_interest: dict[str, pd.Series | pd.DataFrame] | None,
         close: pd.DataFrame,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """
         Aligns hourly Open Interest contract series (`sumOpenInterest` or `open_interest`)
         onto `close.index` for Issue #46 Squeeze/Knife Guard & Breakout Confirmation.
         """
         if not open_interest:
             return None
-        oi_dict: Dict[str, pd.Series] = {}
+        oi_dict: dict[str, pd.Series] = {}
         for sym in close.columns:
             oi_val = open_interest.get(sym)
             if oi_val is None:
@@ -412,8 +417,10 @@ class SevenFactorOnlineEngine:
                     d_o.index = d_o.index.tz_localize("UTC")
                 d_o.index = d_o.index.round("1h")
                 d_o = d_o[~d_o.index.duplicated(keep="last")].sort_index()
-                col = "sumOpenInterest" if "sumOpenInterest" in d_o.columns else (
-                    "open_interest" if "open_interest" in d_o.columns else d_o.columns[0]
+                col = (
+                    "sumOpenInterest"
+                    if "sumOpenInterest" in d_o.columns
+                    else ("open_interest" if "open_interest" in d_o.columns else d_o.columns[0])
                 )
                 oi_dict[sym] = d_o[col].astype(float)
         if not oi_dict:
@@ -425,16 +432,16 @@ class SevenFactorOnlineEngine:
 
     @staticmethod
     def _extract_taker_flow(
-        taker_flow: Optional[Dict[str, pd.DataFrame]],
-        bars_1h: Dict[str, pd.DataFrame],
+        taker_flow: dict[str, pd.DataFrame] | None,
+        bars_1h: dict[str, pd.DataFrame],
         close: pd.DataFrame,
-    ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
         """
         Aligns hourly `quote_volume` and `taker_buy_quote_volume` onto `close.index`
         for Issue #48 True Taker Buy/Sell CVD & Institutional Limit Absorption.
         """
-        qvol_dict: Dict[str, pd.Series] = {}
-        tbuy_dict: Dict[str, pd.Series] = {}
+        qvol_dict: dict[str, pd.Series] = {}
+        tbuy_dict: dict[str, pd.Series] = {}
         source_map = taker_flow if taker_flow else bars_1h
         if not source_map:
             return None
@@ -483,16 +490,16 @@ class SevenFactorOnlineEngine:
 
     @staticmethod
     def _extract_premium_index(
-        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        premium_index: dict[str, pd.Series | pd.DataFrame] | None,
         close: pd.DataFrame,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """
         Aligns hourly Spot-Perp Premium Index (`close` or `premium_index`) onto `close.index`
         for Issue #49 Spot-Perp Basis Spread & Premium Index Alpha.
         """
         if not premium_index:
             return None
-        prem_dict: Dict[str, pd.Series] = {}
+        prem_dict: dict[str, pd.Series] = {}
         for sym in close.columns:
             p_val = premium_index.get(sym)
             if p_val is None:
@@ -520,8 +527,10 @@ class SevenFactorOnlineEngine:
                     d_p.index = d_p.index.tz_localize("UTC")
                 d_p.index = d_p.index.round("1h")
                 d_p = d_p[~d_p.index.duplicated(keep="last")].sort_index()
-                col = "close" if "close" in d_p.columns else (
-                    "premium_index" if "premium_index" in d_p.columns else d_p.columns[0]
+                col = (
+                    "close"
+                    if "close" in d_p.columns
+                    else ("premium_index" if "premium_index" in d_p.columns else d_p.columns[0])
                 )
                 prem_dict[sym] = d_p[col].astype(float)
         if not prem_dict:
@@ -538,9 +547,9 @@ class SevenFactorOnlineEngine:
 
     @staticmethod
     def _extract_smart_money(
-        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]],
+        smart_money: dict[str, pd.Series | pd.DataFrame] | None,
         close: pd.DataFrame,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """
         Aligns hourly Binance Institutional Smart-Money divergence
         `ln(top_pos_ls_ratio / global_acc_ls_ratio)` onto `close.index`
@@ -548,7 +557,7 @@ class SevenFactorOnlineEngine:
         """
         if not smart_money:
             return None
-        sm_dict: Dict[str, pd.Series] = {}
+        sm_dict: dict[str, pd.Series] = {}
         for sym in close.columns:
             sm_val = smart_money.get(sym)
             if sm_val is None:
@@ -581,11 +590,19 @@ class SevenFactorOnlineEngine:
                     sm_dict[sym] = d_s["smart_money_div"].astype(float)
                 else:
                     w_col = next(
-                        (c for c in ("top_pos_ls_ratio", "topLongShortPositionRatio", "whale_ls_ratio") if c in d_s.columns),
+                        (
+                            c
+                            for c in ("top_pos_ls_ratio", "topLongShortPositionRatio", "whale_ls_ratio")
+                            if c in d_s.columns
+                        ),
                         None,
                     )
                     r_col = next(
-                        (c for c in ("global_acc_ls_ratio", "globalLongShortAccountRatio", "retail_ls_ratio") if c in d_s.columns),
+                        (
+                            c
+                            for c in ("global_acc_ls_ratio", "globalLongShortAccountRatio", "retail_ls_ratio")
+                            if c in d_s.columns
+                        ),
                         None,
                     )
                     if w_col and r_col:
@@ -609,11 +626,9 @@ class SevenFactorOnlineEngine:
 
     def _extract_quarterly_basis(
         self,
-        quarterly_basis: Optional[
-            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
-        ],
+        quarterly_basis: float | pd.Series | pd.DataFrame | dict[str, float | pd.Series | pd.DataFrame] | None,
         close: pd.DataFrame,
-    ) -> Optional[pd.Series]:
+    ) -> pd.Series | None:
         """
         Tier 2 (Issue #58): Extracts annualized quarterly delivery basis (`CURRENT_QUARTER` vs Spot Index)
         from `fapiDataGetBasis` (`annualizedBasisRate` or `basisRate * 4.0`) aligned to `close.index`.
@@ -621,7 +636,7 @@ class SevenFactorOnlineEngine:
         if quarterly_basis is None:
             return None
 
-        def _parse_single_basis(item: Union[float, int, pd.Series, pd.DataFrame]) -> Optional[pd.Series]:
+        def _parse_single_basis(item: float | int | pd.Series | pd.DataFrame) -> pd.Series | None:
             if isinstance(item, (int, float, np.floating)):
                 return pd.Series(float(item), index=close.index, dtype=float)
             if isinstance(item, pd.Series):
@@ -678,8 +693,8 @@ class SevenFactorOnlineEngine:
 
     def _compute_subhourly_pullback_adjustment(
         self,
-        bars_15m: Optional[Dict[str, pd.DataFrame]],
-        symbols: List[str],
+        bars_15m: dict[str, pd.DataFrame] | None,
+        symbols: list[str],
         vol_24h_latest: pd.Series,
     ) -> pd.Series:
         """
@@ -709,24 +724,20 @@ class SevenFactorOnlineEngine:
 
     def compute_matrices(
         self,
-        bars_1h: Dict[str, pd.DataFrame],
-        funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
-        bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
-        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
-        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        quarterly_basis: Optional[
-            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
-        ] = None,
-    ) -> Dict[str, Union[pd.DataFrame, pd.Series]]:
+        bars_1h: dict[str, pd.DataFrame],
+        funding_rates: dict[str, float | pd.Series | pd.DataFrame] | None = None,
+        bars_15m: dict[str, pd.DataFrame] | None = None,
+        open_interest: dict[str, pd.Series | pd.DataFrame] | None = None,
+        taker_flow: dict[str, pd.DataFrame] | None = None,
+        premium_index: dict[str, pd.Series | pd.DataFrame] | None = None,
+        smart_money: dict[str, pd.Series | pd.DataFrame] | None = None,
+        quarterly_basis: float | pd.Series | pd.DataFrame | dict[str, float | pd.Series | pd.DataFrame] | None = None,
+    ) -> dict[str, pd.DataFrame | pd.Series]:
         """
         Computes full historical matrices for the 7 factors, online factor weights,
         unit portfolio weights, and 72h volatility scalar.
         """
-        close, volume, dollar_vol, raw_funding, funding = self._build_aligned_matrices(
-            bars_1h, funding_rates
-        )
+        close, volume, dollar_vol, raw_funding, funding = self._build_aligned_matrices(bars_1h, funding_rates)
         high, low = self._extract_high_low(bars_1h, close)
         oi_contracts = self._extract_open_interest(open_interest, close)
         taker_pair = self._extract_taker_flow(taker_flow, bars_1h, close)
@@ -755,24 +766,16 @@ class SevenFactorOnlineEngine:
         inv_vol = (1.0 / vol_24h).clip(upper=100.0)
 
         vol_surge = (
-            dollar_vol.rolling(6, min_periods=1).mean()
-            / (dollar_vol.rolling(48, min_periods=6).mean() + 1e-8)
+            dollar_vol.rolling(6, min_periods=1).mean() / (dollar_vol.rolling(48, min_periods=6).mean() + 1e-8)
         ).clip(0.5, 2.5)
         vol_surge_wk = (
-            dollar_vol.rolling(24, min_periods=4).mean()
-            / (dollar_vol.rolling(168, min_periods=24).mean() + 1e-8)
+            dollar_vol.rolling(24, min_periods=4).mean() / (dollar_vol.rolling(168, min_periods=24).mean() + 1e-8)
         ).clip(0.5, 2.5)
 
         btc_col = self._find_btc_column(cols)
         btc_ret = rets_1h[btc_col] if btc_col else rets_1h.mean(axis=1)
         btc_var = btc_ret.rolling(72, min_periods=12).var().replace(0, 1e-8)
-        beta_72 = (
-            rets_1h.rolling(72, min_periods=12)
-            .cov(btc_ret)
-            .div(btc_var, axis=0)
-            .clip(0.2, 2.5)
-            .fillna(1.0)
-        )
+        beta_72 = rets_1h.rolling(72, min_periods=12).cov(btc_ret).div(btc_var, axis=0).clip(0.2, 2.5).fillna(1.0)
         resid_ret = rets_1h.sub(beta_72.mul(btc_ret, axis=0))
 
         def z_h(s: pd.DataFrame, h: int) -> pd.DataFrame:
@@ -785,28 +788,20 @@ class SevenFactorOnlineEngine:
 
         # 7 Orthogonal Cross-Sectional Factors
         f_macro = 0.70 * (
-            (0.35 * zi[168] + 0.40 * zi[336] + 0.25 * zi[720]) * np.sqrt(vol_surge_wk)
-            - (0.15 * zi[4] + 0.20 * zi[24])
+            (0.35 * zi[168] + 0.40 * zi[336] + 0.25 * zi[720]) * np.sqrt(vol_surge_wk) - (0.15 * zi[4] + 0.20 * zi[24])
         ) + 0.30 * (
-            (0.35 * zr[168] + 0.40 * zr[336] + 0.25 * zr[720]) * np.sqrt(vol_surge_wk)
-            - (0.15 * zr[4] + 0.20 * zr[24])
+            (0.35 * zr[168] + 0.40 * zr[336] + 0.25 * zr[720]) * np.sqrt(vol_surge_wk) - (0.15 * zr[4] + 0.20 * zr[24])
         )
 
         f_med = (0.40 * zi[72] + 0.60 * zi[168]) * np.sqrt(vol_surge_wk) - 0.25 * zi[12]
 
-        f_fast = 0.60 * (
-            (0.35 * zr[12] + 0.45 * zr[24] + 0.20 * zr[48]) * np.sqrt(vol_surge)
-            - 0.25 * zr[4]
-        ) + 0.40 * (
-            (0.30 * zi[12] + 0.40 * zi[24] + 0.30 * zi[72]) * np.sqrt(vol_surge)
-            - 0.20 * zi[4]
+        f_fast = 0.60 * ((0.35 * zr[12] + 0.45 * zr[24] + 0.20 * zr[48]) * np.sqrt(vol_surge) - 0.25 * zr[4]) + 0.40 * (
+            (0.30 * zi[12] + 0.40 * zi[24] + 0.30 * zi[72]) * np.sqrt(vol_surge) - 0.20 * zi[4]
         )
 
         # Incorporate sub-hourly 15m pullback precision into latest bar of f_fast if provided
         if bars_15m and len(f_fast) > 0:
-            sub_adj = self._compute_subhourly_pullback_adjustment(
-                bars_15m, cols, vol_24h.iloc[-1]
-            )
+            sub_adj = self._compute_subhourly_pullback_adjustment(bars_15m, cols, vol_24h.iloc[-1])
             f_fast.iloc[-1] = f_fast.iloc[-1] + sub_adj
 
         f_rev = -(0.40 * zi[24] + 0.60 * zi[72]) - 0.25 * zr[4]
@@ -819,7 +814,7 @@ class SevenFactorOnlineEngine:
         )
         f_size = np.log(dollar_vol.rolling(168, min_periods=12).mean() + 1.0)
 
-        factor_scores: Dict[str, pd.DataFrame] = {
+        factor_scores: dict[str, pd.DataFrame] = {
             "macro": f_macro,
             "med": f_med,
             "fast": f_fast,
@@ -830,9 +825,7 @@ class SevenFactorOnlineEngine:
         }
 
         w_unit = {
-            k: make_continuous_neutral_weights(
-                sc, inv_vol, gross_leverage=1.0, power=self.factor_power
-            )
+            k: make_continuous_neutral_weights(sc, inv_vol, gross_leverage=1.0, power=self.factor_power)
             for k, sc in factor_scores.items()
         }
 
@@ -841,9 +834,7 @@ class SevenFactorOnlineEngine:
             w_exec = w.shift(1).fillna(0.0)
             turn = w_exec.diff().abs().sum(axis=1).fillna(0.0)
             f_bar_ret[k] = (
-                (w_exec * rets_1h).sum(axis=1)
-                - (w_exec * funding).sum(axis=1)
-                - turn * self.factor_turnover_penalty
+                (w_exec * rets_1h).sum(axis=1) - (w_exec * funding).sum(axis=1) - turn * self.factor_turnover_penalty
             )
         df_frets = pd.DataFrame(f_bar_ret, index=idx)
 
@@ -897,7 +888,7 @@ class SevenFactorOnlineEngine:
         zero_rows = raw_fw.sum(axis=1) <= 1e-12
         if zero_rows.any():
             fallback_fw = pd.DataFrame(
-                np.tile((priors_aligned.values ** 2.0), (int(zero_rows.sum()), 1)),
+                np.tile((priors_aligned.values**2.0), (int(zero_rows.sum()), 1)),
                 index=raw_fw.index[zero_rows],
                 columns=raw_fw.columns,
             )
@@ -906,7 +897,7 @@ class SevenFactorOnlineEngine:
                     fallback_fw[f_name] = 0.0
             if (fallback_fw.sum(axis=1) <= 1e-12).any():
                 fallback_fw = pd.DataFrame(
-                    np.tile((priors_aligned.values ** 2.0), (int(zero_rows.sum()), 1)),
+                    np.tile((priors_aligned.values**2.0), (int(zero_rows.sum()), 1)),
                     index=raw_fw.index[zero_rows],
                     columns=raw_fw.columns,
                 )
@@ -939,9 +930,7 @@ class SevenFactorOnlineEngine:
                 index=idx,
                 dtype=float,
             )
-            conviction = (conviction * basis_regime_scalar).clip(
-                self.conviction_bounds[0], self.conviction_bounds[1]
-            )
+            conviction = (conviction * basis_regime_scalar).clip(self.conviction_bounds[0], self.conviction_bounds[1])
 
         comb_w = pd.DataFrame(0.0, index=idx, columns=cols)
         for k in FACTOR_NAMES:
@@ -956,9 +945,7 @@ class SevenFactorOnlineEngine:
 
         # Mejora 3: Dynamic Online F8_OrderFlow_CMF (Chaikin Accumulation/Distribution) Overlay
         f_cmf_score = 0.50 * cmf_24 + 0.30 * cmf_72 + 0.20 * cmf_168
-        w_cmf = make_continuous_neutral_weights(
-            f_cmf_score, inv_vol, gross_leverage=1.0, power=self.factor_power
-        )
+        w_cmf = make_continuous_neutral_weights(f_cmf_score, inv_vol, gross_leverage=1.0, power=self.factor_power)
         w_cmf_exec = w_cmf.shift(1).fillna(0.0)
         cmf_turn = w_cmf_exec.diff().abs().sum(axis=1).fillna(0.0)
         cmf_ret = (
@@ -982,17 +969,13 @@ class SevenFactorOnlineEngine:
         # to prevent selling the bottom of an intraday washout.
         if len(comb_w) > 4 and "rev" in fw_norm.columns and "macro" in t_df_raw.columns:
             rev_drop = (
-                (fw_norm["rev"].shift(4).fillna(0.0) > 0.45)
-                & (fw_norm["rev"] < 0.25)
-                & (t_df_raw["macro"] < 0.25)
+                (fw_norm["rev"].shift(4).fillna(0.0) > 0.45) & (fw_norm["rev"] < 0.25) & (t_df_raw["macro"] < 0.25)
             )
             if rev_drop.any():
                 comb_h = 0.55 * comb_w.shift(4).fillna(0.0) + 0.45 * comb_w
                 comb_w = comb_w.copy()
                 comb_w.loc[rev_drop] = comb_h.loc[rev_drop]
-                conviction = conviction.where(
-                    ~rev_drop, np.minimum(conviction, conviction.shift(4).fillna(0.50))
-                )
+                conviction = conviction.where(~rev_drop, np.minimum(conviction, conviction.shift(4).fillna(0.50)))
 
         # Issue #46 (M13 Ola 2): Real-Time Open Interest (OI) Squeeze/Knife Guard & Confirmation
         if oi_contracts is not None:
@@ -1000,30 +983,14 @@ class SevenFactorOnlineEngine:
             oi_chg_12h = oi_contracts.pct_change(12, fill_method=None).fillna(0.0)
             oi_chg_24h = oi_contracts.pct_change(24, fill_method=None).fillna(0.0)
 
-            sq_short = (
-                ((oi_chg_4h >= 0.06) | (oi_chg_12h >= 0.10))
-                & (ann_fund < -0.02)
-                & (zr[4] >= 0.80)
-            )
+            sq_short = ((oi_chg_4h >= 0.06) | (oi_chg_12h >= 0.10)) & (ann_fund < -0.02) & (zr[4] >= 0.80)
             fl_long = (
-                (fw_norm["rev"].values[:, None] > 0.35)
-                & (oi_chg_24h >= 0.06)
-                & (zr[12] <= -1.40)
-                & (cmf_24 < -0.05)
+                (fw_norm["rev"].values[:, None] > 0.35) & (oi_chg_24h >= 0.06) & (zr[12] <= -1.40) & (cmf_24 < -0.05)
             )
-            oi_confirm = (
-                (oi_chg_12h >= 0.04)
-                & (zi[24] >= 0.75)
-                & (cmf_24 > 0.05)
-            )
-            oi_flush_bounce = (
-                (oi_chg_12h <= -0.05)
-                & (zi[24] <= -1.20)
-                & (cmf_24 > 0.02)
-            )
+            oi_confirm = (oi_chg_12h >= 0.04) & (zi[24] >= 0.75) & (cmf_24 > 0.05)
+            oi_flush_bounce = (oi_chg_12h <= -0.05) & (zi[24] <= -1.20) & (cmf_24 > 0.02)
             comb_w = (
-                comb_w
-                .where(~((comb_w < 0.0) & sq_short), 0.25 * comb_w)
+                comb_w.where(~((comb_w < 0.0) & sq_short), 0.25 * comb_w)
                 .where(~((comb_w > 0.0) & fl_long), 0.25 * comb_w)
                 .where(~((comb_w > 0.0) & oi_confirm), 1.15 * comb_w)
                 .where(~((comb_w > 0.0) & oi_flush_bounce), 1.15 * comb_w)
@@ -1039,20 +1006,16 @@ class SevenFactorOnlineEngine:
             net_taker_usd = (2.0 * tbuy_df - qvol_df).fillna(0.0)
             tot_qvol_usd = qvol_df.fillna(dollar_vol)
             taker_cvd_24 = (
-                net_taker_usd.rolling(24, min_periods=4).sum()
-                / (tot_qvol_usd.rolling(24, min_periods=4).sum() + 1e-8)
-            ).clip(-1.0, 1.0).fillna(0.0)
+                (
+                    net_taker_usd.rolling(24, min_periods=4).sum()
+                    / (tot_qvol_usd.rolling(24, min_periods=4).sum() + 1e-8)
+                )
+                .clip(-1.0, 1.0)
+                .fillna(0.0)
+            )
             limit_abs_24 = (cmf_24 - taker_cvd_24).fillna(0.0)
-            ask_distrib = (
-                (limit_abs_24 <= -0.10)
-                & (taker_cvd_24 >= 0.015)
-                & (zi[12] <= -0.20)
-            )
-            bid_absorb = (
-                (limit_abs_24 >= 0.12)
-                & (taker_cvd_24 <= -0.020)
-                & (zi[12] >= 0.30)
-            )
+            ask_distrib = (limit_abs_24 <= -0.10) & (taker_cvd_24 >= 0.015) & (zi[12] <= -0.20)
+            bid_absorb = (limit_abs_24 >= 0.12) & (taker_cvd_24 <= -0.020) & (zi[12] >= 0.30)
 
         perp_froth = pd.DataFrame(False, index=idx, columns=cols)
         spot_led_short_guard = pd.DataFrame(False, index=idx, columns=cols)
@@ -1062,46 +1025,24 @@ class SevenFactorOnlineEngine:
             prem_12h = prem_close.rolling(12, min_periods=3).mean().fillna(0.0)
             prem_24h = prem_close.rolling(24, min_periods=4).mean().fillna(0.0)
             prem_168h = prem_close.rolling(168, min_periods=24).mean().fillna(0.0)
-            prem_std_168 = (
-                prem_close.rolling(168, min_periods=24).std().replace(0, 1e-4).fillna(1e-4)
-            )
+            prem_std_168 = prem_close.rolling(168, min_periods=24).std().replace(0, 1e-4).fillna(1e-4)
             prem_z12 = ((prem_12h - prem_168h) / prem_std_168).clip(-3.5, 3.5).fillna(0.0)
             prem_z24 = ((prem_24h - prem_168h) / prem_std_168).clip(-3.5, 3.5).fillna(0.0)
-            perp_froth = (
-                (prem_z12 >= 0.60)
-                & (prem_12h >= 0.0001)
-                & (zr[4] <= -0.50)
-                & (cmf_24 < 0.0)
-            )
-            spot_led_short_guard = (
-                (zi[24] >= 0.65)
-                & (prem_24h <= -0.0003)
-                & (prem_z24 <= -0.30)
-                & (cmf_24 > 0.0)
-            )
-            spot_led_long_confirm = (
-                (zi[24] >= 0.40)
-                & (prem_24h <= -0.0003)
-                & (prem_z24 <= -0.30)
-                & (cmf_24 > 0.0)
-            )
+            perp_froth = (prem_z12 >= 0.60) & (prem_12h >= 0.0001) & (zr[4] <= -0.50) & (cmf_24 < 0.0)
+            spot_led_short_guard = (zi[24] >= 0.65) & (prem_24h <= -0.0003) & (prem_z24 <= -0.30) & (cmf_24 > 0.0)
+            spot_led_long_confirm = (zi[24] >= 0.40) & (prem_24h <= -0.0003) & (prem_z24 <= -0.30) & (cmf_24 > 0.0)
 
         if has_cvd and not has_basis:
-            comb_w = (
-                comb_w
-                .where(~((comb_w > 0.0) & ask_distrib), 0.55 * comb_w)
-                .where(~((comb_w < 0.0) & bid_absorb), 0.60 * comb_w)
+            comb_w = comb_w.where(~((comb_w > 0.0) & ask_distrib), 0.55 * comb_w).where(
+                ~((comb_w < 0.0) & bid_absorb), 0.60 * comb_w
             )
         elif has_basis and not has_cvd:
-            comb_w = (
-                comb_w
-                .where(~((comb_w > 0.0) & perp_froth), 0.55 * comb_w)
-                .where(~((comb_w < 0.0) & spot_led_short_guard), 0.55 * comb_w)
+            comb_w = comb_w.where(~((comb_w > 0.0) & perp_froth), 0.55 * comb_w).where(
+                ~((comb_w < 0.0) & spot_led_short_guard), 0.55 * comb_w
             )
         elif has_cvd and has_basis:
             comb_w = (
-                comb_w
-                .where(~((comb_w > 0.0) & (ask_distrib | perp_froth)), 0.55 * comb_w)
+                comb_w.where(~((comb_w > 0.0) & (ask_distrib | perp_froth)), 0.55 * comb_w)
                 .where(~((comb_w < 0.0) & (bid_absorb | spot_led_short_guard)), 0.60 * comb_w)
                 .where(
                     ~((comb_w > 0.0) & spot_led_long_confirm & (taker_cvd_24 > 0.0)),
@@ -1122,14 +1063,8 @@ class SevenFactorOnlineEngine:
                 sd = m_df.std(axis=1).replace(0, 1.0).fillna(1.0)
                 return m_df.sub(mu, axis=0).div(sd, axis=0).clip(-3.5, 3.5).fillna(0.0)
 
-            f_sm_score = (
-                0.50 * _z_cs_df(sm_level)
-                + 0.30 * _z_cs_df(sm_chg_12h)
-                + 0.20 * _z_cs_df(sm_chg_24h)
-            )
-            w_sm = make_continuous_neutral_weights(
-                f_sm_score, inv_vol, gross_leverage=1.0, power=self.factor_power
-            )
+            f_sm_score = 0.50 * _z_cs_df(sm_level) + 0.30 * _z_cs_df(sm_chg_12h) + 0.20 * _z_cs_df(sm_chg_24h)
+            w_sm = make_continuous_neutral_weights(f_sm_score, inv_vol, gross_leverage=1.0, power=self.factor_power)
             w_sm_exec = w_sm.shift(1).fillna(0.0)
             sm_turn = w_sm_exec.diff().abs().sum(axis=1).fillna(0.0)
             sm_ret = (
@@ -1144,24 +1079,13 @@ class SevenFactorOnlineEngine:
                 t_sm += (m_sm / s_sm * np.sqrt(lb)).fillna(0.0) / float(len(self.lookbacks))
 
             has_valid_sm = (sm_div.abs().max(axis=1) > 1e-6).astype(float)
-            alpha_sm_dyn = (
-                (0.04 + ((t_sm - 0.30).clip(lower=0.0) * 0.10)).clip(upper=0.14) * has_valid_sm
-            )
+            alpha_sm_dyn = (0.04 + ((t_sm - 0.30).clip(lower=0.0) * 0.10)).clip(upper=0.14) * has_valid_sm
             comb_w = comb_w.mul(1.0 - alpha_sm_dyn, axis=0) + w_sm.mul(alpha_sm_dyn, axis=0)
 
-            whale_accum_squeeze = (
-                (sm_level >= 0.20)
-                & (sm_chg_12h >= 0.04)
-                & (zi[12] >= -0.25)
-            )
-            retail_long_trap = (
-                (sm_level <= -0.25)
-                & (sm_chg_12h <= -0.04)
-                & (zi[12] <= 0.25)
-            )
+            whale_accum_squeeze = (sm_level >= 0.20) & (sm_chg_12h >= 0.04) & (zi[12] >= -0.25)
+            retail_long_trap = (sm_level <= -0.25) & (sm_chg_12h <= -0.04) & (zi[12] <= 0.25)
             comb_w = (
-                comb_w
-                .where(~((comb_w < 0.0) & whale_accum_squeeze), 0.55 * comb_w)
+                comb_w.where(~((comb_w < 0.0) & whale_accum_squeeze), 0.55 * comb_w)
                 .where(~((comb_w > 0.0) & whale_accum_squeeze), 1.10 * comb_w)
                 .where(~((comb_w > 0.0) & retail_long_trap), 0.55 * comb_w)
                 .where(~((comb_w < 0.0) & retail_long_trap), 1.10 * comb_w)
@@ -1174,9 +1098,9 @@ class SevenFactorOnlineEngine:
             comb_w = comb_w.ewm(span=self.comb_ema_span, min_periods=1).mean()
 
         ones_df = pd.DataFrame(1.0, index=idx, columns=cols)
-        w_raw_1x = make_continuous_neutral_weights(
-            comb_w, ones_df, gross_leverage=1.0, power=self.comb_power
-        ).mul(conviction, axis=0)
+        w_raw_1x = make_continuous_neutral_weights(comb_w, ones_df, gross_leverage=1.0, power=self.comb_power).mul(
+            conviction, axis=0
+        )
 
         # Regime-Conditioned Water-Filling Concentration Cap (30% per asset when Trend >= 20%)
         # & Altcoin Sector Cluster Cap (48% per sector across all regimes — Issue #45).
@@ -1235,9 +1159,7 @@ class SevenFactorOnlineEngine:
                         c_sector_rv[vc] = -(z_blend_rv[vc] - c_mean)
 
             f_range_rev = (
-                -(0.25 * zi[12] + 0.35 * zi[24] + 0.25 * zi[48] + 0.15 * zi[72])
-                - 0.20 * zr[4]
-                + 0.40 * c_sector_rv
+                -(0.25 * zi[12] + 0.35 * zi[24] + 0.25 * zi[48] + 0.15 * zi[72]) - 0.20 * zr[4] + 0.40 * c_sector_rv
             ) * (1.20 / vol_surge.clip(0.65, 1.80))
             f_whipsaw_rev = -(0.45 * zi[168] + 0.35 * zi[336] + 0.20 * zi[72]) + 0.35 * c_sector_rv
 
@@ -1263,10 +1185,12 @@ class SevenFactorOnlineEngine:
                     max_cluster_share=self.alt_cluster_cap if has_cl else None,
                 )
 
-            def _fast_rolling_tstat(w_u: pd.DataFrame, lbs: Tuple[int, ...]) -> pd.Series:
+            def _fast_rolling_tstat(w_u: pd.DataFrame, lbs: tuple[int, ...]) -> pd.Series:
                 w_ex = w_u.shift(1).fillna(0.0)
                 turn_s = w_ex.diff().abs().sum(axis=1).fillna(0.0)
-                r_s = (w_ex * rets_1h).sum(axis=1) - (w_ex * funding).sum(axis=1) - turn_s * self.factor_turnover_penalty
+                r_s = (
+                    (w_ex * rets_1h).sum(axis=1) - (w_ex * funding).sum(axis=1) - turn_s * self.factor_turnover_penalty
+                )
                 t_out = pd.Series(0.0, index=idx, dtype=float)
                 for lb_w in lbs:
                     mp = max(6, lb_w // 4)
@@ -1291,9 +1215,8 @@ class SevenFactorOnlineEngine:
             alpha_chop_overlay = (raw_chop_gate * self.chop_max_alpha).clip(0.0, self.chop_max_alpha)
 
             spec_conv = (0.45 + 0.25 * t_chop_spec.clip(0.0, 1.5)).clip(0.45, 0.75)
-            w_base_1x = (
-                w_base_1x.mul(1.0 - alpha_chop_overlay, axis=0)
-                + w_chop_spec.mul(spec_conv, axis=0).mul(alpha_chop_overlay, axis=0)
+            w_base_1x = w_base_1x.mul(1.0 - alpha_chop_overlay, axis=0) + w_chop_spec.mul(spec_conv, axis=0).mul(
+                alpha_chop_overlay, axis=0
             )
             if has_wf or has_cl:
                 w_base_1x = cap_side_weights_waterfill(
@@ -1302,7 +1225,11 @@ class SevenFactorOnlineEngine:
                     max_cluster_share=self.alt_cluster_cap if has_cl else None,
                 )
             conviction = pd.Series(
-                np.where(alpha_chop_overlay >= 0.25, np.maximum(conviction, spec_conv * alpha_chop_overlay + conviction * (1.0 - alpha_chop_overlay)), conviction),
+                np.where(
+                    alpha_chop_overlay >= 0.25,
+                    np.maximum(conviction, spec_conv * alpha_chop_overlay + conviction * (1.0 - alpha_chop_overlay)),
+                    conviction,
+                ),
                 index=idx,
             )
 
@@ -1322,10 +1249,7 @@ class SevenFactorOnlineEngine:
                 t_med_s = t_df["med"]
                 t_fst_s = t_df["fast"]
                 is_lone_macro = (
-                    (fw_norm["macro"] > 0.50)
-                    & (t_med_s <= 0.10)
-                    & (t_fst_s <= -0.05)
-                    & ((t_med_s + t_fst_s) <= -0.15)
+                    (fw_norm["macro"] > 0.50) & (t_med_s <= 0.10) & (t_fst_s <= -0.05) & ((t_med_s + t_fst_s) <= -0.15)
                 )
                 w_whip_spec = make_continuous_neutral_weights(
                     0.35 * w_range_u + 0.25 * w_sect_u + 0.40 * w_whip_u,
@@ -1356,15 +1280,11 @@ class SevenFactorOnlineEngine:
                     index=idx,
                     columns=cols,
                 )
-                div_strength = (
-                    ((-0.10 - (t_med_s + t_fst_s)) / 0.70).clip(0.0, 1.0)
-                    * ((fw_norm["macro"] - 0.45) / 0.45).clip(0.0, 1.0)
-                )
+                div_strength = ((-0.10 - (t_med_s + t_fst_s)) / 0.70).clip(0.0, 1.0) * (
+                    (fw_norm["macro"] - 0.45) / 0.45
+                ).clip(0.0, 1.0)
                 blend_lm = (div_strength * 0.80).where(is_lone_macro, 0.0)
-                w_base_1x = (
-                    w_base_1x.mul(1.0 - blend_lm, axis=0)
-                    + w_target_spec.mul(0.55 * blend_lm, axis=0)
-                )
+                w_base_1x = w_base_1x.mul(1.0 - blend_lm, axis=0) + w_target_spec.mul(0.55 * blend_lm, axis=0)
                 if has_wf or has_cl:
                     w_base_1x = cap_side_weights_waterfill(
                         w_base_1x,
@@ -1394,15 +1314,14 @@ class SevenFactorOnlineEngine:
                 gross_t = w_base_1x.abs().sum(axis=1) * bull_exhaustion_scale
                 p_sum0 = pos_b0.sum(axis=1).replace(0, 1.0)
                 n_sum0 = neg_b0.sum(axis=1).replace(0, 1.0)
-                w_base_1x = (
-                    pos_b0.div(p_sum0, axis=0).mul(gross_t / 2.0, axis=0)
-                    - neg_b0.div(n_sum0, axis=0).mul(gross_t / 2.0, axis=0)
+                w_base_1x = pos_b0.div(p_sum0, axis=0).mul(gross_t / 2.0, axis=0) - neg_b0.div(n_sum0, axis=0).mul(
+                    gross_t / 2.0, axis=0
                 )
 
                 port_beta_s = (w_base_1x * beta_72).sum(axis=1)
                 b_mean_s = beta_72.mean(axis=1)
                 b_cent_s = beta_72.sub(b_mean_s, axis=0)
-                b_var_s = (b_cent_s ** 2).sum(axis=1).replace(0, 1.0)
+                b_var_s = (b_cent_s**2).sum(axis=1).replace(0, 1.0)
                 need_beta_fix = is_bull_surge & (port_beta_s < 0.03) & (gross_t > 1e-8)
                 if need_beta_fix.any():
                     excess_b = port_beta_s - 0.05
@@ -1412,16 +1331,13 @@ class SevenFactorOnlineEngine:
                     neg_b1 = (-w_b_fix).clip(lower=0.0)
                     ps_b1 = pos_b1.sum(axis=1).replace(0, 1.0)
                     ns_b1 = neg_b1.sum(axis=1).replace(0, 1.0)
-                    w_fixed = (
-                        pos_b1.div(ps_b1, axis=0).mul(gross_t / 2.0, axis=0)
-                        - neg_b1.div(ns_b1, axis=0).mul(gross_t / 2.0, axis=0)
+                    w_fixed = pos_b1.div(ps_b1, axis=0).mul(gross_t / 2.0, axis=0) - neg_b1.div(ns_b1, axis=0).mul(
+                        gross_t / 2.0, axis=0
                     )
                     w_base_1x.loc[need_beta_fix] = w_fixed.loc[need_beta_fix]
 
         unit_ret_1h = (w_base_1x.shift(1).fillna(0.0) * rets_1h).sum(axis=1)
-        port_vol_72h = (
-            unit_ret_1h.rolling(72, min_periods=12).std().bfill().fillna(0.003)
-        )
+        port_vol_72h = unit_ret_1h.rolling(72, min_periods=12).std().bfill().fillna(0.003)
         median_vol = float(port_vol_72h.median()) if len(port_vol_72h) > 0 else 0.003
         if median_vol <= 1e-8 or np.isnan(median_vol):
             median_vol = 0.003
@@ -1460,16 +1376,14 @@ class SevenFactorOnlineEngine:
 
     def allocate_latest(
         self,
-        bars_1h: Dict[str, pd.DataFrame],
-        funding_rates: Optional[Dict[str, Union[float, pd.Series, pd.DataFrame]]] = None,
-        bars_15m: Optional[Dict[str, pd.DataFrame]] = None,
-        open_interest: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        taker_flow: Optional[Dict[str, pd.DataFrame]] = None,
-        premium_index: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        smart_money: Optional[Dict[str, Union[pd.Series, pd.DataFrame]]] = None,
-        quarterly_basis: Optional[
-            Union[float, pd.Series, pd.DataFrame, Dict[str, Union[float, pd.Series, pd.DataFrame]]]
-        ] = None,
+        bars_1h: dict[str, pd.DataFrame],
+        funding_rates: dict[str, float | pd.Series | pd.DataFrame] | None = None,
+        bars_15m: dict[str, pd.DataFrame] | None = None,
+        open_interest: dict[str, pd.Series | pd.DataFrame] | None = None,
+        taker_flow: dict[str, pd.DataFrame] | None = None,
+        premium_index: dict[str, pd.Series | pd.DataFrame] | None = None,
+        smart_money: dict[str, pd.Series | pd.DataFrame] | None = None,
+        quarterly_basis: float | pd.Series | pd.DataFrame | dict[str, float | pd.Series | pd.DataFrame] | None = None,
     ) -> SevenFactorAllocationResult:
         """
         Evaluates the 7-Factor Causal Online Engine on the latest bar and returns
@@ -1497,17 +1411,14 @@ class SevenFactorOnlineEngine:
         gross_target = float(w_latest.abs().sum())
         if abs(port_beta) > 0.15 and gross_target > 1e-8:
             b_centered = beta_latest - float(beta_latest.mean())
-            b_var = float((b_centered ** 2).sum())
+            b_var = float((b_centered**2).sum())
             if b_var > 1e-8:
                 excess_beta = port_beta - np.sign(port_beta) * 0.10
                 w_adj = w_latest - (excess_beta / b_var) * b_centered
                 pos = w_adj.clip(lower=0.0)
                 neg = (-w_adj).clip(lower=0.0)
                 if pos.sum() > 1e-10 and neg.sum() > 1e-10:
-                    w_latest = (
-                        pos * ((gross_target / 2.0) / pos.sum())
-                        - neg * ((gross_target / 2.0) / neg.sum())
-                    )
+                    w_latest = pos * ((gross_target / 2.0) / pos.sum()) - neg * ((gross_target / 2.0) / neg.sum())
                     port_beta = float((w_latest * beta_latest).sum())
 
         unit_weights = {str(k): float(v) for k, v in w_latest.items()}

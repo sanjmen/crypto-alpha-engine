@@ -1,10 +1,8 @@
 import numpy as np
-import pytest
 
 from src.features.cross_sectional import (
-    gaussian_rank_transform,
-    cross_sectional_zscore,
     dollar_neutralize,
+    gaussian_rank_transform,
     neutralize_beta,
 )
 

@@ -10,17 +10,18 @@ Comprehensive Unit & Integration Tests for Milestones M11 & M12 (Issues #37 to #
 - Issue #44: Shadow-to-Live Go/No-Go Validation Suite
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from scripts.run_trading import evaluate_shadow_readiness
-from src.domain.entities import Portfolio, Position
+from src.domain.entities import Position
 from src.domain.enums import OrderSide, PositionSide
 from src.execution.database import ShadowDatabase
-from src.execution.live_broker import BinanceLiveBroker, MaxDrawdownStopError
+from src.execution.live_broker import BinanceLiveBroker
 from src.execution.monitor import ShadowMonitor
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.shadow_daemon import ShadowTradingDaemon
@@ -31,11 +32,12 @@ from src.strategies.seven_factor_engine import (
     FACTOR_NAMES,
     SevenFactorOnlineEngine,
     cap_side_weights_waterfill,
-    make_continuous_neutral_weights,
 )
 
 
-def _build_synthetic_universe(n_bars: int = 800, seed: int = 42) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+def _build_synthetic_universe(
+    n_bars: int = 800, seed: int = 42
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Generates synthetic 1h and 15m OHLCV DataFrames for 6 symbols."""
     rng = np.random.default_rng(seed)
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
@@ -57,24 +59,28 @@ def _build_synthetic_universe(n_bars: int = 800, seed: int = 42) -> tuple[dict[s
         lows = np.minimum(opens, closes) * 0.997
         vols = rng.uniform(50_000, 250_000, size=n_bars)
 
-        bars_1h[sym] = pd.DataFrame({
-            "timestamp": idx_1h,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": vols,
-        })
+        bars_1h[sym] = pd.DataFrame(
+            {
+                "timestamp": idx_1h,
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": vols,
+            }
+        )
 
         c15 = closes[-1] * np.exp(np.cumsum(rng.normal(0.0, 0.002, size=96)))
-        bars_15m[sym] = pd.DataFrame({
-            "timestamp": idx_15m,
-            "open": c15,
-            "high": c15 * 1.001,
-            "low": c15 * 0.999,
-            "close": c15,
-            "volume": rng.uniform(10_000, 50_000, size=96),
-        })
+        bars_15m[sym] = pd.DataFrame(
+            {
+                "timestamp": idx_15m,
+                "open": c15,
+                "high": c15 * 1.001,
+                "low": c15 * 0.999,
+                "close": c15,
+                "volume": rng.uniform(10_000, 50_000, size=96),
+            }
+        )
 
     return bars_1h, bars_15m
 
@@ -157,8 +163,7 @@ def test_meta_allocator_and_daemon_warm_start_integration():
         src = bars_1h.get(clean, next(iter(bars_1h.values())))
         tail = src.tail(min(limit, len(src)))
         return [
-            [int(r.timestamp.timestamp() * 1000), r.open, r.high, r.low, r.close, r.volume]
-            for _, r in tail.iterrows()
+            [int(r.timestamp.timestamp() * 1000), r.open, r.high, r.low, r.close, r.volume] for _, r in tail.iterrows()
         ]
 
     mock_ex.fetch_ohlcv.side_effect = _mock_ohlcv
@@ -472,10 +477,7 @@ def test_mejora_2_and_3_falling_knife_guard_and_cmf_orderflow_overlay():
     assert pytest.approx(sum(res.unit_weights.values()), abs=1e-6) == 0.0
 
     # Also verify graceful fallback when high/low columns are omitted from bars_1h
-    bars_close_only = {
-        sym: df[["timestamp", "close", "volume"]].copy()
-        for sym, df in bars_1h.items()
-    }
+    bars_close_only = {sym: df[["timestamp", "close", "volume"]].copy() for sym, df in bars_1h.items()}
     res_fallback = engine.allocate_latest(bars_1h=bars_close_only)
     assert pytest.approx(sum(res_fallback.unit_weights.values()), abs=1e-6) == 0.0
 
@@ -547,7 +549,7 @@ def test_nov1_active_leg_concentration_cap_and_waterfill():
     assert max(short_vals) <= 0.32 * 0.625 + 1e-6
 
 
-def test_m13_issue_45_altcoin_sector_cluster_cap():
+def test_altcoin_sector_cluster_cap():
     """
     Tests Issue #45 (Dynamic Altcoin Sector Cluster Cap <= 48% with water-filling):
     Verifies that when correlated tokens in the same altcoin sector (e.g., AI_COMPUTE: FET+RENDER
@@ -555,14 +557,30 @@ def test_m13_issue_45_altcoin_sector_cluster_cap():
     and excess weight is water-filled into unclipped sectors while preserving 100% dollar neutrality.
     """
     cols = [
-        "FET/USDT", "RENDER/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT",
-        "SOL/USDT", "SUI/USDT", "AVAX/USDT", "LINK/USDT", "ARB/USDT",
+        "FET/USDT",
+        "RENDER/USDT",
+        "BTC/USDT",
+        "ETH/USDT",
+        "BNB/USDT",
+        "SOL/USDT",
+        "SUI/USDT",
+        "AVAX/USDT",
+        "LINK/USDT",
+        "ARB/USDT",
     ]
     # FET (29%) + RENDER (29%) = 58% of Long leg (> 48% AI_COMPUTE cluster cap)
     # SOL (22%) + SUI (22%) + AVAX (22%) = 66% of Short leg (> 48% FAST_L1 cluster cap)
     raw_row = [
-        0.145, 0.145, 0.08, 0.07, 0.06,
-        -0.11, -0.11, -0.11, -0.09, -0.08,
+        0.145,
+        0.145,
+        0.08,
+        0.07,
+        0.06,
+        -0.11,
+        -0.11,
+        -0.11,
+        -0.09,
+        -0.08,
     ]
     w_df = pd.DataFrame([raw_row], columns=cols)
 
@@ -581,7 +599,7 @@ def test_m13_issue_45_altcoin_sector_cluster_cap():
     assert fast_l1_share_short <= 0.48 + 1e-6
 
 
-def test_m13_issue_46_open_interest_squeeze_and_knife_guard():
+def test_open_interest_squeeze_and_knife_guard():
     """
     Tests Issue #46 (Real-Time Open Interest Squeeze/Knife Guard & Confirmation):
     Verifies that SevenFactorOnlineEngine accepts `open_interest` DataFrames/Series,
@@ -594,10 +612,12 @@ def test_m13_issue_46_open_interest_squeeze_and_knife_guard():
         # Synthetic OI series with a +15% surge on the last 12 bars
         oi_vals = np.full(len(df), 1_000_000.0)
         oi_vals[-12:] = np.linspace(1_000_000.0, 1_150_000.0, 12)
-        oi_data[sym] = pd.DataFrame({
-            "timestamp": df["timestamp"],
-            "sumOpenInterest": oi_vals,
-        })
+        oi_data[sym] = pd.DataFrame(
+            {
+                "timestamp": df["timestamp"],
+                "sumOpenInterest": oi_vals,
+            }
+        )
 
     engine = SevenFactorOnlineEngine()
     res = engine.allocate_latest(
@@ -609,7 +629,7 @@ def test_m13_issue_46_open_interest_squeeze_and_knife_guard():
     assert sum(abs(v) for v in res.unit_weights.values()) > 0.0
 
 
-def test_m13_wave3_issue_48_and_49_true_taker_cvd_and_basis_alpha():
+def test_true_taker_cvd_and_basis_alpha():
     """
     Tests Milestone M13 Wave 3:
     1) Issue #48: Factor F8 True Taker Buy/Sell CVD & Institutional Limit Absorption (`taker_flow`).
@@ -623,18 +643,22 @@ def test_m13_wave3_issue_48_and_49_true_taker_cvd_and_basis_alpha():
         qvol = (df["close"] * df["volume"]).values
         # Alternate net taker buying (55%) vs net taker selling (44%) across symbols
         tbuy_ratio = 0.55 if (i % 2 == 0) else 0.44
-        taker_flow[sym] = pd.DataFrame({
-            "timestamp": df["timestamp"],
-            "quote_volume": qvol,
-            "taker_buy_quote_volume": qvol * tbuy_ratio,
-        })
+        taker_flow[sym] = pd.DataFrame(
+            {
+                "timestamp": df["timestamp"],
+                "quote_volume": qvol,
+                "taker_buy_quote_volume": qvol * tbuy_ratio,
+            }
+        )
         # Alternate negative Spot-Perp discount (-5 bps) vs positive Perp froth (+6 bps)
         prem_vals = np.full(len(df), -0.0002 if (i % 2 == 0) else 0.0001)
         prem_vals[-24:] = -0.0005 if (i % 2 == 0) else 0.0006
-        premium_index[sym] = pd.DataFrame({
-            "timestamp": df["timestamp"],
-            "close": prem_vals,
-        })
+        premium_index[sym] = pd.DataFrame(
+            {
+                "timestamp": df["timestamp"],
+                "close": prem_vals,
+            }
+        )
 
     engine = SevenFactorOnlineEngine()
     res_cvd = engine.allocate_latest(bars_1h=bars_1h, bars_15m=bars_15m, taker_flow=taker_flow)
@@ -824,7 +848,7 @@ def test_unified_trading_launcher_mode_and_db_isolation():
     db.close()
 
 
-def test_m13_lever1_issue_52_f6_liq_tstat_gate_and_top4_priors():
+def test_f6_liq_tstat_gate_and_top4_priors():
     """
     Tests Issue #52 (Lever #1):
     1) DEFAULT_PRIORS boosts Top 4 audited profit generators (size=0.22, fast=0.19, carry=0.18, rev=0.16)
@@ -859,7 +883,7 @@ def test_m13_lever1_issue_52_f6_liq_tstat_gate_and_top4_priors():
     assert np.allclose(mats_def["fw_norm"].sum(axis=1).values, 1.0, atol=1e-5)
 
 
-def test_m13_lever2_issue_53_anomaly_maker_limit_and_pct_equity_sizing():
+def test_anomaly_maker_limit_and_pct_equity_sizing():
     """
     Tests Issue #53 (Lever #2):
     1) Dynamic % equity sizing (anomaly_pct_equity=0.045) scales max anomaly notional to 4.5% of total equity
@@ -906,14 +930,16 @@ def test_m13_lever2_issue_53_anomaly_maker_limit_and_pct_equity_sizing():
         "SUI/USDT": {"price": 2.00, "bid": 1.999, "ask": 2.000, "change_24h": 16.0, "volume_24h": 80_000_000.0},
     }
     ts_idx = pd.date_range("2026-03-01", periods=30, freq="1h", tz="UTC")
-    fake_klines = pd.DataFrame({
-        "timestamp": ts_idx,
-        "open": np.full(30, 1.95),
-        "high": np.full(30, 2.02),
-        "low": np.full(30, 1.92),
-        "close": np.full(30, 2.00),
-        "volume": np.full(30, 1_000_000.0),
-    })
+    fake_klines = pd.DataFrame(
+        {
+            "timestamp": ts_idx,
+            "open": np.full(30, 1.95),
+            "high": np.full(30, 2.02),
+            "low": np.full(30, 1.92),
+            "close": np.full(30, 2.00),
+            "volume": np.full(30, 1_000_000.0),
+        }
+    )
     daemon.fetch_symbol_klines = MagicMock(return_value=fake_klines)
 
     orders = daemon.run_anomaly_scan()
@@ -931,7 +957,7 @@ def test_m13_lever2_issue_53_anomaly_maker_limit_and_pct_equity_sizing():
     db.close()
 
 
-def test_m13_levers3_and_4_issue_54_market_neutral_3x_and_multi_slice_chunking():
+def test_market_neutral_3x_and_multi_slice_chunking():
     """
     Tests Issue #54 (Levers #3 & #4):
     1) Market-Neutral 3.0x Base Leverage Calibration with tighter 6% DD de-step bracket.
@@ -989,7 +1015,7 @@ def test_m13_levers3_and_4_issue_54_market_neutral_3x_and_multi_slice_chunking()
     db.close()
 
 
-def test_m13_tier1a_issue_55_smart_money_institutional_positioning_factor(tmp_path):
+def test_smart_money_institutional_positioning_factor(tmp_path):
     """
     Tests Issue #55 (Tier 1A: Factor F8_Smart_Money_Flow via fapiData Whale vs. Retail Ratios):
     1) Verifies SevenFactorOnlineEngine computes `sm_div = ln(top_pos_ls_ratio / global_acc_ls_ratio)`,
@@ -1010,11 +1036,13 @@ def test_m13_tier1a_issue_55_smart_money_institutional_positioning_factor(tmp_pa
         else:
             w_ratio = np.linspace(1.15, 0.88, len(df))
             r_ratio = np.linspace(1.40, 2.25, len(df))
-        smart_money[sym] = pd.DataFrame({
-            "timestamp": df["timestamp"],
-            "top_pos_ls_ratio": w_ratio,
-            "global_acc_ls_ratio": r_ratio,
-        })
+        smart_money[sym] = pd.DataFrame(
+            {
+                "timestamp": df["timestamp"],
+                "top_pos_ls_ratio": w_ratio,
+                "global_acc_ls_ratio": r_ratio,
+            }
+        )
 
     engine = SevenFactorOnlineEngine()
     mats = engine.compute_matrices(bars_1h=bars_1h, bars_15m=bars_15m, smart_money=smart_money)
@@ -1056,7 +1084,7 @@ def test_m13_tier1a_issue_55_smart_money_institutional_positioning_factor(tmp_pa
     db.close()
 
 
-def test_m13_tier1b_issue_56_extreme_funding_harvester_and_beta_neutral_hedge(tmp_path):
+def test_extreme_funding_harvester_and_beta_neutral_hedge(tmp_path):
     """
     Tests Issue #56 (Tier 1B: Extreme Funding Rate Harvester across 300+ USDS-M Perpetuals
     with Beta-Neutral Hedge):
@@ -1077,14 +1105,16 @@ def test_m13_tier1b_issue_56_extreme_funding_harvester_and_beta_neutral_hedge(tm
     ts = pd.date_range("2026-03-01", periods=30, freq="1h", tz="UTC")
     # Controlled price series (+2% over 24h, +0.5% over 4h)
     closes = np.linspace(10.0, 10.20, 30)
-    df_kline = pd.DataFrame({
-        "timestamp": ts,
-        "open": closes * 0.998,
-        "high": closes * 1.005,
-        "low": closes * 0.995,
-        "close": closes,
-        "volume": np.full(30, 500_000.0),
-    })
+    df_kline = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": closes * 0.998,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": np.full(30, 500_000.0),
+        }
+    )
 
     # 1a. Deep negative funding (-0.35% / 8h == -383% APR) -> LONG carry + short squeeze harvest
     sigs_long = harvester.generate_signals(
@@ -1169,7 +1199,7 @@ def test_m13_tier1b_issue_56_extreme_funding_harvester_and_beta_neutral_hedge(tm
     db.close()
 
 
-def test_m13_tier1c_issue_57_yield_bearing_collateral_bfusd_ldusdt_accounting(tmp_path):
+def test_yield_bearing_collateral_bfusd_ldusdt_accounting(tmp_path):
     """
     Tests Issue #57 (Tier 1C: Yield-Bearing Futures Collateral Integration — BFUSD & LDUSDT):
     1) Verifies BinanceLiveBroker.compute_effective_margin_collateral() aggregates USDT (100%),
@@ -1219,7 +1249,7 @@ def test_m13_tier1c_issue_57_yield_bearing_collateral_bfusd_ldusdt_accounting(tm
     db.close()
 
 
-def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_path):
+def test_quarterly_basis_regime_and_ecosystem_guardrails(tmp_path):
     """
     Tests Issue #58 (Tier 2: Quarterly Delivery Basis Regime Indicator `fapiDataGetBasis`
     & Ecosystem Guardrails):
@@ -1238,11 +1268,13 @@ def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_
     engine = SevenFactorOnlineEngine()
 
     # 1a. Healthy Institutional Contango (+10% APR) -> scalar = 1.05
-    df_contango = pd.DataFrame({
-        "timestamp": ts_col,
-        "basisRate": np.full(len(ts_col), 0.025),
-        "annualizedBasisRate": np.full(len(ts_col), 0.10),
-    })
+    df_contango = pd.DataFrame(
+        {
+            "timestamp": ts_col,
+            "basisRate": np.full(len(ts_col), 0.025),
+            "annualizedBasisRate": np.full(len(ts_col), 0.10),
+        }
+    )
     res_contango = engine.allocate_latest(
         bars_1h=bars_1h,
         bars_15m=bars_15m,
@@ -1253,11 +1285,13 @@ def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_
     assert pytest.approx(sum(res_contango.unit_weights.values()), abs=1e-6) == 0.0
 
     # 1b. Severe Backwardation Stress (-4% APR) -> scalar = 0.88
-    df_back = pd.DataFrame({
-        "timestamp": ts_col,
-        "basisRate": np.full(len(ts_col), -0.010),
-        "annualizedBasisRate": np.full(len(ts_col), -0.04),
-    })
+    df_back = pd.DataFrame(
+        {
+            "timestamp": ts_col,
+            "basisRate": np.full(len(ts_col), -0.010),
+            "annualizedBasisRate": np.full(len(ts_col), -0.04),
+        }
+    )
     res_back = engine.allocate_latest(
         bars_1h=bars_1h,
         bars_15m=bars_15m,
@@ -1268,11 +1302,13 @@ def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_
     assert res_contango.conviction >= res_back.conviction
 
     # 1c. Overheated Retail Blow-Off (+30% APR) -> scalar = 0.90
-    df_hot = pd.DataFrame({
-        "timestamp": ts_col,
-        "basisRate": np.full(len(ts_col), 0.075),
-        "annualizedBasisRate": np.full(len(ts_col), 0.30),
-    })
+    df_hot = pd.DataFrame(
+        {
+            "timestamp": ts_col,
+            "basisRate": np.full(len(ts_col), 0.075),
+            "annualizedBasisRate": np.full(len(ts_col), 0.30),
+        }
+    )
     res_hot = engine.allocate_latest(
         bars_1h=bars_1h,
         bars_15m=bars_15m,
@@ -1291,7 +1327,12 @@ def test_m13_tier2_issue_58_quarterly_basis_regime_and_ecosystem_guardrails(tmp_
         def fapiDataGetBasis(params):
             assert params["contractType"] == "CURRENT_QUARTER"
             return [
-                {"pair": params["pair"], "basisRate": "0.022", "annualizedBasisRate": "0.095", "timestamp": 1710000000000},
+                {
+                    "pair": params["pair"],
+                    "basisRate": "0.022",
+                    "annualizedBasisRate": "0.095",
+                    "timestamp": 1710000000000,
+                },
                 {"pair": params["pair"], "basisRate": "0.025", "annualizedBasisRate": "", "timestamp": 1710003600000},
             ]
 
@@ -1551,12 +1592,3 @@ def test_generalized_scripts_cli_parsers() -> None:
     assert d_args.mode == "vision"
     assert d_args.preset == "all82"
     assert d_args.include_subhourly is True
-
-
-
-
-
-
-
-
-

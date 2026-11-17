@@ -16,13 +16,15 @@ def synthetic_covariance():
     # Assets 0 and 1 belong to Cluster A (high correlation 0.8)
     # Assets 2 and 3 belong to Cluster B (high correlation 0.7)
     # Asset 4 is uncorrelated idiosyncratic asset
-    corr = np.array([
-        [1.0, 0.8, 0.1, 0.1, 0.0],
-        [0.8, 1.0, 0.1, 0.1, 0.0],
-        [0.1, 0.1, 1.0, 0.7, 0.0],
-        [0.1, 0.1, 0.7, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 1.0],
-    ])
+    corr = np.array(
+        [
+            [1.0, 0.8, 0.1, 0.1, 0.0],
+            [0.8, 1.0, 0.1, 0.1, 0.0],
+            [0.1, 0.1, 1.0, 0.7, 0.0],
+            [0.1, 0.1, 0.7, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+        ]
+    )
     # Volatilities: Asset 0 has higher vol than Asset 1
     vols = np.array([0.05, 0.02, 0.04, 0.03, 0.01])
     cov = np.outer(vols, vols) * corr
@@ -31,11 +33,13 @@ def synthetic_covariance():
 
 
 def test_correlation_to_distance():
-    corr = np.array([
-        [1.0, 0.5, -0.5],
-        [0.5, 1.0, 0.0],
-        [-0.5, 0.0, 1.0],
-    ])
+    corr = np.array(
+        [
+            [1.0, 0.5, -0.5],
+            [0.5, 1.0, 0.0],
+            [-0.5, 0.0, 1.0],
+        ]
+    )
     dist = HierarchicalRiskParity.correlation_to_distance(corr)
 
     # Diagonal must be 0
@@ -84,12 +88,14 @@ def test_hrp_on_collinear_singular_matrix():
     # Markowitz Mean-Variance fails on collinear/singular matrices.
     # Create rank-deficient covariance matrix with duplicate assets
     vols = np.array([0.02, 0.02, 0.02, 0.02])
-    corr = np.array([
-        [1.0, 1.0, 0.2, 0.2],
-        [1.0, 1.0, 0.2, 0.2],  # Duplicate of asset 0
-        [0.2, 0.2, 1.0, 0.9],
-        [0.2, 0.2, 0.9, 1.0],
-    ])
+    corr = np.array(
+        [
+            [1.0, 1.0, 0.2, 0.2],
+            [1.0, 1.0, 0.2, 0.2],  # Duplicate of asset 0
+            [0.2, 0.2, 1.0, 0.9],
+            [0.2, 0.2, 0.9, 1.0],
+        ]
+    )
     cov = np.outer(vols, vols) * corr
     assert np.linalg.matrix_rank(cov) < 4  # Singular matrix!
 

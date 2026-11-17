@@ -14,6 +14,48 @@ import pandas as pd
 from scipy import stats
 
 
+def _resolve_t1_positions(
+    X: pd.DataFrame | pd.Series | np.ndarray,
+    t1: pd.Series | None,
+) -> np.ndarray:
+    """
+    Maps each observation index `i` to the positional end index of its label horizon `t1`.
+    Handles duplicate panel timestamps and out-of-range future `t1` timestamps safely.
+    """
+    n_samples = len(X)
+    if t1 is None or not isinstance(X, (pd.DataFrame, pd.Series)):
+        return np.arange(n_samples, dtype=int)
+
+    index_vals = X.index
+    if len(t1) == n_samples and t1.index.equals(index_vals):
+        t1_targets = t1.values
+    else:
+        time_to_pos = {ts: pos for pos, ts in enumerate(index_vals)}
+        t1_positions = np.empty(n_samples, dtype=int)
+        for pos, ts in enumerate(index_vals):
+            raw_end = t1.get(ts, ts)
+            if isinstance(raw_end, pd.Series):
+                raw_end = raw_end.iloc[-1]
+            if raw_end in time_to_pos:
+                t1_positions[pos] = time_to_pos[raw_end]
+            else:
+                try:
+                    t1_positions[pos] = int(np.searchsorted(index_vals, raw_end, side="right")) - 1
+                except TypeError:
+                    t1_positions[pos] = n_samples
+        return np.maximum(t1_positions, np.arange(n_samples, dtype=int))
+
+    try:
+        resolved = np.searchsorted(index_vals.values, t1_targets, side="right") - 1
+        return np.maximum(resolved.astype(int), np.arange(n_samples, dtype=int))
+    except TypeError:
+        time_to_pos = {ts: pos for pos, ts in enumerate(index_vals)}
+        return np.array(
+            [max(pos, time_to_pos.get(val, n_samples)) for pos, val in enumerate(t1_targets)],
+            dtype=int,
+        )
+
+
 class PurgedWalkForwardCV:
     """
     Purged and Embargoed Walk-Forward Cross-Validation.
@@ -30,15 +72,7 @@ class PurgedWalkForwardCV:
         test_pct: float | None = None,
         embargo_pct: float = 0.01,
         expanding: bool = True,
-    ):
-        """
-        Args:
-            n_splits: Number of walk-forward folds.
-            min_train_pct: Minimum fraction of data required for the first training set.
-            test_pct: Fraction of data per test fold (if None, splits remaining data equally).
-            embargo_pct: Fraction of total dataset length used as embargo after test period.
-            expanding: If True, train window expands; if False, rolling fixed-size window.
-        """
+    ) -> None:
         if n_splits < 1:
             raise ValueError("n_splits must be at least 1")
         self.n_splits = n_splits
@@ -55,34 +89,14 @@ class PurgedWalkForwardCV:
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """
         Generates (train_indices, test_indices) tuples.
-
-        Args:
-            X: Feature matrix. If DataFrame with DatetimeIndex or RangeIndex,
-               timestamps/indices are extracted.
-            y: Optional target series.
-            t1: Series of label end times (touch time) indexed by event start time (t0).
-                If None, assumes 1-step non-overlapping labels (t1 = t0).
         """
         n_samples = len(X)
         if n_samples == 0:
             return
 
         indices = np.arange(n_samples)
+        t1_positions = _resolve_t1_positions(X, t1)
 
-        # Build t1 index mapping
-        if t1 is not None and isinstance(X, (pd.DataFrame, pd.Series)):
-            # Map index positions to exit index positions
-            t0_times = list(X.index)
-            time_to_pos = {t: pos for pos, t in enumerate(t0_times)}
-            t1_positions = np.array([
-                time_to_pos.get(t1.get(t, t), pos)
-                for pos, t in enumerate(t0_times)
-            ])
-        else:
-            # Fallback: assume each sample horizon ends at its own index (no overlap)
-            t1_positions = np.arange(n_samples)
-
-        # Calculate fold sizes
         min_train_size = int(np.floor(n_samples * self.min_train_pct))
         remaining = n_samples - min_train_size
 
@@ -100,22 +114,11 @@ class PurgedWalkForwardCV:
             if test_start >= n_samples:
                 break
 
-            if self.expanding:
-                train_start = 0
-            else:
-                train_start = fold * test_size
-
+            train_start = 0 if self.expanding else fold * test_size
             train_end = test_start
 
-            # Candidate train indices
             train_candidates = indices[train_start:train_end]
-
-            # PURGING: remove train observations whose label horizon t1 extends into test
-            # i.e., t1_position >= test_start
-            valid_train = [
-                i for i in train_candidates
-                if t1_positions[i] < test_start
-            ]
+            valid_train = [idx for idx in train_candidates if t1_positions[idx] < test_start]
 
             test_idx = indices[test_start:test_end]
             train_idx = np.array(valid_train, dtype=int)
@@ -133,7 +136,7 @@ class PurgedKFoldCV:
     - Embargo eliminates training samples immediately following the test block to suppress serial correlation.
     """
 
-    def __init__(self, n_splits: int = 5, embargo_pct: float = 0.01):
+    def __init__(self, n_splits: int = 5, embargo_pct: float = 0.01) -> None:
         if n_splits < 2:
             raise ValueError("n_splits must be at least 2 for K-Fold CV")
         self.n_splits = n_splits
@@ -150,17 +153,7 @@ class PurgedKFoldCV:
             return
 
         indices = np.arange(n_samples)
-
-        # Build t1 index mapping
-        if t1 is not None and isinstance(X, (pd.DataFrame, pd.Series)):
-            t0_times = list(X.index)
-            time_to_pos = {t: pos for pos, t in enumerate(t0_times)}
-            t1_positions = np.array([
-                time_to_pos.get(t1.get(t, t), pos)
-                for pos, t in enumerate(t0_times)
-            ])
-        else:
-            t1_positions = np.arange(n_samples)
+        t1_positions = _resolve_t1_positions(X, t1)
 
         embargo_samples = int(np.ceil(n_samples * self.embargo_pct))
         fold_bounds = np.linspace(0, n_samples, self.n_splits + 1, dtype=int)
@@ -170,19 +163,9 @@ class PurgedKFoldCV:
             test_end = fold_bounds[fold + 1]
             test_idx = indices[test_start:test_end]
 
-            # 1. Train candidates before test: indices in [0, test_start)
-            # PURGE: Drop observations whose horizon reaches or passes test_start
-            train_before = [
-                i for i in indices[:test_start]
-                if t1_positions[i] < test_start
-            ]
-
-            # 2. Train candidates after test: indices in [test_end, n_samples)
-            # EMBARGO: Drop observations starting within embargo_samples after test_end
+            train_before = [idx for idx in indices[:test_start] if t1_positions[idx] < test_start]
             embargo_limit = min(n_samples, test_end + embargo_samples)
-            train_after = [
-                i for i in indices[embargo_limit:]
-            ]
+            train_after = list(indices[embargo_limit:])
 
             train_idx = np.array(train_before + train_after, dtype=int)
 
@@ -193,33 +176,25 @@ class PurgedKFoldCV:
 def compute_rank_ic(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """
     Computes Spearman's Rank Information Coefficient (Rank IC).
-    Rank correlation measures monotonic relationship between alpha predictions and realized returns,
-    invariant to linear scaling or outliers.
     """
     valid = ~(np.isnan(y_pred) | np.isnan(y_true) | np.isinf(y_pred) | np.isinf(y_true))
     if np.sum(valid) < 3:
         return 0.0
 
-    rho, _ = stats.spearmanr(y_pred[valid], y_true[valid])
+    pred_valid = y_pred[valid]
+    true_valid = y_true[valid]
+    if float(np.std(pred_valid)) <= 1e-12 or float(np.std(true_valid)) <= 1e-12:
+        return 0.0
+
+    rho, _ = stats.spearmanr(pred_valid, true_valid)
     return 0.0 if np.isnan(rho) else float(rho)
 
 
 def compute_cv_metrics(
-    fold_predictions: list[tuple[np.ndarray, np.ndarray]]
+    fold_predictions: list[tuple[np.ndarray, np.ndarray]],
 ) -> dict[str, float]:
     """
     Computes comprehensive out-of-sample Cross-Validation performance statistics.
-
-    Args:
-        fold_predictions: List of tuples (y_test_true, y_test_pred) per CV fold.
-
-    Returns:
-        Dict containing:
-            - 'mean_rank_ic': Average out-of-sample Rank IC
-            - 'std_rank_ic': Standard deviation of Rank IC across folds
-            - 'information_ratio': Rank IC / Std(Rank IC) (prediction stability)
-            - 'mean_pearson_ic': Average linear Pearson correlation
-            - 'directional_accuracy': Fraction of predictions with matching directional sign
     """
     if not fold_predictions:
         return {
@@ -230,29 +205,29 @@ def compute_cv_metrics(
             "directional_accuracy": 0.0,
         }
 
-    rank_ics = []
-    pearson_ics = []
-    dir_accs = []
+    rank_ics: list[float] = []
+    pearson_ics: list[float] = []
+    dir_accs: list[float] = []
 
     for y_true, y_pred in fold_predictions:
         valid = ~(np.isnan(y_true) | np.isnan(y_pred) | np.isinf(y_true) | np.isinf(y_pred))
-        yt = y_true[valid]
-        yp = y_pred[valid]
+        true_valid = y_true[valid]
+        pred_valid = y_pred[valid]
 
-        if len(yt) < 3:
+        if len(true_valid) < 3:
             continue
 
-        # Rank IC
-        ric = compute_rank_ic(yp, yt)
-        rank_ics.append(ric)
+        rank_ic = compute_rank_ic(pred_valid, true_valid)
+        rank_ics.append(rank_ic)
 
-        # Pearson IC
-        pic, _ = stats.pearsonr(yp, yt)
-        pearson_ics.append(0.0 if np.isnan(pic) else float(pic))
+        if float(np.std(pred_valid)) > 1e-12 and float(np.std(true_valid)) > 1e-12:
+            pearson_ic, _ = stats.pearsonr(pred_valid, true_valid)
+            pearson_ics.append(0.0 if np.isnan(pearson_ic) else float(pearson_ic))
+        else:
+            pearson_ics.append(0.0)
 
-        # Directional Accuracy (sign agreement)
-        correct_dir = np.mean(np.sign(yp) == np.sign(yt))
-        dir_accs.append(float(correct_dir))
+        correct_dir = float(np.mean(np.sign(pred_valid) == np.sign(true_valid)))
+        dir_accs.append(correct_dir)
 
     if not rank_ics:
         return {
@@ -265,12 +240,12 @@ def compute_cv_metrics(
 
     mean_ric = float(np.mean(rank_ics))
     std_ric = float(np.std(rank_ics)) if len(rank_ics) > 1 else 1e-4
-    ir = mean_ric / max(std_ric, 1e-4)
+    info_ratio = mean_ric / max(std_ric, 1e-4)
 
     return {
         "mean_rank_ic": mean_ric,
         "std_rank_ic": std_ric,
-        "information_ratio": ir,
+        "information_ratio": info_ratio,
         "mean_pearson_ic": float(np.mean(pearson_ics)),
         "directional_accuracy": float(np.mean(dir_accs)),
     }

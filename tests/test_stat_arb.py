@@ -29,16 +29,18 @@ def test_stat_arb_mean_reversion_strategy():
         if sym == "TOKEN_A":
             prices[-1] = 110.0  # +10 deviation above mean -> should short
         elif sym == "TOKEN_B":
-            prices[-1] = 90.0   # -10 deviation below mean -> should long
+            prices[-1] = 90.0  # -10 deviation below mean -> should long
 
         p_arr = np.array(prices)
-        df = pd.DataFrame({
-            "open": p_arr,
-            "high": p_arr * 1.01,
-            "low": p_arr * 0.99,
-            "close": p_arr,
-            "volume": np.ones_like(p_arr) * 1000.0,
-        })
+        df = pd.DataFrame(
+            {
+                "open": p_arr,
+                "high": p_arr * 1.01,
+                "low": p_arr * 0.99,
+                "close": p_arr,
+                "volume": np.ones_like(p_arr) * 1000.0,
+            }
+        )
         market_data[sym] = df
         volatilities[sym] = 0.40
 

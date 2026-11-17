@@ -3,7 +3,6 @@ Student-t Heavy-Tail Distribution Estimator and Tail Risk (VaR / CVaR) Engine.
 Ported and adapted from CrunchDAO Synth for risk controls.
 """
 
-from typing import Dict, Optional, Tuple, Union
 import numpy as np
 from scipy import stats
 
@@ -14,7 +13,7 @@ class StudentTDensityEstimator:
     capturing fat tails and extreme kurtosis in crypto return series.
     """
 
-    def __init__(self, default_df: float = 4.5, min_df: float = 2.5, max_df: float = 30.0):
+    def __init__(self, default_df: float = 4.5, min_df: float = 2.5, max_df: float = 30.0) -> None:
         self.default_df = default_df
         self.min_df = min_df
         self.max_df = max_df
@@ -23,26 +22,27 @@ class StudentTDensityEstimator:
         self.scale: float = 0.02
         self.is_fitted: bool = False
 
-    def fit(self, returns: Union[np.ndarray, list]) -> "StudentTDensityEstimator":
-        r = np.asarray(returns, dtype=np.float64).flatten()
-        if len(r) < 30:
+    def fit(self, returns: np.ndarray | list[float]) -> "StudentTDensityEstimator":
+        returns_arr = np.asarray(returns, dtype=np.float64).flatten()
+        returns_arr = returns_arr[np.isfinite(returns_arr)]
+        if len(returns_arr) < 30:
             self.df = self.default_df
-            self.loc = float(np.mean(r)) if len(r) > 0 else 0.0
-            self.scale = float(np.std(r)) if len(r) > 1 else 0.02
+            self.loc = float(np.mean(returns_arr)) if len(returns_arr) > 0 else 0.0
+            raw_std = float(np.std(returns_arr)) if len(returns_arr) > 1 else 0.02
+            self.scale = max(raw_std, 1e-5)
             self.is_fitted = True
             return self
 
         try:
-            # Maximum likelihood estimation of Student-t parameters (df, loc, scale)
-            df, loc, scale = stats.t.fit(r)
+            df, loc, scale = stats.t.fit(returns_arr)
             self.df = float(np.clip(df, self.min_df, self.max_df))
             self.loc = float(loc)
             self.scale = float(max(scale, 1e-5))
             self.is_fitted = True
-        except Exception:
+        except Exception:  # noqa: BLE001
             self.df = self.default_df
-            self.loc = float(np.mean(r))
-            self.scale = float(np.std(r))
+            self.loc = float(np.mean(returns_arr))
+            self.scale = float(max(np.std(returns_arr), 1e-5))
             self.is_fitted = True
 
         return self
@@ -52,15 +52,32 @@ class StudentTDensityEstimator:
         Parametric Value at Risk (VaR) at significance level alpha (e.g. 5% or 1%).
         Returns the negative return threshold: P(r < -VaR) = alpha.
         """
-        q = stats.t.ppf(alpha, df=self.df, loc=self.loc, scale=self.scale)
-        return float(-q)
+        quantile = stats.t.ppf(alpha, df=self.df, loc=self.loc, scale=self.scale)
+        return float(-quantile)
 
-    def conditional_value_at_risk(self, alpha: float = 0.05, num_simulations: int = 10_000) -> float:
+    def conditional_value_at_risk(
+        self,
+        alpha: float = 0.05,
+        num_simulations: int = 10_000,
+        random_state: int = 42,
+    ) -> float:
         """
         Parametric Expected Shortfall / Conditional VaR (CVaR).
         Average loss given that the loss exceeds the VaR threshold.
         """
-        sims = stats.t.rvs(df=self.df, loc=self.loc, scale=self.scale, size=num_simulations)
+        if self.df > 1.05:
+            t_val = float(stats.t.ppf(alpha, df=self.df))
+            pdf_val = float(stats.t.pdf(t_val, df=self.df))
+            es_standard = -((self.df + t_val**2) / (self.df - 1.0)) * (pdf_val / alpha)
+            return float(-(self.loc + self.scale * es_standard))
+
+        sims = stats.t.rvs(
+            df=self.df,
+            loc=self.loc,
+            scale=self.scale,
+            size=num_simulations,
+            random_state=random_state,
+        )
         var_thresh = -self.value_at_risk(alpha)
         tail_losses = sims[sims <= var_thresh]
         if len(tail_losses) == 0:

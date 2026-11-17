@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-alpha-engine"
+version = "2.0.0"
+description = "Institutional-grade quantitative alpha and market-neutral trading engine for cryptocurrency perpetual futures."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (unused imports, undefined names)
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear (common bugs & design problems)
+    "UP",  # pyupgrade (modern Python syntax)
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",   # line length handled by formatter / long markdown strings
+    "B008",   # function call in default argument
+    "SIM108", # ternary operator preference when if/else is clearer
+    "UP038",  # isinstance tuple syntax is standard and faster than union
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "scripts"]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"tests/*.py" = ["B011", "SIM117"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

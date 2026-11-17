@@ -1,7 +1,6 @@
 import numpy as np
-import pytest
 
-from src.features.hurst import estimate_hurst_variance_time, estimate_hurst_rs, AssetHurstCalibrator
+from src.features.hurst import AssetHurstCalibrator, estimate_hurst_rs, estimate_hurst_variance_time
 
 
 def test_hurst_variance_time_and_rs():

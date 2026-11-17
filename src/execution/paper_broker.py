@@ -4,8 +4,9 @@ Simulates realistic exchange order execution with configurable slippage,
 maker/taker fee schedules, and position accounting.
 """
 
-import uuid
 from datetime import datetime, timezone
+from typing import Any
+import uuid
 
 from src.domain.entities import Order, Portfolio, Position, Trade
 from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide
@@ -25,13 +26,13 @@ class PaperExecutionBroker(IExecutionClient):
     def __init__(
         self,
         initial_cash: float = 100_000.0,
-        taker_fee_pct: float = 0.0004,     # 0.04% taker
-        maker_fee_pct: float = 0.0002,     # 0.02% maker
-        slippage_bps: float = 1.0,         # 1 bp slippage
+        taker_fee_pct: float = 0.0004,  # 0.04% taker
+        maker_fee_pct: float = 0.0002,  # 0.02% maker
+        slippage_bps: float = 1.0,  # 1 bp slippage
         impact_model: NonLinearMarketImpactModel | None = None,
         capacity_ceiling: CapitalCapacityCeiling | None = None,
         enforce_capacity_ceiling: bool = False,
-    ):
+    ) -> None:
         self.portfolio = Portfolio(
             cash=initial_cash,
             initial_cash=initial_cash,
@@ -43,7 +44,7 @@ class PaperExecutionBroker(IExecutionClient):
         self.impact_model = impact_model
         self.capacity_ceiling = capacity_ceiling or (impact_model.capacity_ceiling if impact_model else None)
         self.enforce_capacity_ceiling = enforce_capacity_ceiling
-        self.symbol_microstructure: dict[str, dict] = {}
+        self.symbol_microstructure: dict[str, dict[str, Any]] = {}
 
         self.orders: dict[str, Order] = {}
         self.trades: list[Trade] = []
@@ -95,7 +96,7 @@ class PaperExecutionBroker(IExecutionClient):
         if order_id in self.orders:
             order = self.orders[order_id]
             if order.status == OrderStatus.PENDING:
-                order.status = OrderStatus.CANCELLED
+                order.status = OrderStatus.CANCELED
                 return True
         return False
 
@@ -110,6 +111,7 @@ class PaperExecutionBroker(IExecutionClient):
         order_type: OrderType,
         quantity: float,
         price: float | None = None,
+        strategy: str | None = None,
     ) -> Order:
         """
         Creates and executes an order against current market prices.
@@ -129,10 +131,10 @@ class PaperExecutionBroker(IExecutionClient):
             price=price,
             status=OrderStatus.PENDING,
             created_at=datetime.now(tz=timezone.utc),
+            strategy=strategy,
         )
         self.orders[order_id] = order
 
-        # Execute order
         self._execute_order(order, current_market_price)
         return order
 
@@ -158,22 +160,18 @@ class PaperExecutionBroker(IExecutionClient):
                     amihud=amihud,
                     is_flash_crash=is_flash_crash,
                 )
+            elif order.side == OrderSide.BUY:
+                fill_price = mark_price * (1.0 + self.slippage)
             else:
-                # Slippage: buy pays higher, sell receives lower
-                if order.side == OrderSide.BUY:
-                    fill_price = mark_price * (1.0 + self.slippage)
-                else:
-                    fill_price = mark_price * (1.0 - self.slippage)
+                fill_price = mark_price * (1.0 - self.slippage)
             fee_pct = self.taker_fee_pct
         else:
-            # Limit order
             fill_price = order.price if order.price is not None else mark_price
             fee_pct = self.maker_fee_pct
 
         notional = fill_price * order.quantity
         fee = notional * fee_pct
 
-        # Check cash balance for opening purchases
         trade = Trade(
             id=f"trd_{uuid.uuid4().hex[:10]}",
             order_id=order.id,
@@ -183,15 +181,14 @@ class PaperExecutionBroker(IExecutionClient):
             price=fill_price,
             fee=fee,
             timestamp=datetime.now(tz=timezone.utc),
+            strategy=order.strategy,
         )
         self.trades.append(trade)
 
-        # Update order state
         order.status = OrderStatus.FILLED
         order.filled_quantity = order.quantity
         order.average_fill_price = fill_price
 
-        # Update portfolio accounting
         self._update_position(trade)
 
     def _update_position(self, trade: Trade) -> None:
@@ -199,11 +196,9 @@ class PaperExecutionBroker(IExecutionClient):
         symbol = trade.symbol
         pos = self.portfolio.positions.get(symbol)
 
-        # Deduct transaction fee from cash
         self.portfolio.cash -= trade.fee
 
         if pos is None or pos.side == PositionSide.FLAT or pos.quantity == 0:
-            # Open new position
             side = PositionSide.LONG if trade.side == OrderSide.BUY else PositionSide.SHORT
             self.portfolio.positions[symbol] = Position(
                 symbol=symbol,
@@ -216,52 +211,44 @@ class PaperExecutionBroker(IExecutionClient):
 
         if pos.side == PositionSide.LONG:
             if trade.side == OrderSide.BUY:
-                # Add to long
                 new_qty = pos.quantity + trade.quantity
                 new_entry = (pos.quantity * pos.entry_price + trade.quantity * trade.price) / new_qty
                 pos.quantity = new_qty
                 pos.entry_price = new_entry
-            else:
-                # Sell long
-                if trade.quantity >= pos.quantity:
-                    # Flat or flipped
-                    pnl = pos.quantity * (trade.price - pos.entry_price)
-                    self.portfolio.cash += pnl
-                    remaining = trade.quantity - pos.quantity
-                    if remaining > 0:
-                        pos.side = PositionSide.SHORT
-                        pos.quantity = remaining
-                        pos.entry_price = trade.price
-                    else:
-                        pos.side = PositionSide.FLAT
-                        pos.quantity = 0.0
+            elif trade.quantity >= pos.quantity:
+                pnl = pos.quantity * (trade.price - pos.entry_price)
+                self.portfolio.cash += pnl
+                remaining = trade.quantity - pos.quantity
+                if remaining > 0:
+                    pos.side = PositionSide.SHORT
+                    pos.quantity = remaining
+                    pos.entry_price = trade.price
                 else:
-                    # Partial close
-                    pnl = trade.quantity * (trade.price - pos.entry_price)
-                    self.portfolio.cash += pnl
-                    pos.quantity -= trade.quantity
+                    pos.side = PositionSide.FLAT
+                    pos.quantity = 0.0
+            else:
+                pnl = trade.quantity * (trade.price - pos.entry_price)
+                self.portfolio.cash += pnl
+                pos.quantity -= trade.quantity
 
         elif pos.side == PositionSide.SHORT:
             if trade.side == OrderSide.SELL:
-                # Add to short
                 new_qty = pos.quantity + trade.quantity
                 new_entry = (pos.quantity * pos.entry_price + trade.quantity * trade.price) / new_qty
                 pos.quantity = new_qty
                 pos.entry_price = new_entry
-            else:
-                # Buy to cover short
-                if trade.quantity >= pos.quantity:
-                    pnl = pos.quantity * (pos.entry_price - trade.price)
-                    self.portfolio.cash += pnl
-                    remaining = trade.quantity - pos.quantity
-                    if remaining > 0:
-                        pos.side = PositionSide.LONG
-                        pos.quantity = remaining
-                        pos.entry_price = trade.price
-                    else:
-                        pos.side = PositionSide.FLAT
-                        pos.quantity = 0.0
+            elif trade.quantity >= pos.quantity:
+                pnl = pos.quantity * (pos.entry_price - trade.price)
+                self.portfolio.cash += pnl
+                remaining = trade.quantity - pos.quantity
+                if remaining > 0:
+                    pos.side = PositionSide.LONG
+                    pos.quantity = remaining
+                    pos.entry_price = trade.price
                 else:
-                    pnl = trade.quantity * (pos.entry_price - trade.price)
-                    self.portfolio.cash += pnl
-                    pos.quantity -= trade.quantity
+                    pos.side = PositionSide.FLAT
+                    pos.quantity = 0.0
+            else:
+                pnl = trade.quantity * (pos.entry_price - trade.price)
+                self.portfolio.cash += pnl
+                pos.quantity -= trade.quantity

@@ -2,7 +2,6 @@
 Unit Tests for Dollar Bars, Dollar Imbalance Bars, and Statistical Validation.
 """
 
-from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import pytest
@@ -26,13 +25,15 @@ def sample_ticks():
     is_buyer_maker = np.random.choice([True, False], size=n_ticks, p=[0.48, 0.52])
 
     timestamps = pd.date_range("2024-01-01 12:00:00", periods=n_ticks, freq="1s", tz="UTC")
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "price": prices,
-        "quantity": quantities,
-        "notional": prices * quantities,
-        "is_buyer_maker": is_buyer_maker,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "price": prices,
+            "quantity": quantities,
+            "notional": prices * quantities,
+            "is_buyer_maker": is_buyer_maker,
+        }
+    )
 
 
 def test_dollar_bar_synthesizer(sample_ticks):
@@ -46,7 +47,7 @@ def test_dollar_bar_synthesizer(sample_ticks):
     assert len(bars_df) >= 15
 
     # Check OHLC properties
-    for idx, row in bars_df.iterrows():
+    for _idx, row in bars_df.iterrows():
         assert row["high"] >= row["low"]
         assert row["high"] >= row["open"]
         assert row["high"] >= row["close"]
@@ -65,7 +66,7 @@ def test_dollar_imbalance_bars(sample_ticks):
 
     dib_bars = dib_synth.process_ticks(sample_ticks)
     assert not dib_bars.empty
-    for idx, row in dib_bars.iterrows():
+    for _idx, row in dib_bars.iterrows():
         assert abs(row["signed_imbalance"]) >= threshold * 0.5
         assert row["imbalance_side"] in ("BUY", "SELL")
         assert row["high"] >= row["low"]

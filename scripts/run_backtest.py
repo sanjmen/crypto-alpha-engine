@@ -28,12 +28,9 @@ Usage Examples:
 """
 
 import argparse
-from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
-import time
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -63,47 +60,170 @@ REPORTS_DIR = REPO_ROOT / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 ALL_82_SYMBOLS = [
-    "1000FLOKIUSDT", "1000PEPEUSDT", "1000SHIBUSDT", "1INCHUSDT", "AAVEUSDT", "ADAUSDT",
-    "ALGOUSDT", "APTUSDT", "ARBUSDT", "ATOMUSDT", "AVAXUSDT", "AXSUSDT", "BATUSDT",
-    "BCHUSDT", "BNBUSDT", "BTCUSDT", "CHZUSDT", "COMPUSDT", "CRVUSDT", "CTSIUSDT",
-    "DOGEUSDT", "DOTUSDT", "DYDXUSDT", "EGLDUSDT", "ENAUSDT", "ENJUSDT", "ETCUSDT",
-    "ETHUSDT", "FETUSDT", "FILUSDT", "FLOWUSDT", "FTMUSDT", "GALAUSDT", "GRTUSDT",
-    "GTCUSDT", "ICPUSDT", "INJUSDT", "IOTAUSDT", "JUPUSDT", "KAVAUSDT", "KSMUSDT",
-    "LDOUSDT", "LINKUSDT", "LTCUSDT", "MAGICUSDT", "MANAUSDT", "MATICUSDT", "MEMEUSDT",
-    "METUSDT", "MINAUSDT", "MKRUSDT", "NEARUSDT", "OGNUSDT", "ONDOUSDT", "OPUSDT",
-    "PENDLEUSDT", "PYTHUSDT", "QNTUSDT", "RENDERUSDT", "RLCUSDT", "RUNEUSDT", "SANDUSDT",
-    "SEIUSDT", "SKLUSDT", "SNXUSDT", "SOLUSDT", "STRKUSDT", "SUIUSDT", "SUSHIUSDT",
-    "TAOUSDT", "THETAUSDT", "TIAUSDT", "UNIUSDT", "WIFUSDT", "WLDUSDT", "WUSDT",
-    "XMRUSDT", "XRPUSDT", "ZECUSDT", "ZILUSDT", "ZKUSDT", "ZROUSDT",
+    "1000FLOKIUSDT",
+    "1000PEPEUSDT",
+    "1000SHIBUSDT",
+    "1INCHUSDT",
+    "AAVEUSDT",
+    "ADAUSDT",
+    "ALGOUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "ATOMUSDT",
+    "AVAXUSDT",
+    "AXSUSDT",
+    "BATUSDT",
+    "BCHUSDT",
+    "BNBUSDT",
+    "BTCUSDT",
+    "CHZUSDT",
+    "COMPUSDT",
+    "CRVUSDT",
+    "CTSIUSDT",
+    "DOGEUSDT",
+    "DOTUSDT",
+    "DYDXUSDT",
+    "EGLDUSDT",
+    "ENAUSDT",
+    "ENJUSDT",
+    "ETCUSDT",
+    "ETHUSDT",
+    "FETUSDT",
+    "FILUSDT",
+    "FLOWUSDT",
+    "FTMUSDT",
+    "GALAUSDT",
+    "GRTUSDT",
+    "GTCUSDT",
+    "ICPUSDT",
+    "INJUSDT",
+    "IOTAUSDT",
+    "JUPUSDT",
+    "KAVAUSDT",
+    "KSMUSDT",
+    "LDOUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "MAGICUSDT",
+    "MANAUSDT",
+    "MATICUSDT",
+    "MEMEUSDT",
+    "METUSDT",
+    "MINAUSDT",
+    "MKRUSDT",
+    "NEARUSDT",
+    "OGNUSDT",
+    "ONDOUSDT",
+    "OPUSDT",
+    "PENDLEUSDT",
+    "PYTHUSDT",
+    "QNTUSDT",
+    "RENDERUSDT",
+    "RLCUSDT",
+    "RUNEUSDT",
+    "SANDUSDT",
+    "SEIUSDT",
+    "SKLUSDT",
+    "SNXUSDT",
+    "SOLUSDT",
+    "STRKUSDT",
+    "SUIUSDT",
+    "SUSHIUSDT",
+    "TAOUSDT",
+    "THETAUSDT",
+    "TIAUSDT",
+    "UNIUSDT",
+    "WIFUSDT",
+    "WLDUSDT",
+    "WUSDT",
+    "XMRUSDT",
+    "XRPUSDT",
+    "ZECUSDT",
+    "ZILUSDT",
+    "ZKUSDT",
+    "ZROUSDT",
 ]
 
 TOP_15_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "RENDERUSDT", "FETUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "SUIUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "RENDERUSDT",
+    "FETUSDT",
 ]
 
 ANOMALIES_23_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "RENDERUSDT", "FETUSDT",
-    "CTSIUSDT", "MAGICUSDT", "OGNUSDT", "RLCUSDT",
-    "GTCUSDT", "COMPUSDT", "CRVUSDT", "DYDXUSDT",
-    "WALUSDT", "BSPUSDT", "TRUTHUSDT", "ZEREBROUSDT",
-    "BTWUSDT", "QUSDT", "AVAUSDT", "EPICUSDT",
-    "MUBARAKUSDT", "CRWVUSDT", "CAPUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "RENDERUSDT",
+    "FETUSDT",
+    "CTSIUSDT",
+    "MAGICUSDT",
+    "OGNUSDT",
+    "RLCUSDT",
+    "GTCUSDT",
+    "COMPUSDT",
+    "CRVUSDT",
+    "DYDXUSDT",
+    "WALUSDT",
+    "BSPUSDT",
+    "TRUTHUSDT",
+    "ZEREBROUSDT",
+    "BTWUSDT",
+    "QUSDT",
+    "AVAUSDT",
+    "EPICUSDT",
+    "MUBARAKUSDT",
+    "CRWVUSDT",
+    "CAPUSDT",
 ]
 
 PRESETS = {
     "top5": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"],
     "top10": [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
-        "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "DOGEUSDT",
+        "ADAUSDT",
+        "XRPUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "NEARUSDT",
     ],
     "top15": TOP_15_SYMBOLS,
     "top20": [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
-        "ADAUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT",
-        "SUIUSDT", "APTUSDT", "DOTUSDT", "ATOMUSDT", "FTMUSDT",
-        "ALGOUSDT", "EGLDUSDT", "KAVAUSDT", "ICPUSDT", "ARBUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "DOGEUSDT",
+        "ADAUSDT",
+        "XRPUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "NEARUSDT",
+        "SUIUSDT",
+        "APTUSDT",
+        "DOTUSDT",
+        "ATOMUSDT",
+        "FTMUSDT",
+        "ALGOUSDT",
+        "EGLDUSDT",
+        "KAVAUSDT",
+        "ICPUSDT",
+        "ARBUSDT",
     ],
     "anomalies23": ANOMALIES_23_SYMBOLS,
     "all82": ALL_82_SYMBOLS,
@@ -120,11 +240,11 @@ MARKET_PERIODS = {
 
 
 def load_drive_market_data(
-    symbols: List[str],
+    symbols: list[str],
     timeframe: str = "1h",
     cache_dir: Path = Path("/tmp/crypto_alpha_backtest_cache"),
     sync_drive: bool = True,
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """
     Loads symbol Parquet files from local cache (`cache_dir`), optionally syncing missing files
     from Google Drive via `rclone` when `sync_drive=True`.
@@ -143,12 +263,16 @@ def load_drive_market_data(
             pattern = "{" + ",".join([f"{s}.parquet" for s in missing_bars]) + "}"
             subprocess.run(
                 [
-                    "rclone", "copy",
+                    "rclone",
+                    "copy",
                     f"gdrive:trading/crypto-alpha-engine/data/bars/{timeframe}/",
                     str(bars_dir),
-                    "--include", pattern,
-                    "--transfers", "16",
-                    "--checkers", "16",
+                    "--include",
+                    pattern,
+                    "--transfers",
+                    "16",
+                    "--checkers",
+                    "16",
                 ],
                 check=False,
             )
@@ -158,18 +282,22 @@ def load_drive_market_data(
             pattern = "{" + ",".join([f"{s}.parquet" for s in missing_funding]) + "}"
             subprocess.run(
                 [
-                    "rclone", "copy",
+                    "rclone",
+                    "copy",
                     "gdrive:trading/crypto-alpha-engine/data/funding/",
                     str(funding_dir),
-                    "--include", pattern,
-                    "--transfers", "16",
-                    "--checkers", "16",
+                    "--include",
+                    pattern,
+                    "--transfers",
+                    "16",
+                    "--checkers",
+                    "16",
                 ],
                 check=False,
             )
 
-    bars_dict: Dict[str, pd.DataFrame] = {}
-    funding_dict: Dict[str, pd.DataFrame] = {}
+    bars_dict: dict[str, pd.DataFrame] = {}
+    funding_dict: dict[str, pd.DataFrame] = {}
 
     for sym in symbols:
         bar_path = bars_dir / f"{sym}.parquet"
@@ -198,15 +326,15 @@ def load_drive_market_data(
 
 
 def generate_synthetic_universe(
-    symbols: List[str],
+    symbols: list[str],
     n_bars: int = 2000,
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Generates synthetic multi-asset price and funding data for deterministic testing."""
     np.random.seed(42)
     timestamps = pd.date_range("2024-01-01", periods=n_bars, freq="1h", tz="UTC")
 
-    bars_dict: Dict[str, pd.DataFrame] = {}
-    funding_dict: Dict[str, pd.DataFrame] = {}
+    bars_dict: dict[str, pd.DataFrame] = {}
+    funding_dict: dict[str, pd.DataFrame] = {}
     base_prices = {"BTCUSDT": 45000.0, "ETHUSDT": 2500.0, "SOLUSDT": 100.0, "BNBUSDT": 300.0, "DOGEUSDT": 0.12}
 
     for sym in symbols:
@@ -236,14 +364,14 @@ def generate_synthetic_universe(
 
 def run_simulation(
     strategy_name: str,
-    bars_dict: Dict[str, pd.DataFrame],
-    funding_dict: Dict[str, pd.DataFrame],
+    bars_dict: dict[str, pd.DataFrame],
+    funding_dict: dict[str, pd.DataFrame],
     initial_capital: float = 100_000.0,
     rebalance_freq_bars: int = 8,
     execution_mode: str = "maker",
     turnover_deadband: float = 0.04,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     enable_pairs: bool = False,
     enable_anomalies: bool = False,
     anomaly_size: float = 15.0,
@@ -290,10 +418,7 @@ def run_simulation(
     funding_df = pd.DataFrame(funding_dfs)
 
     if strategy_name == "seven_factor":
-        volume_dfs = {
-            sym: bars_dict[sym]["volume"].reindex(master_idx).ffill().fillna(0.0)
-            for sym in valid_symbols
-        }
+        volume_dfs = {sym: bars_dict[sym]["volume"].reindex(master_idx).ffill().fillna(0.0) for sym in valid_symbols}
         volume_df = pd.DataFrame(volume_dfs)
         raw_funding_dfs = {}
         for sym in valid_symbols:
@@ -335,7 +460,9 @@ def run_simulation(
                 sim_eq = max(100.0, sim_eq * (1.0 + bar_ret))
                 if (i - lookback) % rebalance_freq_bars == 0:
                     w_unit = {sym: float(unit_weights_df[sym].iloc[i]) for sym in valid_symbols}
-                    port_rets = (unit_weights_df.iloc[max(0, i - 72):i] * returns_df.iloc[max(0, i - 72):i]).sum(axis=1)
+                    port_rets = (unit_weights_df.iloc[max(0, i - 72) : i] * returns_df.iloc[max(0, i - 72) : i]).sum(
+                        axis=1
+                    )
                     scaled_w, _ = ctrl.scale_and_deadband_weights(
                         unit_weights=w_unit,
                         current_weights=current_w,
@@ -398,10 +525,7 @@ def run_simulation(
                 for sym in valid_symbols
                 if sym in funding_dict and not funding_dict[sym].empty
             }
-            volatilities = {
-                sym: float(returns_df[sym].iloc[max(0, i - 24) : i].std()) or 0.02
-                for sym in sub_market
-            }
+            volatilities = {sym: float(returns_df[sym].iloc[max(0, i - 24) : i].std()) or 0.02 for sym in sub_market}
 
             if strategy_name in ("meta", "anomalies"):
                 target_dollars, _, _ = strat.generate_portfolio_allocations(
@@ -418,10 +542,7 @@ def run_simulation(
                 target_dollars = strat.allocate_weights(signals, portfolio, volatilities)
 
             total_eq = portfolio.total_equity
-            current_weights = {
-                sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0)
-                for sym in valid_symbols
-            }
+            current_weights = {sym: target_dollars.get(sym, 0.0) / max(total_eq, 1.0) for sym in valid_symbols}
 
         weights_history.append((ts, current_weights))
 
@@ -476,7 +597,8 @@ def generate_plotly_tearsheet(
 ) -> None:
     """Generates an institutional interactive HTML report with Plotly."""
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=2,
+        cols=1,
         shared_xaxes=True,
         vertical_spacing=0.06,
         row_heights=[0.7, 0.3],
@@ -495,7 +617,8 @@ def generate_plotly_tearsheet(
             line=dict(color="#00E676", width=2),
             hovertemplate="<b>Date:</b> %{x}<br><b>Equity:</b> $%{y:,.2f}<extra></extra>",
         ),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
 
     fig.add_trace(
@@ -509,7 +632,8 @@ def generate_plotly_tearsheet(
             fillcolor="rgba(255, 23, 68, 0.2)",
             hovertemplate="<b>Date:</b> %{x}<br><b>Drawdown:</b> %{y:.2f}%<extra></extra>",
         ),
-        row=2, col=1,
+        row=2,
+        col=1,
     )
 
     fig.update_layout(
@@ -540,7 +664,7 @@ def print_performance_table(
     """Prints institutional summary table with fee breakdown."""
     print("\n" + "=" * 70)
     print(f"  INSTITUTIONAL PERFORMANCE REPORT: {strategy_name.upper()} ({preset.upper()})")
-    print(f"  Execution: {execution_mode.upper()} | Turnover Deadband Buffer: {deadband*100:.1f}%")
+    print(f"  Execution: {execution_mode.upper()} | Turnover Deadband Buffer: {deadband * 100:.1f}%")
     print("=" * 70)
     print(f"  Gross Alpha Return:  {result.gross_return_pct:+8.2f}%")
     print(f"  Total Turnover:      {result.total_turnover:8.2f}x portfolio")
@@ -561,8 +685,8 @@ def print_performance_table(
 
 
 def run_ablation_suite(
-    bars_dict: Dict[str, pd.DataFrame],
-    funding_dict: Dict[str, pd.DataFrame],
+    bars_dict: dict[str, pd.DataFrame],
+    funding_dict: dict[str, pd.DataFrame],
     args: argparse.Namespace,
 ) -> None:
     """Runs a 3-way component ablation on the 7-Factor Causal Online Engine."""
@@ -600,8 +724,8 @@ def run_ablation_suite(
 
 
 def run_multi_period_suite(
-    bars_dict: Dict[str, pd.DataFrame],
-    funding_dict: Dict[str, pd.DataFrame],
+    bars_dict: dict[str, pd.DataFrame],
+    funding_dict: dict[str, pd.DataFrame],
     args: argparse.Namespace,
 ) -> None:
     """Runs multi-strategy & 4-regime cycle stress-testing across 2023–2026."""
@@ -639,8 +763,8 @@ def run_multi_period_suite(
 
 
 def run_anomalies_comparison_suite(
-    bars_dict: Dict[str, pd.DataFrame],
-    funding_dict: Dict[str, pd.DataFrame],
+    bars_dict: dict[str, pd.DataFrame],
+    funding_dict: dict[str, pd.DataFrame],
     args: argparse.Namespace,
 ) -> None:
     """Runs 3-way comparison: Baseline Meta vs $15 Test Anomaly Sizing vs $100 Prod Sizing."""
@@ -701,14 +825,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="top15",
         help="Asset universe preset (default: top15).",
     )
-    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbol override (e.g. BTCUSDT,ETHUSDT).")
+    parser.add_argument(
+        "--symbols", type=str, default=None, help="Comma-separated symbol override (e.g. BTCUSDT,ETHUSDT)."
+    )
     parser.add_argument(
         "--source",
         choices=["cache", "drive", "synthetic"],
         default="cache",
         help="Data source: cache (local /tmp parquet cache), drive (sync via rclone), or synthetic.",
     )
-    parser.add_argument("--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Path to local Parquet cache.")
+    parser.add_argument(
+        "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Path to local Parquet cache."
+    )
     parser.add_argument("--rebalance-freq", type=int, default=4, help="Rebalancing frequency in 1h bars (default: 4).")
     parser.add_argument(
         "--execution-mode",
@@ -716,17 +844,47 @@ def build_parser() -> argparse.ArgumentParser:
         default="maker",
         help="Execution mode (maker=0.02%% passive, taker=0.04%% market+slip, hybrid).",
     )
-    parser.add_argument("--turnover-deadband", type=float, default=0.04, help="Turnover deadband threshold (default: 0.04).")
-    parser.add_argument("--capital", type=float, default=1000.0, help="Initial portfolio capital in USDT (default: 1000.0).")
+    parser.add_argument(
+        "--turnover-deadband", type=float, default=0.04, help="Turnover deadband threshold (default: 0.04)."
+    )
+    parser.add_argument(
+        "--capital", type=float, default=1000.0, help="Initial portfolio capital in USDT (default: 1000.0)."
+    )
     parser.add_argument("--start", type=str, default=None, help="Backtest start date (YYYY-MM-DD).")
     parser.add_argument("--end", type=str, default=None, help="Backtest end date (YYYY-MM-DD).")
-    parser.add_argument("--start-leverage", type=float, default=3.5, help="Initial gross leverage tier for seven_factor (default: 3.5x).")
-    parser.add_argument("--max-leverage", type=float, default=5.0, help="Maximum stepped leverage tier for seven_factor (default: 5.0x).")
+    parser.add_argument(
+        "--start-leverage",
+        type=float,
+        default=3.5,
+        help="Initial gross leverage tier for seven_factor (default: 3.5x).",
+    )
+    parser.add_argument(
+        "--max-leverage",
+        type=float,
+        default=5.0,
+        help="Maximum stepped leverage tier for seven_factor (default: 5.0x).",
+    )
     parser.add_argument("--enable-pairs", action="store_true", help="Include Cointegrated Pairs in Meta-Strategy.")
-    parser.add_argument("--enable-anomalies", action="store_true", help="Include Extreme Anomaly overlays in Meta-Strategy.")
-    parser.add_argument("--anomaly-size", type=float, default=15.0, help="Max notional USD per anomaly trade (default: 15.0).")
-    parser.add_argument("--disable-chop-arb", dest="enable_chop_arb", action="store_false", default=True, help="Disable Chop Range-Arb F5 compression.")
-    parser.add_argument("--disable-holistic-shields", dest="enable_holistic_shields", action="store_false", default=True, help="Disable Holistic Regime Shields 1A & 1B.")
+    parser.add_argument(
+        "--enable-anomalies", action="store_true", help="Include Extreme Anomaly overlays in Meta-Strategy."
+    )
+    parser.add_argument(
+        "--anomaly-size", type=float, default=15.0, help="Max notional USD per anomaly trade (default: 15.0)."
+    )
+    parser.add_argument(
+        "--disable-chop-arb",
+        dest="enable_chop_arb",
+        action="store_false",
+        default=True,
+        help="Disable Chop Range-Arb F5 compression.",
+    )
+    parser.add_argument(
+        "--disable-holistic-shields",
+        dest="enable_holistic_shields",
+        action="store_false",
+        default=True,
+        help="Disable Holistic Regime Shields 1A & 1B.",
+    )
     parser.add_argument("--report", default=None, help="Output path for HTML tearsheet report.")
     return parser
 
@@ -758,7 +916,9 @@ def main() -> None:
     print(f"  Mode / Strategy:  {args.mode.upper()} / {args.strategy.upper()}")
     print(f"  Universe:         {args.preset.upper()} ({len(symbols)} symbols: {', '.join(symbols[:5])}...)")
     print(f"  Source:           {args.source.upper()} ({args.cache_dir})")
-    print(f"  Execution Mode:   {args.execution_mode.upper()} ({'0.02% passive' if args.execution_mode == 'maker' else '0.04% + 1bp taker'})")
+    print(
+        f"  Execution Mode:   {args.execution_mode.upper()} ({'0.02% passive' if args.execution_mode == 'maker' else '0.04% + 1bp taker'})"
+    )
     print(f"  Initial Capital:  ${args.capital:,.2f} | Rebalance: Every {args.rebalance_freq}h")
     print("-" * 70)
 

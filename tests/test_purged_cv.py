@@ -43,7 +43,7 @@ def test_purged_walk_forward_cv_leakage_prevention(sample_events_and_data):
 
     assert len(splits) == 3
 
-    for fold, (train_idx, test_idx) in enumerate(splits):
+    for _fold, (train_idx, test_idx) in enumerate(splits):
         # 1. All train indices must be strictly before test_idx
         assert np.max(train_idx) < np.min(test_idx)
 
@@ -63,7 +63,7 @@ def test_purged_kfold_cv_purging_and_embargo(sample_events_and_data):
 
     assert len(splits) == 4
 
-    for fold, (train_idx, test_idx) in enumerate(splits):
+    for _fold, (train_idx, test_idx) in enumerate(splits):
         test_start_idx = np.min(test_idx)
         test_end_idx = np.max(test_idx)
 

@@ -2,8 +2,6 @@
 Unit tests for TradingDaemon with PaperExecutionBroker.
 """
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from src.execution.paper_broker import PaperExecutionBroker

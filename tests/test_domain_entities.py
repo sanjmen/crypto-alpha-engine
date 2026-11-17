@@ -1,8 +1,7 @@
 from datetime import datetime, timezone
-import pytest
 
-from src.domain.entities import Bar, Signal, Order, Position, Portfolio, Trade
-from src.domain.enums import OrderSide, OrderStatus, OrderType, PositionSide, MarketRegime
+from src.domain.entities import Bar, Portfolio, Position
+from src.domain.enums import PositionSide
 
 
 def test_bar_properties():
