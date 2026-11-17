@@ -834,7 +834,7 @@ def main() -> None:
         daemon.last_rebalance_time = None
     elif mode == "mainnet" and priors_cfg is None and hasattr(db, "get_latest_seven_factor_telemetry"):
         # Issue #61: Auto-trigger a one-time rebalance when upgrading Mainnet from static
-        # BASELINE_20D_PRIORS (where negative-tstat factors still held >5% weight) to Dynamic IC + F6 Gate
+        # BASELINE_20D_PRIORS or from pre-shield single-factor concentration (>60% in a single factor)
         sf_prev = db.get_latest_seven_factor_telemetry() or {}
         prev_w = sf_prev.get("factor_weights") or {}
         prev_t = sf_prev.get("factor_tstats") or {}
@@ -842,10 +842,14 @@ def main() -> None:
             float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < 0.0
             for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
+        has_unshielded_concentration = (
+            feature_flags.enable_holistic_regime_shields
+            and max((float(v) for v in prev_w.values()), default=0.0) > 0.60
+        )
         tier_changed = abs(float(sf_prev.get("unlocked_tier") or start_lev) - start_lev) > 0.1
-        if has_legacy_prior_weights or tier_changed:
+        if has_legacy_prior_weights or has_unshielded_concentration or tier_changed:
             logger.info(
-                "🚀 [Dynamic IC Upgrade] Legacy static-prior weights or base leverage tier change detected — scheduling immediate rebalance."
+                "🚀 [Holistic Shields / Dynamic IC Upgrade] Unshielded factor concentration (>60%) or tier change detected — scheduling immediate rebalance."
             )
             daemon.last_rebalance_time = None
 
