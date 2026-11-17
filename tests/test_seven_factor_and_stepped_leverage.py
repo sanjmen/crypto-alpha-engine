@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.audit_shadow_readiness import evaluate_shadow_readiness
+from scripts.run_trading import evaluate_shadow_readiness
 from src.domain.entities import Portfolio, Position
 from src.domain.enums import OrderSide, PositionSide
 from src.execution.database import ShadowDatabase
@@ -1524,6 +1524,34 @@ def test_rebalance_reduce_first_ordering_and_max_leverage_cap():
     # FET/USDT (-$1000 reduction) and APT/USDT (-$23.40 full close) MUST execute BEFORE BTC/USDT (+$800 increase)
     assert routed_symbols == ["FET/USDT", "APT/USDT", "BTC/USDT"]
     db.close()
+
+
+def test_generalized_scripts_cli_parsers() -> None:
+    """Issue #66: Validates that all generalized scripts expose clean parameterized CLI parsers."""
+    from scripts.download_market_data import build_parser as build_data_parser
+    from scripts.run_backtest import build_parser as build_bt_parser
+    from scripts.run_benchmarks import build_parser as build_bench_parser
+    from scripts.run_trading import build_parser as build_trade_parser
+
+    t_args = build_trade_parser().parse_args(["--shadow", "--audit-readiness", "--audit-json"])
+    assert t_args.shadow is True
+    assert t_args.audit_readiness is True
+    assert t_args.audit_json is True
+
+    b_args = build_bt_parser().parse_args(["--mode", "ablation", "--strategy", "seven_factor", "--preset", "top15"])
+    assert b_args.mode == "ablation"
+    assert b_args.strategy == "seven_factor"
+    assert b_args.preset == "top15"
+
+    m_args = build_bench_parser().parse_args(["--suite", "market-impact", "--lookback", "2000"])
+    assert m_args.suite == "market-impact"
+    assert m_args.lookback == 2000
+
+    d_args = build_data_parser().parse_args(["--mode", "vision", "--preset", "all82", "--include-subhourly"])
+    assert d_args.mode == "vision"
+    assert d_args.preset == "all82"
+    assert d_args.include_subhourly is True
+
 
 
 
