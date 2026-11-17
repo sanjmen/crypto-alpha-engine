@@ -1480,11 +1480,14 @@ def test_shadow_monitor_single_instance_reclaim_and_tty_watchdog(tmp_path, monke
     # Verify _is_terminal_alive detects revoked devpts (st_nlink == 0)
     class _DeadPtyStat:
         st_nlink = 0
+        st_size = 0
+        st_mode = 0
 
     monkeypatch.setattr("sys.stdout.fileno", lambda: 1)
     monkeypatch.setattr("os.isatty", lambda fd: True)
     monkeypatch.setattr("os.fstat", lambda fd: _DeadPtyStat())
     assert ShadowMonitor._is_terminal_alive(initial_tty=True) is False
+    monkeypatch.undo()
 
 
 def test_rebalance_reduce_first_ordering_and_max_leverage_cap():
