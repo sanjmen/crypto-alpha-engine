@@ -1399,12 +1399,6 @@ class ShadowTradingDaemon:
             if chop_tp_val > 0.0:
                 eff_tp = chop_tp_val
 
-        if eff_tp and eff_tp > 0.0:
-            if self.profit_lock_trigger_pct and self.profit_lock_trigger_pct > 0:
-                eff_lock_trig = min(self.profit_lock_trigger_pct, max(0.020, round(0.72 * eff_tp, 4)))
-            if self.profit_lock_level_pct and self.profit_lock_level_pct > 0:
-                eff_lock_lvl = min(self.profit_lock_level_pct, max(0.010, round(0.40 * eff_tp, 4)))
-
         return eff_tp, eff_lock_trig, eff_lock_lvl
 
     def ensure_position_brackets(self) -> None:
@@ -1811,6 +1805,12 @@ class ShadowTradingDaemon:
                 current_weights_map[sym.replace("/", "")] = signed_val / total_equity
 
         if use_7f:
+            active_cd_sides: dict[str, PositionSide] = {}
+            if self.core_bracket_cooldown_sec > 0 and self.core_bracket_last_exit:
+                now_cd = datetime.now(timezone.utc)
+                for c_sym, (exit_ts, exited_side) in self.core_bracket_last_exit.items():
+                    if 0.0 <= (now_cd - exit_ts).total_seconds() < self.core_bracket_cooldown_sec:
+                        active_cd_sides[c_sym] = exited_side
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
                 market_data=market_data,
                 portfolio=portfolio,
@@ -1823,6 +1823,7 @@ class ShadowTradingDaemon:
                 premium_index_data=premium_index_data if premium_index_data else None,
                 smart_money_data=smart_money_data if smart_money_data else None,
                 quarterly_basis_data=quarterly_basis_data if quarterly_basis_data else None,
+                cooldown_blocked_sides=active_cd_sides if active_cd_sides else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(

@@ -200,6 +200,7 @@ class MetaStrategyAllocator:
         premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
+        cooldown_blocked_sides: dict[str, PositionSide] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Runs the 7-Factor Causal Online Alpha Engine + Stepped Leverage Controller (2.5x -> 5.0x)
@@ -223,6 +224,17 @@ class MetaStrategyAllocator:
         )
         self.last_seven_factor_result = sf_res
 
+        eff_unit_weights = dict(sf_res.unit_weights)
+        if cooldown_blocked_sides:
+            for sym_k, w_val in list(eff_unit_weights.items()):
+                clean_k = sym_k.replace("/", "")
+                blocked_side = cooldown_blocked_sides.get(clean_k) or cooldown_blocked_sides.get(sym_k)
+                if blocked_side is not None:
+                    if (w_val > 0 and blocked_side == PositionSide.LONG) or (
+                        w_val < 0 and blocked_side == PositionSide.SHORT
+                    ):
+                        eff_unit_weights[sym_k] = 0.0
+
         equity = max(float(portfolio.total_equity), 1.0)
         if current_weights is None and portfolio.positions:
             current_weights = {}
@@ -233,7 +245,7 @@ class MetaStrategyAllocator:
                     current_weights[sym] = (pos.quantity * px) / equity
 
         final_weights, lev_snap = lev_ctrl.scale_and_deadband_weights(
-            unit_weights=sf_res.unit_weights,
+            unit_weights=eff_unit_weights,
             current_weights=current_weights,
             current_equity=equity,
             vol_scalar=sf_res.vol_scalar,
@@ -272,6 +284,7 @@ class MetaStrategyAllocator:
         premium_index_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
+        cooldown_blocked_sides: dict[str, PositionSide] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Executes end-to-end multi-strategy signal generation, regime/HRP adaptation,
@@ -290,6 +303,7 @@ class MetaStrategyAllocator:
                 premium_index_data=premium_index_data,
                 smart_money_data=smart_money_data,
                 quarterly_basis_data=quarterly_basis_data,
+                cooldown_blocked_sides=cooldown_blocked_sides,
             )
 
         # 1. Detect market regime

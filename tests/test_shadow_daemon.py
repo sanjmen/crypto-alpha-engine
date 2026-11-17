@@ -1055,8 +1055,8 @@ def test_chop_range_arb_specialist_and_adaptive_chop_tp():
     btc_tp, btc_trig, btc_lock = daemon.compute_dynamic_barrier_profile("BTC/USDT")
     apt_tp, apt_trig, apt_lock = daemon.compute_dynamic_barrier_profile("APT/USDT")
     assert pytest.approx(btc_tp, abs=1e-4) == 0.0280
-    assert pytest.approx(btc_trig, abs=1e-4) == 0.0202
-    assert pytest.approx(btc_lock, abs=1e-4) == 0.0112
+    assert pytest.approx(btc_trig, abs=1e-4) == 0.0350
+    assert pytest.approx(btc_lock, abs=1e-4) == 0.0150
     # Higher-vol symbol (sigma_1h = 0.0100 -> 2*0.0100*1.6933 = 3.39%, within [2.8%, 3.6%])
     assert pytest.approx(apt_tp, abs=1e-4) == 0.0339
 
