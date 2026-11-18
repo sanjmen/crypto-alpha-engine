@@ -401,8 +401,13 @@ class ShadowTradingDaemon:
                             self.allocator.last_directional_net_usd = fallback_net
             if getattr(self.broker, "capital_rescaled_ratio", None) is not None:
                 self.last_rebalance_time = None
-            self._sync_kill_switch_directional_target()
+        self._ws_barrier_event = threading.Event()
+        self._last_ws_wakeup_mono: float = 0.0
+        self._closed_core_p1_bracket_shift_usd: float = 0.0
+        self._closed_core_bracket_syms: set[str] = set()
+        self._counted_core_bracket_oids: set[str] = set()
         self._refresh_anomaly_cooldowns()
+        self._sync_kill_switch_directional_target()
         self.last_funding_check_time: datetime | None = None
         self.anomaly_scan_interval_sec: float = 30.0
         self.last_anomaly_scan_time: datetime | None = None
@@ -455,9 +460,33 @@ class ShadowTradingDaemon:
                     clean_sym = o.symbol.replace("/", "")
                     if getattr(o, "strategy", None) in ANOMALY_STRATEGIES:
                         self.anomaly_last_exit[clean_sym] = (now, o.order_type == OrderType.STOP_LOSS)
+                    elif getattr(o, "strategy", None) in SNIPER_STRATEGIES:
+                        rpnl_s = getattr(o, "_realized_pnl", None)
+                        was_s_loss = (o.order_type == OrderType.STOP_LOSS) and not (
+                            rpnl_s is not None and float(rpnl_s) > 1e-8
+                        )
+                        self.sniper_last_exit[clean_sym] = (now, was_s_loss)
+                        self._sync_kill_switch_directional_target()
                     else:
                         self.last_core_bracket_fill_time = now
                         exited_side = PositionSide.LONG if o.side == OrderSide.SELL else PositionSide.SHORT
+                        oid_cur = str(getattr(o, "order_id", "") or "")
+                        counted_oids = getattr(self, "_counted_core_bracket_oids", None)
+                        if counted_oids is None:
+                            counted_oids = set()
+                            self._counted_core_bracket_oids = counted_oids
+                        if not oid_cur or oid_cur not in counted_oids:
+                            if oid_cur:
+                                counted_oids.add(oid_cur)
+                            fill_px_o = float(o.average_fill_price or o.price or 0.0)
+                            closed_usd = float(o.quantity) * fill_px_o
+                            signed_closed = closed_usd if exited_side == PositionSide.LONG else -closed_usd
+                            self._closed_core_p1_bracket_shift_usd = (
+                                getattr(self, "_closed_core_p1_bracket_shift_usd", 0.0) - signed_closed
+                            )
+                            if not hasattr(self, "_closed_core_bracket_syms"):
+                                self._closed_core_bracket_syms = set()
+                            self._closed_core_bracket_syms.add(clean_sym)
                         rpnl_o = getattr(o, "_realized_pnl", None)
                         is_winning_exit = (o.order_type == OrderType.TAKE_PROFIT) or (
                             rpnl_o is not None and float(rpnl_o) > 1e-8
@@ -466,6 +495,7 @@ class ShadowTradingDaemon:
                             self.core_bracket_last_exit.pop(clean_sym, None)
                         else:
                             self.core_bracket_last_exit[clean_sym] = (now, exited_side)
+                        self._sync_kill_switch_directional_target()
 
         db_inst = getattr(self.broker, "db", None)
         if db_inst and hasattr(db_inst, "get_trades"):
@@ -491,12 +521,31 @@ class ShadowTradingDaemon:
                                     ts = ts.replace(tzinfo=timezone.utc)
                                 was_loss = rpnl < -1e-8 if abs(rpnl) > 1e-8 else oid.startswith("shd_sl_")
                                 self.anomaly_last_exit[clean_sym] = (ts, was_loss)
-                        elif oid.startswith(("shd_tp_", "shd_sl_")):
+                        elif oid.startswith(("shd_tp_", "shd_sl_")) and strat not in SNIPER_STRATEGIES:
                             ts = datetime.fromisoformat(str(ts_raw))
                             if ts.tzinfo is None:
                                 ts = ts.replace(tzinfo=timezone.utc)
                             if self.last_core_bracket_fill_time is None or ts > self.last_core_bracket_fill_time:
                                 self.last_core_bracket_fill_time = ts
+                            counted_db = getattr(self, "_counted_core_bracket_oids", None)
+                            if counted_db is None:
+                                counted_db = set()
+                                self._counted_core_bracket_oids = counted_db
+                            if (
+                                self.last_rebalance_time is not None
+                                and ts > self.last_rebalance_time
+                                and oid
+                                and oid not in counted_db
+                            ):
+                                counted_db.add(oid)
+                                side_db = str(r.get("side") or "").upper()
+                                qty_db = float(r.get("quantity") or 0.0)
+                                px_db = float(r.get("price") or 0.0)
+                                closed_db = qty_db * px_db
+                                if closed_db > 0:
+                                    signed_db = closed_db if side_db == "SELL" else -closed_db
+                                    self._closed_core_p1_bracket_shift_usd -= signed_db
+                                    self._closed_core_bracket_syms.add(clean_sym)
                             if oid.startswith("shd_tp_") or rpnl > 1e-8:
                                 self.core_bracket_last_exit.pop(clean_sym, None)
                             else:
@@ -662,6 +711,43 @@ class ShadowTradingDaemon:
                 bid=tick.bid,
                 ask=tick.ask,
             )
+        # Immediate sub-second WebSocket wakeup when an open position touches TP, SL, or an un-ratcheted Profit-Lock threshold
+        pos_ws = self.broker.portfolio.positions.get(sym_slash)
+        if (
+            pos_ws is not None
+            and pos_ws.side != PositionSide.FLAT
+            and pos_ws.quantity > 0
+            and tick.price > 0
+            and (now_mono - getattr(self, "_last_ws_wakeup_mono", 0.0)) >= 0.75
+        ):
+            tp_w = pos_ws.take_profit
+            sl_w = pos_ws.stop_loss
+            ep_w = pos_ws.entry_price
+            hit_tp = tp_w is not None and (
+                (pos_ws.side == PositionSide.LONG and (tick.bid >= tp_w or tick.price >= tp_w))
+                or (pos_ws.side == PositionSide.SHORT and (tick.ask <= tp_w or tick.price <= tp_w))
+            )
+            hit_sl = sl_w is not None and (
+                (pos_ws.side == PositionSide.LONG and (tick.bid <= sl_w or tick.price <= sl_w))
+                or (pos_ws.side == PositionSide.SHORT and (tick.ask >= sl_w or tick.price >= sl_w))
+            )
+            hit_new_lock = False
+            if ep_w > 0:
+                gain_w = (tick.price - ep_w) / ep_w if pos_ws.side == PositionSide.LONG else (ep_w - tick.price) / ep_w
+                cur_lock_gain = -1.0
+                if sl_w is not None:
+                    cur_lock_gain = (sl_w - ep_w) / ep_w if pos_ws.side == PositionSide.LONG else (ep_w - sl_w) / ep_w
+                if (
+                    (gain_w >= 0.018 and cur_lock_gain < 0.007)
+                    or (gain_w >= 0.033 and cur_lock_gain < 0.017)
+                    or (gain_w >= 0.043 and cur_lock_gain < 0.030)
+                ):
+                    hit_new_lock = True
+            if hit_tp or hit_sl or hit_new_lock:
+                self._last_ws_wakeup_mono = now_mono
+                ev = getattr(self, "_ws_barrier_event", None)
+                if ev is not None:
+                    ev.set()
 
     def fetch_live_tickers(self) -> dict[str, dict[str, float]]:
         """
@@ -1708,11 +1794,13 @@ class ShadowTradingDaemon:
         sf_res = getattr(self.allocator, "last_seven_factor_result", None)
         t_map: dict[str, Any] = {}
         chop_w = 0.0
+        conviction_val = 1.0
         vol_map: dict[str, float] = {}
 
         if sf_res is not None:
             t_map = getattr(sf_res, "factor_tstats", None) or {}
             chop_w = float(getattr(sf_res, "chop_overlay_weight", 0.0) or 0.0)
+            conviction_val = float(getattr(sf_res, "conviction", 1.0) or 1.0)
             vol_map = getattr(sf_res, "asset_vol_24h", None) or {}
         else:
             db = getattr(self.broker, "db", None)
@@ -1720,6 +1808,8 @@ class ShadowTradingDaemon:
                 try:
                     tel = db.get_latest_seven_factor_telemetry() or {}
                     t_map = tel.get("factor_tstats") or {}
+                    if tel.get("conviction") is not None:
+                        conviction_val = float(tel.get("conviction") or 1.0)
                 except Exception:
                     t_map = {}
 
@@ -1727,7 +1817,8 @@ class ShadowTradingDaemon:
             return eff_tp, eff_lock_trig, eff_lock_lvl
 
         max_tr = max((float(t_map.get(k, 0.0)) for k in ("macro", "med", "fast")), default=1.0) if t_map else 1.0
-        if not (chop_w >= 0.25 or max_tr <= 0.0):
+        is_low_conviction_ranging = bool(t_map) and conviction_val < 0.50 and max_tr < 1.0
+        if not (chop_w >= 0.25 or max_tr <= 0.0 or is_low_conviction_ranging):
             return eff_tp, eff_lock_trig, eff_lock_lvl
 
         clean_sym = symbol.split(":")[0].replace("/", "")
@@ -2089,7 +2180,13 @@ class ShadowTradingDaemon:
             else:
                 trail_trig = self.trailing_trigger_pct
                 trail_dist = self.trailing_distance_pct
-                _, lock_trig, lock_lvl = self.compute_dynamic_barrier_profile(sym)
+                eff_tp_dyn, lock_trig, lock_lvl = self.compute_dynamic_barrier_profile(sym)
+
+            use_prog_lock = (
+                not is_anomaly
+                and sniper_spec is None
+                and bool(getattr(self.feature_flags, "enable_progressive_profit_lock", False))
+            )
 
             # Phase 3: Trailing Stop (only active when trail_trig > 0)
             if trail_trig is not None and trail_trig > 0 and peak_ret >= trail_trig:
@@ -2104,17 +2201,61 @@ class ShadowTradingDaemon:
                     if (pos.stop_loss is None or trail_target < pos.stop_loss) and curr_p < trail_target:
                         candidate_sl = trail_target
 
-            # Phase 2: Profit-Lock (Peak gain >= 3.5% -> +1.5% Core / >= 4.5% -> +2.5% Anomaly)
+            # Phase 2A: 3-Stage Progressive Profit-Lock Ratchet on Core & Manga P2 positions
+            if use_prog_lock and lock_trig is not None and lock_trig > 0:
+                is_chop_prof = eff_tp_dyn is not None and 0.0 < eff_tp_dyn <= 0.040
+                if is_chop_prof:
+                    s3_trig = max(0.029, round(float(eff_tp_dyn) - 0.004, 4))
+                    s3_lvl = max(0.020, round(float(eff_tp_dyn) - 0.012, 4))
+                    prog_stages = [
+                        (s3_trig, s3_lvl),
+                        (float(lock_trig), float(lock_lvl)),
+                        (0.018, 0.008),
+                    ]
+                else:
+                    s2_trig = min(0.033, float(lock_trig))
+                    s2_lvl = max(0.018, float(lock_lvl))
+                    prog_stages = [
+                        (0.043, 0.032),
+                        (s2_trig, s2_lvl),
+                        (0.022, 0.009),
+                    ]
+                dec_p = 6 if entry < 1.0 else (4 if entry < 100.0 else 2)
+                for st_trig, st_lvl in prog_stages:
+                    if peak_ret < st_trig:
+                        continue
+                    if pos.side == PositionSide.LONG:
+                        lock_target = round(entry * (1.0 + st_lvl), dec_p)
+                        eff_prev = max(
+                            [x for x in (pos.stop_loss, candidate_sl) if x is not None],
+                            default=None,
+                        )
+                        if (eff_prev is None or lock_target > eff_prev + 1e-9) and curr_p > lock_target * 1.0005:
+                            candidate_sl = lock_target
+                            break
+                    else:  # SHORT
+                        lock_target = round(entry * (1.0 - st_lvl), dec_p)
+                        eff_prev = min(
+                            [x for x in (pos.stop_loss, candidate_sl) if x is not None],
+                            default=None,
+                        )
+                        if (eff_prev is None or lock_target < eff_prev - 1e-9) and curr_p < lock_target * 0.9995:
+                            candidate_sl = lock_target
+                            break
+
+            # Phase 2B: Legacy Single-Stage Profit-Lock
             elif lock_trig is not None and lock_trig > 0 and peak_ret >= lock_trig:
                 if pos.side == PositionSide.LONG:
                     lock_target = entry * (1.0 + lock_lvl)
                     lock_target = round(lock_target, 6 if lock_target < 1.0 else 2)
-                    if (pos.stop_loss is None or lock_target > pos.stop_loss) and curr_p > lock_target:
+                    eff_prev = max([x for x in (pos.stop_loss, candidate_sl) if x is not None], default=None)
+                    if (eff_prev is None or lock_target > eff_prev) and curr_p > lock_target:
                         candidate_sl = lock_target
                 else:  # SHORT
                     lock_target = entry * (1.0 - lock_lvl)
                     lock_target = round(lock_target, 6 if lock_target < 1.0 else 2)
-                    if (pos.stop_loss is None or lock_target < pos.stop_loss) and curr_p < lock_target:
+                    eff_prev = min([x for x in (pos.stop_loss, candidate_sl) if x is not None], default=None)
+                    if (eff_prev is None or lock_target < eff_prev) and curr_p < lock_target:
                         candidate_sl = lock_target
 
             # Apply ratchet if candidate_sl is an improvement
@@ -2297,6 +2438,9 @@ class ShadowTradingDaemon:
             )
 
         target_dollars = self._apply_core_bracket_cooldowns(target_dollars)
+        self._closed_core_p1_bracket_shift_usd = 0.0
+        self._closed_core_bracket_syms = set()
+        self._counted_core_bracket_oids = set()
         self._sync_kill_switch_directional_target(portfolio=portfolio)
 
         if getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None) is not None:
@@ -2488,11 +2632,10 @@ class ShadowTradingDaemon:
             self._prev_factor_weights = cur_fw
         if sf_res and lev_snap and hasattr(self.broker.db, "save_seven_factor_telemetry"):
             sf_eng_inst = getattr(self.allocator, "seven_factor_engine", None)
-            eng_mode = (
-                "dynamic_online_ic"
-                if (sf_eng_inst is not None and getattr(sf_eng_inst, "priors", None) is None)
-                else "static_priors"
+            is_dyn_ic = bool(getattr(sf_eng_inst, "_zero_priors", False)) or (
+                sf_eng_inst is not None and getattr(sf_eng_inst, "priors", None) is None
             )
+            eng_mode = "dynamic_online_ic" if is_dyn_ic else "static_priors"
             p2_w_snap = (
                 dict(getattr(self.allocator, "last_p2_weights", {}) or {})
                 if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
@@ -2647,6 +2790,27 @@ class ShadowTradingDaemon:
                 return True
         return False
 
+    def _compute_active_authorized_core_net_usd(self, portfolio: Portfolio) -> float:
+        """
+        Computes currently active authorized Core + Manga P2 net USD exposure,
+        preserving exact P1+P2 netted exposure at rebalance and dynamically adjusting
+        as mid-cycle Core or P2 legs exit via Take-Profit or Profit-Lock Stop-Loss.
+        """
+        base_dir_net = (
+            float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+            if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
+            else 0.0
+        )
+        bracket_shift = float(getattr(self, "_closed_core_p1_bracket_shift_usd", 0.0) or 0.0)
+        closed_syms = getattr(self, "_closed_core_bracket_syms", None) or set()
+        any_core_open = any(
+            p and p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy not in ISOLATED_SATELLITE_STRATEGIES
+            for p in portfolio.positions.values()
+        )
+        if not any_core_open and closed_syms:
+            return 0.0
+        return base_dir_net + bracket_shift
+
     def _sync_kill_switch_directional_target(self, portfolio: Portfolio | None = None) -> None:
         """Synchronizes `EmergencyKillSwitch.target_net_exposure_usd` with authorized P2 + Event-Sniper net USD."""
         live_b_ks = getattr(self.broker, "live_broker", None)
@@ -2654,11 +2818,7 @@ class ShadowTradingDaemon:
         if ks_inst is None:
             return
         pf = portfolio or self.broker.get_portfolio()
-        p2_net = (
-            float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
-            if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
-            else 0.0
-        )
+        p2_net = self._compute_active_authorized_core_net_usd(pf)
         sniper_net = 0.0
         if self.enable_event_snipers:
             for pos in pf.positions.values():
@@ -2835,7 +2995,7 @@ class ShadowTradingDaemon:
         eq = max(float(pf.total_equity), 1.0)
         denom = max(core_gross_usd, eq, 1.0)
         p2_active_map = getattr(self.allocator, "last_p2_weights", {}) or {}
-        dir_net_usd = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+        dir_net_usd = self._compute_active_authorized_core_net_usd(pf)
         residual_core_net_usd = (core_long_usd - core_short_usd) - dir_net_usd
         core_net_drift_pct = (abs(residual_core_net_usd) / denom) if core_gross_usd > 0 else 0.0
         max_side_legs = 5 + min(3, len(p2_active_map))
@@ -3701,6 +3861,9 @@ class ShadowTradingDaemon:
     def stop(self) -> None:
         """Stops the daemon background thread, waiting for any in-flight live order chase to complete."""
         self.is_running = False
+        ev = getattr(self, "_ws_barrier_event", None)
+        if ev is not None:
+            ev.set()
         if self.ws_client:
             self.ws_client.stop()
         join_timeout = 20.0 if getattr(self.broker, "is_live", False) else 5.0
@@ -3726,10 +3889,15 @@ class ShadowTradingDaemon:
         logger.info("ShadowTradingDaemon stopped.")
 
     def _run_loop(self) -> None:
-        """Continuous execution loop."""
+        """Continuous execution loop with sub-second WebSocket barrier wakeup."""
         while self.is_running:
             try:
                 self.step()
             except Exception:
                 logger.exception("Error in shadow daemon loop")
-            time.sleep(self.fast_interval_sec)
+            ev = getattr(self, "_ws_barrier_event", None)
+            if ev is not None:
+                ev.wait(timeout=self.fast_interval_sec)
+                ev.clear()
+            else:
+                time.sleep(self.fast_interval_sec)

@@ -991,12 +991,11 @@ def main() -> None:
         daemon.last_rebalance_time = None
     elif mode == "mainnet" and priors_cfg is None and hasattr(db, "get_latest_seven_factor_telemetry"):
         sf_prev = db.get_latest_seven_factor_telemetry() or {}
-        saved_mode = str(sf_prev.get("engine_mode") or "")
         prev_w = sf_prev.get("factor_weights") or {}
         is_all_seven_static = len(prev_w) == 7 and all(
             float(prev_w.get(k, 0.0)) >= 0.08 for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
-        if saved_mode == "static_priors" or (not saved_mode and is_all_seven_static):
+        if is_all_seven_static:
             logger.info(
                 "🚀 [Dynamic Online IC Migration] Legacy static-prior factor weights detected — scheduling one-time rebalance."
             )

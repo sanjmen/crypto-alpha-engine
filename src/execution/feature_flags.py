@@ -91,6 +91,7 @@ class FeatureFlags:
     chop_max_tp_pct: float = 0.036
     chop_profit_lock_trigger_pct: float = 0.024
     chop_profit_lock_level_pct: float = 0.012
+    enable_progressive_profit_lock: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -224,6 +225,10 @@ class FeatureFlags:
             env.get("FF_CHOP_PROFIT_LOCK_LEVEL_PCT"),
             default=0.012,
         )
+        enable_prog_lock = _parse_bool(
+            env.get("FF_ENABLE_PROGRESSIVE_PROFIT_LOCK"),
+            default=True,
+        )
         cli_cushion = getattr(args, "enable_cushion_governor", None) if args is not None else None
         env_cushion = env.get("FF_ENABLE_CUSHION_GOVERNOR")
         if env_cushion is not None:
@@ -318,6 +323,7 @@ class FeatureFlags:
             chop_max_tp_pct=chop_max_tp,
             chop_profit_lock_trigger_pct=chop_lock_trig,
             chop_profit_lock_level_pct=chop_lock_lvl,
+            enable_progressive_profit_lock=enable_prog_lock,
         )
 
     def apply_override(self, key: str, raw_value: Any) -> tuple[str, Any]:
@@ -372,6 +378,8 @@ class FeatureFlags:
             "enable_event_snipers": "enable_event_snipers",
             "sniper_slot_leverage": "sniper_slot_leverage",
             "sniper_max_positions": "sniper_max_positions",
+            "progressive_profit_lock": "enable_progressive_profit_lock",
+            "enable_progressive_profit_lock": "enable_progressive_profit_lock",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:

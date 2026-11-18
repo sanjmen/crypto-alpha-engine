@@ -176,6 +176,19 @@ class ShadowExecutionBroker(IExecutionClient):
                         local_pos.quantity = ex_pos.quantity
                         local_pos.entry_price = ex_pos.entry_price
                         local_pos.current_price = ex_pos.current_price or ex_pos.entry_price
+                        if local_pos.current_price > 0 and local_pos.entry_price > 0:
+                            if local_pos.side == PositionSide.LONG:
+                                local_pos.peak_price = (
+                                    max(local_pos.entry_price, local_pos.peak_price, local_pos.current_price)
+                                    if local_pos.peak_price > 0
+                                    else max(local_pos.entry_price, local_pos.current_price)
+                                )
+                            elif local_pos.side == PositionSide.SHORT:
+                                local_pos.peak_price = (
+                                    min(local_pos.entry_price, local_pos.peak_price, local_pos.current_price)
+                                    if local_pos.peak_price > 0
+                                    else min(local_pos.entry_price, local_pos.current_price)
+                                )
                         self.db.save_position(local_pos)
                     else:
                         ex_pos.opened_at = datetime.now(timezone.utc)
@@ -320,6 +333,15 @@ class ShadowExecutionBroker(IExecutionClient):
         if symbol in self.portfolio.positions:
             pos = self.portfolio.positions[symbol]
             pos.current_price = p
+            if pos.quantity > 0 and pos.entry_price > 0 and p > 0:
+                if pos.side == PositionSide.LONG:
+                    pos.peak_price = (
+                        max(pos.entry_price, pos.peak_price, p) if pos.peak_price > 0 else max(pos.entry_price, p)
+                    )
+                elif pos.side == PositionSide.SHORT:
+                    pos.peak_price = (
+                        min(pos.entry_price, pos.peak_price, p) if pos.peak_price > 0 else min(pos.entry_price, p)
+                    )
             if persist_db:
                 self.db.save_position(pos)
 
