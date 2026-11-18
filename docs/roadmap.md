@@ -184,7 +184,18 @@ This roadmap structures the development of the **Crypto Alpha Engine** into six 
 * **Issue #64 [OPEN — Quarantine in `--shadow`]**: Quarantine `Extreme Funding Harvester` in `--shadow` pending post-settlement stop-loss refinement.
 * **Issue #65 [OPEN — Quarantine in `--shadow`]**: Quarantine `4.5% Dynamic Anomaly Equity Sizing` in `--shadow` (keeping `$45` cap in `--mainnet`).
 * **Core Bracket Optimization (`commits cfdb24b` & `4cdbb2a`)**: Unify Core 7-Factor exit brackets to **Passive Maker Take-Profit `+5.0%` (`0.02%` fee) + Profit-Lock (`+3.5% -> +1.5%`) with Trailing Stop disabled (`0.0`) and initial negative Stop-Loss disabled (`None`)** across both `--shadow` and `--mainnet` (documented in [`docs/SYSTEM_OPERATION_AND_DECISIONS_2026.md`](SYSTEM_OPERATION_AND_DECISIONS_2026.md)).
+* **1m Microstructure Upgrade — Phase 1 & Phase 2 (`commits 510533e`, `ef515a9`, `cfbed64` — COMPLETED, `100% USDT`)**:
+  * **Phase 1**: Cushion-Safe CPPI Equity Floor Governor (`$2,500` floor + `$240` buffer) + `CausalDollarBarTSMOMEngine` (`Manga P2` `1m` Volume-Clock Dollar Bars + Taker-CVD on `BTC/ETH/SOL`, `Max=0.95x`, `P1Scale=0.85x`) + Trend-Aware Chop Bracket Protection.
+  * **Phase 2**: `EventDrivenSniperEngine` (`Sniper:M09_CoilBreakout`, `Sniper:M23_BreadthThrust`, `Sniper:M04_NegFundSqueeze`, `Max=3x0.24`, One-Way non-collision, `100% USDT` Single-Asset Margin — `BFUSD` permanently disabled), lifting 4-year `1m` portfolio metrics to `Sharpe = 2.48`, `CAGR = +125.7%`, `MaxDD = 21.2%` (`Calmar = 5.92`).
 
+---
 
+## Milestone 16: Multi-Modal Alpha Factory & High-Sharpe Orthogonal Discovery (M16) [ACTIVE]
+**Objective**: Lift portfolio net Sharpe from `2.48` (`~0.22%–0.42%/day`) toward `5.0–7.5` (`~0.60%–1.00%/day` geometric daily return) while strictly preserving `MaxDD <= 20%`, `100% USDT` Single-Asset Cross-Margin, and the `$2,500` Hard Equity Floor — using Google Drive (`0 MB` local storage) + Google Colab systematic discovery (detailed specification in [`docs/MILESTONE_M16_ALPHA_FACTORY.md`](MILESTONE_M16_ALPHA_FACTORY.md)).
 
-
+* **Issue #67 (`M16-1`)**: `Data/Drive` — Zero-Local Streaming Ingestion of `5m` Derivatives Metrics (`Open Interest`, Whale/Retail `L/S`), `1m` Spot Klines & Survivorship-Bias-Free `200+` Perp Universe to Google Drive.
+* **Issue #68 (`M16-2`)**: `FeatureLab/MultiModal` — Causal Microstructure Feature Library (`ΔOI` 4-Quadrant Liquidation Physics, Whale-vs-Crowd Divergence, `1m` Spot-Perp Basis & Spot CVD Lead-Lag).
+* **Issue #69 (`M16-3`)**: `ExecutionLab/Maker` — Conservative `1m` Passive `Post-Only (GTX)` Wick-Sniper & Queue-Penetration Simulator (`1–3 bps` penetration buffer + worst-case intrabar SL priority).
+* **Issue #70 (`M16-4`)**: `Discovery/Engine` — Automated Symbolic & Shallow-Tree Alpha Mining on Colab with `Train (23-24) -> Val (25) -> Sealed Holdout (26)`, CPCV, and Deflated Sharpe Ratio (`DSR >= 0.95`).
+* **Issue #71 (`M16-5`)**: `Portfolio/Synthesis` — Orthogonal Multi-Engine Risk Budgeting & Grand 4-Year `1m` Portfolio Stress-Test (`Target: Sharpe 4.5–6.5, MaxDD <= 20%, $2,500 Floor SAFE`).
+* **Issue #72 (`M16-6`)**: `Prod/Integration` — Live Real-Time Multi-Modal Feeds (`5m` OI/Whales, `1m` Spot-Perp, `GTX` Snipers), Shadow Burn-In & Mainnet Rollout on GCP Tokyo.

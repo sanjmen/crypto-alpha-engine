@@ -39,6 +39,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.ccxt_provider import TOP_30_SYMBOLS, CCXTMarketDataProvider
+from src.data.multimodal_vision_ingestor import (
+    KLINES_RAW_COLS,
+    build_universe_catalog_row,
+    fetch_and_assemble_symbol_metrics_5m,
+    fetch_vision_zip_csv,
+    list_vision_s3_prefixes,
+    load_default_pit_220_plan,
+    normalize_funding_df,
+    normalize_kline_df,
+    resolve_spot_candidates,
+    stream_multimodal_shards_to_directory,
+    verify_spot_price_parity,
+    write_parquet_zstd,
+)
 from src.data.parquet_storage import ParquetBarStorage
 from src.domain.enums import Timeframe
 
@@ -152,6 +166,7 @@ PRESETS = {
     "top15": [f"{s[:-4]}/USDT" if s.endswith("USDT") and "/" not in s else s for s in TOP_15_SYMBOLS],
     "top30": TOP_30_SYMBOLS[:30],
     "all82": [f"{s[:-4]}/USDT" if s.endswith("USDT") and "/" not in s else s for s in ALL_82_SYMBOLS],
+    "m16_pit220": sorted(load_default_pit_220_plan().keys()),
 }
 
 BINANCE_VISION_S3_BASE = "https://data.binance.vision"
@@ -510,40 +525,113 @@ def _fetch_month_premium(symbol: str, year: int, month: int, url_ticker: str | N
     return None
 
 
+def _fetch_spot_1m_for_symbol(
+    perp_sym: str,
+    spot_sym: str,
+    multiplier: float,
+    years: list[int],
+    recent_days: list[str],
+) -> pd.DataFrame | None:
+    dfs: list[pd.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futs = [
+            ex.submit(
+                fetch_vision_zip_csv,
+                f"{BINANCE_VISION_S3_BASE}/data/spot/monthly/klines/{spot_sym}/1m/{spot_sym}-1m-{y}-{m:02d}.zip",
+                KLINES_RAW_COLS,
+            )
+            for y in years
+            for m in range(1, 13)
+        ] + [
+            ex.submit(
+                fetch_vision_zip_csv,
+                f"{BINANCE_VISION_S3_BASE}/data/spot/daily/klines/{spot_sym}/1m/{spot_sym}-1m-{ds}.zip",
+                KLINES_RAW_COLS,
+            )
+            for ds in recent_days
+        ]
+        for fut in as_completed(futs):
+            raw_df = fut.result()
+            if raw_df is not None and not raw_df.empty:
+                dfs.append(raw_df)
+    if not dfs:
+        return None
+    return normalize_kline_df(
+        pd.concat(dfs, ignore_index=True),
+        symbol=perp_sym,
+        price_multiplier=multiplier,
+        spot_symbol=spot_sym,
+    )
+
+
 def run_vision_mode(args: argparse.Namespace) -> None:
     import shutil
 
     start_time = time.time()
     base_output_dir = Path(args.output_dir)
     base_output_dir.mkdir(parents=True, exist_ok=True)
-    symbols = [_raw_symbol(s) for s in PRESETS[args.preset]]
+    universe_plan: dict[str, dict] = {}
+    plan_path_arg = getattr(args, "universe_plan_json", None)
+    if plan_path_arg and Path(plan_path_arg).exists():
+        universe_plan = json.loads(Path(plan_path_arg).read_text())
+        symbols = sorted(universe_plan.keys())
+    elif args.preset == "m16_pit220":
+        universe_plan = load_default_pit_220_plan()
+        symbols = sorted(universe_plan.keys())
+    else:
+        symbols = [_raw_symbol(s) for s in PRESETS[args.preset]]
     years = [int(y) for y in args.years.split(",")]
+    if getattr(args, "sharded_multimodal", False):
+        rclone_target = "gdrive:trading/crypto-alpha-engine/data/m16_multimodal" if args.sync_drive else None
+        stream_multimodal_shards_to_directory(
+            output_dir=base_output_dir,
+            universe_plan=universe_plan or None,
+            years=years,
+            rclone_dest=rclone_target,
+        )
+        return
     timeframes = ["1h", "15m"] if args.include_subhourly else [args.timeframe]
     resample_1m = bool(getattr(args, "resample_from_1m", False)) and args.timeframe == "1m"
     include_prem = bool(getattr(args, "include_premium", False))
+    include_metrics = bool(getattr(args, "include_metrics_5m", False))
+    include_spot = bool(getattr(args, "include_spot_1m", False))
     clean_local = bool(getattr(args, "clean_local", False)) and bool(args.sync_drive)
+
+    spot_set: set[str] = set()
+    if include_spot and not universe_plan:
+        spot_prefixes = list_vision_s3_prefixes("data/spot/monthly/klines/")
+        spot_set = {p.split("/")[-2] for p in spot_prefixes if p.split("/")[-2].endswith("USDT")}
 
     now_utc = datetime.now(timezone.utc)
     cur_ym_prefix = f"{now_utc.year:04d}-{now_utc.month:02d}"
     recent_days = [f"{cur_ym_prefix}-{d:02d}" for d in range(1, now_utc.day)] if now_utc.year in years else []
+    active_cutoff_ts = int((now_utc - timedelta(days=45)).timestamp())
 
     print("=" * 70)
     print("  CRYPTO ALPHA ENGINE: BINANCE VISION S3 -> GOOGLE DRIVE INGESTION")
     print("=" * 70)
     print(
         f"  Staging: {base_output_dir} | Symbols: {len(symbols)} | Years: {years} | "
-        f"TFs: {timeframes} | Resample1m: {resample_1m} | SyncDrive: {args.sync_drive} | CleanLocal: {clean_local}"
+        f"TFs: {timeframes} | Resample1m: {resample_1m} | Metrics5m: {include_metrics} | "
+        f"Spot1m: {include_spot} | SyncDrive: {args.sync_drive} | CleanLocal: {clean_local}"
     )
     print("-" * 70)
 
     total_klines = 0
     total_funding = 0
+    total_metrics = 0
+    total_spot = 0
+    catalog_rows: list[dict] = []
     batch_size = 6 if clean_local else len(symbols)
 
     for b_start in range(0, len(symbols), max(1, batch_size)):
         batch_syms = symbols[b_start : b_start + batch_size]
         for sym in batch_syms:
             tickers = VISION_TICKER_ALIASES.get(sym, [sym])
+            sym_1m_df: pd.DataFrame | None = None
+            sym_fnd_df: pd.DataFrame | None = None
+            sym_met_df: pd.DataFrame | None = None
+            sym_spot_df: pd.DataFrame | None = None
             for tf in timeframes:
                 dfs = []
                 with ThreadPoolExecutor(max_workers=16) as ex:
@@ -564,6 +652,8 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                         .sort_values("timestamp")
                         .reset_index(drop=True)
                     )
+                    if tf == "1m":
+                        sym_1m_df = merged
                     target_dir = base_output_dir / "bars" / tf
                     target_dir.mkdir(parents=True, exist_ok=True)
                     pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
@@ -582,7 +672,10 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                 f_dfs = []
                 with ThreadPoolExecutor(max_workers=16) as ex:
                     futs_f = [
-                        ex.submit(_fetch_month_funding, sym, y, m, tk)
+                        ex.submit(
+                            fetch_vision_zip_csv,
+                            f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/fundingRate/{tk}/{tk}-fundingRate-{y}-{m:02d}.zip",
+                        )
                         for tk in tickers
                         for y in years
                         for m in range(1, 13)
@@ -592,16 +685,50 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                         if res_df is not None:
                             f_dfs.append(res_df)
                 if f_dfs:
-                    merged_f = (
-                        pd.concat(f_dfs, ignore_index=True)
-                        .drop_duplicates(subset=["timestamp"], keep="last")
-                        .sort_values("timestamp")
-                        .reset_index(drop=True)
-                    )
-                    f_dir = base_output_dir / "funding"
-                    f_dir.mkdir(parents=True, exist_ok=True)
-                    pq.write_table(pa.Table.from_pandas(merged_f), f_dir / f"{sym}.parquet", compression="zstd")
-                    total_funding += len(merged_f)
+                    merged_f = normalize_funding_df(pd.concat(f_dfs, ignore_index=True), symbol=sym)
+                    if merged_f is not None and not merged_f.empty:
+                        sym_fnd_df = merged_f
+                        f_dir = base_output_dir / "funding"
+                        f_dir.mkdir(parents=True, exist_ok=True)
+                        write_parquet_zstd(merged_f, f_dir / f"{sym}.parquet")
+                        total_funding += len(merged_f)
+
+            if include_metrics:
+                sym_met_df = fetch_and_assemble_symbol_metrics_5m(sym, min_year=min(years), max_workers=24)
+                if sym_met_df is not None and not sym_met_df.empty:
+                    m_dir = base_output_dir / "metrics" / "5m"
+                    write_parquet_zstd(sym_met_df, m_dir / f"{sym}.parquet")
+                    total_metrics += len(sym_met_df)
+
+            sp_sym_used: str | None = None
+            sp_mult_used: float = 1.0
+            if include_spot:
+                if sym in universe_plan:
+                    sp_sym_used = universe_plan[sym].get("spot_symbol")
+                    sp_mult_used = float(universe_plan[sym].get("spot_multiplier") or 1.0)
+                else:
+                    cands = resolve_spot_candidates(sym, spot_set)
+                    if cands:
+                        sp_sym_used, sp_mult_used = cands[0]
+                if sp_sym_used:
+                    cand_spot_df = _fetch_spot_1m_for_symbol(sym, sp_sym_used, sp_mult_used, years, recent_days)
+                    if (
+                        cand_spot_df is not None
+                        and not cand_spot_df.empty
+                        and (
+                            sym_1m_df is None
+                            or sym_1m_df.empty
+                            or verify_spot_price_parity(
+                                float(sym_1m_df["close"].iloc[-1]),
+                                float(cand_spot_df["close"].iloc[-1]) / sp_mult_used,
+                                sp_mult_used,
+                            )
+                        )
+                    ):
+                        sym_spot_df = cand_spot_df
+                        sp_dir = base_output_dir / "spot_bars" / "1m"
+                        write_parquet_zstd(sym_spot_df, sp_dir / f"{sym}.parquet")
+                        total_spot += len(sym_spot_df)
 
             if include_prem:
                 p_dfs = []
@@ -627,6 +754,19 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                     p_dir.mkdir(parents=True, exist_ok=True)
                     pq.write_table(pa.Table.from_pandas(merged_p), p_dir / f"{sym}.parquet", compression="zstd")
 
+            catalog_rows.append(
+                build_universe_catalog_row(
+                    symbol=sym,
+                    bars_1m_df=sym_1m_df,
+                    metrics_5m_df=sym_met_df,
+                    spot_1m_df=sym_spot_df,
+                    funding_df=sym_fnd_df,
+                    spot_symbol=sp_sym_used,
+                    spot_multiplier=sp_mult_used,
+                    active_cutoff_ts=active_cutoff_ts,
+                )
+            )
+
         if args.sync_drive:
             subprocess.run(
                 [
@@ -650,21 +790,45 @@ def run_vision_mode(args: argparse.Namespace) -> None:
                     flush=True,
                 )
 
+    cat_df = pd.DataFrame(catalog_rows)
     manifest = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.time() - start_time, 2),
+        "symbols_count": len(symbols),
         "symbols": symbols,
         "timeframes": timeframes,
         "years": years,
         "total_klines_bars": total_klines,
         "total_funding_settlements": total_funding,
+        "total_metrics_5m_rows": total_metrics,
+        "total_spot_1m_bars": total_spot,
+        "spot_matched_symbols": int(cat_df["has_spot"].sum()) if not cat_df.empty else 0,
+        "delisted_historical_symbols": (
+            int((cat_df["status"] == "HISTORICAL_DELISTED").sum()) if not cat_df.empty else 0
+        ),
     }
-    if not clean_local:
-        (base_output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    else:
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    if not cat_df.empty:
+        write_parquet_zstd(cat_df, base_output_dir / "universe_catalog.parquet")
+    (base_output_dir / "universe_data_manifest.json").write_text(json.dumps(manifest, indent=2))
+    if args.sync_drive:
+        subprocess.run(
+            [
+                "rclone",
+                "copy",
+                str(base_output_dir),
+                "gdrive:trading/crypto-alpha-engine/data",
+                "--transfers",
+                "8",
+                "-q",
+            ],
+            check=False,
+        )
+    if clean_local:
         shutil.rmtree(base_output_dir, ignore_errors=True)
     print(
-        f"🎉 Complete in {manifest['elapsed_seconds']}s | Klines: {total_klines:,} | Funding: {total_funding:,}",
+        f"🎉 Complete in {manifest['elapsed_seconds']}s | Klines: {total_klines:,} | "
+        f"Metrics5m: {total_metrics:,} | Spot1m: {total_spot:,} | Funding: {total_funding:,}",
         flush=True,
     )
 
@@ -705,6 +869,65 @@ def run_colab_mode(args: argparse.Namespace) -> None:
         )
         rc, out, err = client.exec_inline(cmd, timeout=60)
         print(f"[+] Dispatched remote Vision ingestion on Colab ({rc}): {out or err}")
+    elif act == "ingest-m16":
+        if not client.ensure_session(gpu=args.colab_gpu):
+            raise RuntimeError(f"Failed to connect to Colab session '{args.colab_session}'")
+        if not client.is_drive_mounted():
+            raise RuntimeError(
+                f"Google Drive is not mounted on '{args.colab_session}'. "
+                f"Run `colab drivemount -s {args.colab_session} /content/drive` first."
+            )
+        client.upload(
+            REPO_ROOT / "src/data/multimodal_vision_ingestor.py", "/content/src/data/multimodal_vision_ingestor.py"
+        )
+        client.upload(REPO_ROOT / "src/data/m16_pit_220_universe.json", "/content/src/data/m16_pit_220_universe.json")
+        client.upload(REPO_ROOT / "src/data/ccxt_provider.py", "/content/src/data/ccxt_provider.py")
+        client.upload(REPO_ROOT / "src/data/parquet_storage.py", "/content/src/data/parquet_storage.py")
+        client.upload(REPO_ROOT / "src/domain/enums.py", "/content/src/domain/enums.py")
+        client.upload(Path(__file__).resolve(), "/content/scripts/download_market_data.py")
+        drive_out = "/content/drive/MyDrive/trading/crypto-alpha-engine/data/m16_multimodal"
+        launch_cmd = (
+            "import os, subprocess, sys; "
+            "os.makedirs('/content/src/data', exist_ok=True); "
+            "os.makedirs('/content/src/domain', exist_ok=True); "
+            "log_f = open('/content/m16_colab.log', 'w', buffering=1); "
+            "proc = subprocess.Popen([sys.executable, '-u', '/content/scripts/download_market_data.py', "
+            f"'--mode', 'vision', '--preset', 'm16_pit220', '--sharded-multimodal', '--output-dir', '{drive_out}'], "
+            "stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True); "
+            "open('/content/m16_colab.pid', 'w').write(str(proc.pid)); "
+            "print(f'LAUNCHED_PID={proc.pid}')"
+        )
+        rc, out, err = client.exec_inline(launch_cmd, timeout=60)
+        print(f"[+] Dispatched M16-1 sharded ingestion on Colab ({rc}): {(out or err).strip()}", flush=True)
+        seen = 0
+        while True:
+            time.sleep(35.0)
+            poll = (
+                "import os; "
+                "pid = int(open('/content/m16_colab.pid').read().strip()); "
+                "alive = os.path.exists(f'/proc/{pid}'); "
+                "lines = open('/content/m16_colab.log').read().splitlines() if os.path.exists('/content/m16_colab.log') else []; "
+                f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+            )
+            rc_p, out_p, _ = client.exec_inline(poll, timeout=60)
+            if rc_p != 0:
+                continue
+            alive, done = True, False
+            for ln in out_p.splitlines():
+                if ln.startswith("ALIVE="):
+                    p = ln.split()
+                    alive = p[0].split("=")[1] == "True"
+                    seen = int(p[1].split("=")[1])
+                elif ln.startswith("LOG|"):
+                    msg = ln[4:]
+                    print(msg, flush=True)
+                    if "ALL_20_SHARDS_COMPLETE!" in msg:
+                        done = True
+            if done or not alive:
+                break
+        client.stop()
+        print("[+] M16-1 Colab ingestion finished and session stopped cleanly.", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -764,16 +987,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also ingest 1h Spot-Perp Premium Index klines in --mode vision.",
     )
     parser.add_argument(
+        "--include-metrics-5m",
+        action="store_true",
+        help="M16-1: Also ingest 5-minute Derivatives Positioning & Open Interest metrics (`metrics/5m/`).",
+    )
+    parser.add_argument(
+        "--include-spot-1m",
+        action="store_true",
+        help="M16-1: Also ingest multiplier-adjusted 1-minute Spot klines (`spot_bars/1m/`).",
+    )
+    parser.add_argument(
+        "--universe-plan-json",
+        type=str,
+        default=None,
+        help="M16-1: Path to Point-in-Time survivorship-free 200+ universe JSON plan overriding --preset.",
+    )
+    parser.add_argument(
         "--clean-local",
         action="store_true",
         help="Stream in 6-symbol batches to Google Drive and immediately delete local staging files (0 local disk used).",
+    )
+    parser.add_argument(
+        "--sharded-multimodal",
+        action="store_true",
+        help="M16-1: Stream compact zstd-9 row-group shards (`bars_1m`, `bars_1h`, `metrics_5m`, `spot_bars_1m`, `funding`).",
     )
     parser.add_argument(
         "--colab-session", type=str, default="crypto_data_ingest", help="Colab session name for --mode colab."
     )
     parser.add_argument(
         "--colab-action",
-        choices=["status", "ensure", "mount", "ingest", "stop", "heartbeat"],
+        choices=["status", "ensure", "mount", "ingest", "ingest-m16", "stop", "heartbeat"],
         default="status",
         help="Action to execute in --mode colab (default: status).",
     )
