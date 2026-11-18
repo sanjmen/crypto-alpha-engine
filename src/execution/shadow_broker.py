@@ -50,7 +50,7 @@ class ShadowExecutionBroker(IExecutionClient):
         capacity_ceiling: CapitalCapacityCeiling | None = None,
         enforce_capacity_ceiling: bool = False,
         live_broker: Any | None = None,
-        enable_yield_collateral: bool = True,
+        enable_yield_collateral: bool = False,
         collateral_yield_apy: float = 0.055,
         collateral_haircut: float = 0.999,
         account_snapshot_interval_sec: float = 60.0,

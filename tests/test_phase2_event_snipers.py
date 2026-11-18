@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.domain.enums import PositionSide
 from src.execution.database import ShadowDatabase
@@ -234,3 +235,171 @@ def test_m04_neg_funding_squeeze_and_full_daemon_lifecycle() -> None:
     assert daemon.enable_event_snipers is False
     daemon.manage_trailing_and_profit_locks({"INJ/USDT": {"price": 20.65 * 1.05}})
     assert broker.get_portfolio().positions["INJ/USDT"].side == PositionSide.FLAT
+
+
+def test_usdt_only_default_and_container_restart_p2_hydration(tmp_path):
+    """
+    Verifies:
+    1) `ShadowExecutionBroker` defaults to 100% USDT (`enable_yield_collateral=False`, ZERO BFUSD).
+    2) Mid-cycle container restart hydrates `allocator.last_p2_weights`, `allocator.last_directional_net_usd`,
+       and `EmergencyKillSwitch.target_net_exposure_usd` from SQLite without triggering spurious asymmetry
+       warnings or losing Trend-Aware Chop Bracket Protection (`5.0% TP / 3.5%->1.5%`).
+    3) Fast-cycle `save_seven_factor_telemetry` updates preserve persisted `p2_weights` and `directional_net_usd`.
+    """
+    from src.domain.entities import OrderSide, OrderType
+    from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
+
+    db_file = str(tmp_path / "restart_hydration.db")
+    db = ShadowDatabase(db_path=db_file)
+    broker = ShadowExecutionBroker(database=db, initial_cash=2700.0)
+    # 1. 100% USDT by default — no simulated BFUSD collateral yield
+    assert broker.enable_yield_collateral is False
+    assert broker.settle_collateral_yield() == 0.0
+
+    # Open Core + P2 directional short portfolio:
+    # Core P1: +$900 ETH/USDT, -$900 BTC/USDT; P2 directional sleeve: -$420 BTC/USDT -> Net -$420.00 (-15.56% of $2,700!)
+    broker.set_market_price("ETH/USDT", 3000.0, 2999.5, 3000.5)
+    broker.set_market_price("BTC/USDT", 60000.0, 59995.0, 60005.0)
+    broker.create_order(
+        symbol="ETH/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=0.30,
+        strategy="7-Factor Core",
+    )
+    broker.create_order(
+        symbol="BTC/USDT",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=0.022,  # -$1,320 notional -> net portfolio = +$900 - $1,320 = -$420.00 (-15.56% > 15% limit!)
+        strategy="7-Factor Core + DollarBar P2",
+    )
+
+    reb_ts = datetime(2026, 11, 18, 8, 0, 20, tzinfo=timezone.utc)
+    db.save_rebalance_snapshot(
+        regime_detected="CHOP",
+        momentum_weight=0.35,
+        stat_arb_weight=0.45,
+        carry_weight=0.20,
+        target_allocations={"ETHUSDT": 900.0, "BTCUSDT": -1320.0},
+        executed_delta={"ETH/USDT": 900.0, "BTC/USDT": -1320.0},
+        timestamp=reb_ts,
+    )
+    db.save_seven_factor_telemetry(
+        initial_capital=2700.0,
+        current_equity=2700.0,
+        high_water_mark=2750.0,
+        drawdown_pct=0.018,
+        unlocked_tier=2.5,
+        active_base_leverage=2.5,
+        vol_scalar=1.0,
+        effective_leverage=2.5,
+        next_tier_leverage=3.0,
+        next_tier_hwm_target=3162.5,
+        progress_to_next_tier_pct=0.10,
+        portfolio_beta=0.0,
+        conviction=1.0,
+        factor_weights={"macro": 0.0, "med": 0.12, "fast": 0.0, "rev": 0.58, "carry": 0.30, "liq": 0.0, "size": 0.0},
+        factor_tstats={"macro": -0.8, "med": -0.3, "fast": -0.5, "rev": 1.8, "carry": 1.2, "liq": 0.2, "size": -0.4},
+        p2_weights={"BTCUSDT": -0.22, "ETHUSDT": 0.064},
+        directional_net_usd=-420.0,
+        engine_mode="dynamic_online_ic",
+        timestamp=reb_ts,
+    )
+    # Simulate a fast-cycle telemetry update (passing None for p2_weights / directional_net_usd)
+    db.save_seven_factor_telemetry(
+        initial_capital=2700.0,
+        current_equity=2702.0,
+        high_water_mark=2750.0,
+        drawdown_pct=0.017,
+        unlocked_tier=2.5,
+        active_base_leverage=2.5,
+        vol_scalar=1.0,
+        effective_leverage=2.5,
+        next_tier_leverage=3.0,
+        next_tier_hwm_target=3162.5,
+        progress_to_next_tier_pct=0.11,
+        portfolio_beta=0.0,
+        conviction=1.0,
+        factor_weights={},
+        factor_tstats={},
+    )
+    db.close()
+
+    # 2. Simulate Mid-Cycle Container Restart (e.g. 12:52 UTC — between 08:00 and 16:00 UTC)
+    db2 = ShadowDatabase(db_path=db_file)
+    ks2 = EmergencyKillSwitch(equity_floor_usd=2500.0)
+    dummy_live = type("DummyLive", (), {"kill_switch": ks2, "dry_run": True})()
+    broker2 = ShadowExecutionBroker(database=db2, initial_cash=2700.0, live_broker=dummy_live)
+    broker2.set_market_price("ETH/USDT", 3000.0, 2999.5, 3000.5)
+    broker2.set_market_price("BTC/USDT", 60000.0, 59995.0, 60005.0)
+
+    ff2 = FeatureFlags.from_env_and_args(mode="mainnet", environ={})
+    lev2 = SteppedLeverageController(
+        initial_capital=2700.0,
+        start_leverage=2.5,
+        max_leverage=5.0,
+        cushion_floor_usd=2500.0,
+        cushion_buffer_usd=240.0,
+    )
+    alloc2 = MetaStrategyAllocator(
+        seven_factor_engine=SevenFactorOnlineEngine(),
+        stepped_leverage_controller=lev2,
+        use_seven_factor_engine=True,
+        dollar_bar_engine=CausalDollarBarTSMOMEngine(max_gross_leverage=0.95),
+        enable_dollar_bar_tsmom=True,
+        core_p1_risk_scale=0.85,
+    )
+    daemon2 = ShadowTradingDaemon(
+        broker=broker2,
+        allocator=alloc2,
+        symbols=["BTC/USDT", "ETH/USDT"],
+        core_take_profit_pct=0.050,
+        profit_lock_trigger_pct=0.035,
+        profit_lock_level_pct=0.015,
+        equity_floor_usd=2500.0,
+        enable_hard_equity_floor=True,
+        enable_warm_start=False,
+        feature_flags=ff2,
+    )
+
+    # Verify hydration BEFORE any rebalance runs!
+    assert pytest.approx(daemon2.allocator.last_p2_weights.get("BTCUSDT", 0.0), abs=1e-6) == -0.22
+    assert pytest.approx(daemon2.allocator.last_directional_net_usd, abs=1e-4) == -420.0
+    assert pytest.approx(ks2.target_net_exposure_usd, abs=1e-4) == -420.0
+    assert daemon2.last_rebalance_time == reb_ts
+
+    # Verify EmergencyKillSwitch & Shield Invariants emit 0 asymmetry errors (-15.56% raw net, 0.0% unintended drift!)
+    halted = daemon2.enforce_hard_equity_floor_and_kill_switch(broker2.get_portfolio())
+    assert halted is False
+    inv2 = daemon2.evaluate_shield_invariants()
+    assert inv2["all_invariants_ok"] is True
+    assert inv2["inv4_dollar_neutrality"] is True
+
+    # Verify Trend-Aware Chop Bracket Protection survives restart (`BTC/USDT` short aligned with `p2_w = -0.22`)
+    daemon2.allocator.last_seven_factor_result = type("DummySF", (), {"chop_overlay_weight": 0.65})()
+    tp_btc, lk_tr_btc, lk_lv_btc = daemon2.compute_dynamic_barrier_profile("BTC/USDT")
+    tp_eth, lk_tr_eth, lk_lv_eth = daemon2.compute_dynamic_barrier_profile("ETH/USDT")
+    assert (tp_btc, lk_tr_btc, lk_lv_btc) == (0.050, 0.035, 0.015)
+    assert tp_eth <= 0.036
+    assert (lk_tr_eth, lk_lv_eth) == (0.024, 0.012)
+    db2.close()
+
+
+def test_backtest_cli_supports_phase2_snipers():
+    """Verifies `scripts/run_backtest.py` natively supports `--enable-dollar-bar-tsmom` + `--enable-event-snipers`."""
+    from scripts.run_backtest import generate_synthetic_universe, run_simulation
+
+    syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "INJUSDT"]
+    bars, funding = generate_synthetic_universe(symbols=syms, n_bars=600)
+    res = run_simulation(
+        strategy_name="seven_factor",
+        bars_dict=bars,
+        funding_dict=funding,
+        initial_capital=2700.0,
+        enable_dollar_bar_tsmom=True,
+        enable_event_snipers=True,
+        cushion_floor_usd=2500.0,
+    )
+    assert len(res.equity_curve) > 100
+    assert res.equity_curve.iloc[-1] > 0.0

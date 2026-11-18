@@ -47,6 +47,11 @@ from src.risk.stepped_leverage import SteppedLeverageController
 from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
 from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
+from src.strategies.event_snipers import (
+    SNIPER_BRACKET_PROFILES,
+    SNIPER_M04_STRAT,
+    EventDrivenSniperEngine,
+)
 from src.strategies.extreme_anomaly import (
     EarlyBreakoutStrategy,
     OversoldBounceStrategy,
@@ -391,7 +396,10 @@ def run_simulation(
     enable_btc_lead_lag: bool = False,
     enable_dollar_bar_tsmom: bool = False,
     dollar_bar_max_gross: float = 0.95,
-    core_p1_risk_scale: float = 0.88,
+    core_p1_risk_scale: float = 0.85,
+    enable_event_snipers: bool = False,
+    sniper_slot_leverage: float = 0.24,
+    sniper_max_positions: int = 3,
     cushion_floor_usd: float | None = None,
     cushion_buffer_usd: float = 240.0,
     recovery_boost_equity: float | None = None,
@@ -545,12 +553,80 @@ def run_simulation(
             p2_hist_df = db_eng.compute_historical_weights(src_p2, eval_idx)
             p2_w_mat = p2_hist_df.reindex(index=eval_idx, columns=valid_symbols, fill_value=0.0).values.astype(float)
 
+        events_by_t: dict[int, list[tuple[int, int, str, float, int]]] = {}
+        if enable_event_snipers:
+            sniper_eng = EventDrivenSniperEngine()
+            t_grid_1h = (calc_idx.view("int64") // 10**9).astype(np.int64)
+            c_1h_m = mats["close"].reindex(index=calc_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+            h_1h_m = high_mat.reindex(index=calc_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+            l_1h_m = low_mat.reindex(index=calc_idx, columns=valid_symbols).ffill().bfill().values.astype(float)
+            qv_1h_df = pd.DataFrame(0.0, index=calc_idx, columns=valid_symbols)
+            tb_1h_df = pd.DataFrame(0.0, index=calc_idx, columns=valid_symbols)
+            for sym in valid_symbols:
+                if sym in bars_1h_in and not bars_1h_in[sym].empty:
+                    b_df = bars_1h_in[sym].set_index("timestamp")
+                    b_df = b_df[~b_df.index.duplicated(keep="last")]
+                    vol_s = b_df["volume"].reindex(calc_idx).fillna(0.0).astype(float)
+                    cls_s = b_df["close"].reindex(calc_idx).ffill().fillna(0.0).astype(float)
+                    qv_s = (
+                        b_df["quote_volume"].reindex(calc_idx).fillna(0.0).astype(float)
+                        if "quote_volume" in b_df.columns
+                        else (cls_s * vol_s)
+                    )
+                    if "taker_buy_quote_volume" in b_df.columns:
+                        tb_s = b_df["taker_buy_quote_volume"].reindex(calc_idx).fillna(0.0).astype(float)
+                    elif "taker_buy_vol" in b_df.columns:
+                        tb_s = cls_s * b_df["taker_buy_vol"].reindex(calc_idx).fillna(0.0).astype(float)
+                    else:
+                        tb_s = qv_s * 0.50
+                    qv_1h_df[sym] = qv_s
+                    tb_1h_df[sym] = tb_s
+            adv_30d = qv_1h_df.shift(1).rolling(24 * 30, min_periods=24).mean().fillna(0.0)
+            rk_1h_m = (adv_30d.rank(axis=1, ascending=False, method="first") - 1.0).fillna(99.0).values.astype(int)
+            qv_1h_m = qv_1h_df.values.astype(float)
+            tb_1h_m = tb_1h_df.values.astype(float)
+
+            raw_evs = sniper_eng.scan_historical_1h_events(
+                t_grid_1h=t_grid_1h,
+                syms=valid_symbols,
+                c_1h=c_1h_m,
+                h_1h=h_1h_m,
+                l_1h=l_1h_m,
+                qv_1h=qv_1h_m,
+                tb_1h=tb_1h_m,
+                rank_1h=rk_1h_m,
+            )
+            # Hourly M04 Negative-Funding Short Squeeze scan when 15m bars are not passed
+            f_calc_df = pd.DataFrame(0.0, index=calc_idx, columns=valid_symbols)
+            for sym in valid_symbols:
+                if sym in funding_dict and not funding_dict[sym].empty:
+                    f_calc_df[sym] = funding_dict[sym]["funding_rate"].reindex(calc_idx, method="ffill").fillna(0.0)
+            raw_evs.extend(
+                sniper_eng.scan_historical_15m_events(
+                    t_grid_15m=t_grid_1h,
+                    c_15m=c_1h_m,
+                    h_15m=h_1h_m,
+                    qv_15m=qv_1h_m,
+                    tb_15m=tb_1h_m,
+                    fr_15m=f_calc_df.values.astype(float),
+                    rank_15m=rk_1h_m,
+                )
+            )
+            ts_to_eval_t = {int(ts_v): idx_t for idx_t, ts_v in enumerate((eval_idx.view("int64") // 10**9).tolist())}
+            for entry_ts_sec, j_ev, side_ev, strat_ev, sc_ev, rk_ev in raw_evs:
+                eval_t = ts_to_eval_t.get(int(entry_ts_sec)) or ts_to_eval_t.get(int(entry_ts_sec) + 2700)
+                if eval_t is not None:
+                    events_by_t.setdefault(eval_t, []).append((j_ev, side_ev, strat_ev, sc_ev, rk_ev))
+
         n_b, n_s = len(eval_idx), len(valid_symbols)
         curr_w = np.zeros(n_s, dtype=float)
         prev_p2_w = np.zeros(n_s, dtype=float)
         entry_px = np.zeros(n_s, dtype=float)
         lock_armed = np.zeros(n_s, dtype=bool)
         cooldown_until = np.zeros((n_s, 2), dtype=int)
+        active_snipers: dict[int, dict[str, float | int | bool | str]] = {}
+        sniper_cooldown_until = np.zeros(n_s, dtype=int)
+        last_ramp_sc = 1.0
         net_rets = np.zeros(n_b, dtype=float)
         gross_rets = np.zeros(n_b, dtype=float)
         fee_rets = np.zeros(n_b, dtype=float)
@@ -562,12 +638,16 @@ def run_simulation(
 
         base_maker_cost = 0.0002 if execution_mode == "maker" else (0.0006 if execution_mode == "taker" else 0.0001)
         fallback_cost = 0.0002 if execution_mode == "maker" else (0.0006 if execution_mode == "taker" else 0.00085)
+        use_p1_scale = bool(enable_dollar_bar_tsmom or enable_event_snipers)
 
         for t in range(n_b):
             prev_c = c_arr[t - 1] if t > 0 else o_arr[0]
             cur_o, cur_h, cur_l, cur_c = o_arr[t], h_arr[t], l_arr[t], c_arr[t]
             gap_ret = np.where(prev_c > 0, (cur_o - prev_c) / prev_c, 0.0)
-            bar_gross = float(np.sum(curr_w * gap_ret))
+            sniper_w_vec = np.zeros(n_s, dtype=float)
+            for j_sn, sn_pos in active_snipers.items():
+                sniper_w_vec[j_sn] = float(sn_pos["w"])
+            bar_gross = float(np.sum((curr_w + sniper_w_vec) * gap_ret))
             bar_fee = 0.0
             bar_turn = 0.0
 
@@ -575,7 +655,11 @@ def run_simulation(
             if is_reb:
                 raw_u = w1x_sh[t].copy()
                 for s_i in range(n_s):
-                    if raw_u[s_i] > 0 and t < cooldown_until[s_i, 0] or raw_u[s_i] < 0 and t < cooldown_until[s_i, 1]:
+                    if (
+                        s_i in active_snipers
+                        or (raw_u[s_i] > 0 and t < cooldown_until[s_i, 0])
+                        or (raw_u[s_i] < 0 and t < cooldown_until[s_i, 1])
+                    ):
                         raw_u[s_i] = 0.0
                 pl = float(np.maximum(raw_u, 0.0).sum())
                 nl = float(np.maximum(-raw_u, 0.0).sum())
@@ -587,9 +671,9 @@ def run_simulation(
                 else:
                     raw_u[:] = 0.0
                 u_dict = {valid_symbols[s_i]: float(raw_u[s_i]) for s_i in range(n_s)}
-                if p2_w_mat is not None and np.any(np.abs(prev_p2_w) > 1e-8):
+                if use_p1_scale and np.any(np.abs(curr_w) > 1e-8):
                     inv_sc = 1.0 / max(core_p1_risk_scale, 0.25)
-                    p1_est_arr = (curr_w - prev_p2_w) * inv_sc
+                    p1_est_arr = (curr_w - (prev_p2_w if p2_w_mat is not None else 0.0)) * inv_sc
                     prev_dict = (
                         {valid_symbols[s_i]: float(p1_est_arr[s_i]) for s_i in range(n_s)}
                         if np.any(np.abs(p1_est_arr) > 1e-6)
@@ -607,11 +691,16 @@ def run_simulation(
                     current_equity=sim_eq,
                     vol_scalar=float(vol_sh[t]),
                 )
+                ramp_m = min(1.65, max(0.50, snap_t.active_base_leverage / max(start_leverage, 1.0)))
+                last_ramp_sc = ramp_m * snap_t.cushion_scalar
                 desired_p1 = np.array([scaled_d.get(sym, 0.0) for sym in valid_symbols], dtype=float)
                 if p2_w_mat is not None:
-                    ramp_m = min(1.65, max(0.50, snap_t.active_base_leverage / max(start_leverage, 1.0)))
-                    p2_sc = ramp_m * snap_t.cushion_scalar
-                    raw_p2 = p2_w_mat[t] * p2_sc
+                    p2_sc = last_ramp_sc
+                    raw_p2 = np.where(
+                        np.isin(np.arange(n_s), list(active_snipers.keys())),
+                        0.0,
+                        p2_w_mat[t] * p2_sc,
+                    )
                     eff_p2 = np.where(
                         (np.abs(raw_p2) >= 1e-6)
                         & ((raw_p2 * prev_p2_w) > 0.0)
@@ -628,8 +717,10 @@ def run_simulation(
                         desired_w = np.where(stub_m, 0.0, desired_w)
                     prev_p2_w = eff_p2
                 else:
-                    desired_w = desired_p1
+                    desired_w = desired_p1 * core_p1_risk_scale if use_p1_scale else desired_p1
                 for s_i in range(n_s):
+                    if s_i in active_snipers:
+                        continue
                     dw = desired_w[s_i] - curr_w[s_i]
                     if abs(dw) < 1e-6:
                         continue
@@ -653,16 +744,45 @@ def run_simulation(
                     elif abs(desired_w[s_i]) > abs(curr_w[s_i]) + 1e-6:
                         add_w = abs(desired_w[s_i]) - abs(curr_w[s_i])
                         entry_px[s_i] = (abs(curr_w[s_i]) * entry_px[s_i] + add_w * cur_o[s_i]) / abs(desired_w[s_i])
-                curr_w = desired_w
+                curr_w = np.where(np.isin(np.arange(n_s), list(active_snipers.keys())), 0.0, desired_w)
+
+            if enable_event_snipers and t in events_by_t and len(active_snipers) < sniper_max_positions:
+                cands_t = sorted(events_by_t[t], key=lambda x: x[3], reverse=True)
+                slot_lev = float(sniper_slot_leverage) * last_ramp_sc
+                for j_ev, side_ev, strat_ev, _sc_ev, _rk_ev in cands_t:
+                    if len(active_snipers) >= sniper_max_positions:
+                        break
+                    if (
+                        j_ev in active_snipers
+                        or abs(curr_w[j_ev]) > 1e-8
+                        or t < sniper_cooldown_until[j_ev]
+                        or cur_o[j_ev] <= 0.0
+                        or slot_lev * sim_eq < 20.0
+                    ):
+                        continue
+                    w_sn = float(side_ev) * slot_lev
+                    active_snipers[j_ev] = {
+                        "w": w_sn,
+                        "side": int(side_ev),
+                        "ep": float(cur_o[j_ev]),
+                        "peak": float(cur_o[j_ev]),
+                        "lock": False,
+                        "strat": strat_ev,
+                        "open_t": t,
+                    }
+                    bar_fee += abs(w_sn) * base_maker_cost
+                    bar_turn += abs(w_sn)
 
             is_chop_b = chop_sh[t] >= 0.25
-            tp_tgt = 0.032 if is_chop_b else 0.050
-            lk_trig_b = 0.024 if is_chop_b else 0.035
-            lk_lvl_b = 0.012 if is_chop_b else 0.015
             for s_i in range(n_s):
                 w_i = curr_w[s_i]
                 if abs(w_i) < 1e-8 or entry_px[s_i] <= 0:
                     continue
+                aligned_p2 = (p2_w_mat is not None) and (abs(prev_p2_w[s_i]) >= 0.15) and ((prev_p2_w[s_i] * w_i) > 0.0)
+                use_chop_p = is_chop_b and not aligned_p2
+                tp_tgt = 0.032 if use_chop_p else 0.050
+                lk_trig_b = 0.024 if use_chop_p else 0.035
+                lk_lvl_b = 0.012 if use_chop_p else 0.015
                 sgn = 1.0 if w_i > 0 else -1.0
                 ep = entry_px[s_i]
                 pnl_open = sgn * (cur_o[s_i] - ep) / ep
@@ -698,7 +818,52 @@ def run_simulation(
                 else:
                     bar_gross += w_i * ((cur_c[s_i] - cur_o[s_i]) / cur_o[s_i])
 
-            bar_fnd = -float(np.sum(curr_w * f_arr[t]))
+            for j_sn in list(active_snipers.keys()):
+                sn = active_snipers[j_sn]
+                w_sn = float(sn["w"])
+                sgn_sn = float(sn["side"])
+                ep_sn = float(sn["ep"])
+                prof = SNIPER_BRACKET_PROFILES.get(str(sn["strat"]), SNIPER_BRACKET_PROFILES[SNIPER_M04_STRAT])
+                fav_px = cur_h[j_sn] if sgn_sn > 0 else cur_l[j_sn]
+                adv_px = cur_l[j_sn] if sgn_sn > 0 else cur_h[j_sn]
+                peak_sn = max(float(sn["peak"]), fav_px) if sgn_sn > 0 else min(float(sn["peak"]), fav_px)
+                sn["peak"] = peak_sn
+                fav_r = sgn_sn * (fav_px - ep_sn) / ep_sn
+                adv_r = sgn_sn * (adv_px - ep_sn) / ep_sn
+                stop_r = -prof.stop_loss_pct
+                if bool(sn["lock"]):
+                    stop_r = max(stop_r, prof.profit_lock_level_pct)
+                peak_r = sgn_sn * (peak_sn - ep_sn) / ep_sn
+                if peak_r >= prof.trailing_trigger_pct:
+                    stop_r = max(stop_r, peak_r - prof.trailing_distance_pct)
+                ex_sn = False
+                ex_px_sn = cur_c[j_sn]
+                ex_fee_sn = 0.00055
+                if adv_r <= stop_r:
+                    ex_px_sn, ex_fee_sn, ex_sn = ep_sn * (1.0 + sgn_sn * stop_r), 0.00055, True
+                elif fav_r >= prof.take_profit_pct:
+                    ex_px_sn, ex_fee_sn, ex_sn = ep_sn * (1.0 + sgn_sn * prof.take_profit_pct), 0.00020, True
+                elif (t - int(sn["open_t"]) + 1) >= int(round(prof.max_hold_hours)):
+                    ex_px_sn, ex_fee_sn, ex_sn = cur_c[j_sn], 0.00055, True
+                else:
+                    if fav_r >= prof.profit_lock_trigger_pct:
+                        sn["lock"] = True
+                if ex_sn:
+                    bar_gross += w_sn * ((ex_px_sn - cur_o[j_sn]) / cur_o[j_sn])
+                    bar_fee += abs(w_sn) * ex_fee_sn
+                    bar_turn += abs(w_sn)
+                    was_loss_sn = (sgn_sn * (ex_px_sn - ep_sn)) < 0.0
+                    sniper_cooldown_until[j_sn] = t + int(
+                        round(prof.loss_cooldown_hours if was_loss_sn else prof.win_cooldown_hours)
+                    )
+                    del active_snipers[j_sn]
+                else:
+                    bar_gross += w_sn * ((cur_c[j_sn] - cur_o[j_sn]) / cur_o[j_sn])
+
+            active_sn_fnd_w = np.zeros(n_s, dtype=float)
+            for j_sn, sn_pos in active_snipers.items():
+                active_sn_fnd_w[j_sn] = float(sn_pos["w"])
+            bar_fnd = -float(np.sum((curr_w + active_sn_fnd_w) * f_arr[t]))
             nr_t = bar_gross - bar_fee + bar_fnd
             sim_eq = max(0.0, sim_eq * (1.0 + nr_t))
             eq_arr[t] = sim_eq
@@ -1182,6 +1347,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable Phase 1 Manga P2 Causal Dollar-Bar TSMOM + Taker-CVD sleeve.",
     )
     parser.add_argument(
+        "--enable-event-snipers",
+        action="store_true",
+        default=False,
+        help="Enable Phase 2 Event-Driven Microstructure Snipers (M09, M23, M04).",
+    )
+    parser.add_argument(
+        "--sniper-slot-leverage",
+        type=float,
+        default=0.24,
+        help="Base equity fraction per Phase 2 Sniper slot (default: 0.24).",
+    )
+    parser.add_argument(
+        "--sniper-max-positions",
+        type=int,
+        default=3,
+        help="Maximum concurrent Phase 2 Sniper positions (default: 3).",
+    )
+    parser.add_argument(
         "--cushion-floor-usd",
         type=float,
         default=None,
@@ -1286,6 +1469,9 @@ def main() -> None:
         deadband_mult=args.deadband_mult,
         enable_btc_lead_lag=args.enable_btc_lead_lag,
         enable_dollar_bar_tsmom=args.enable_dollar_bar_tsmom,
+        enable_event_snipers=args.enable_event_snipers,
+        sniper_slot_leverage=args.sniper_slot_leverage,
+        sniper_max_positions=args.sniper_max_positions,
         cushion_floor_usd=args.cushion_floor_usd,
         cushion_buffer_usd=args.cushion_buffer_usd,
         recovery_boost_equity=args.recovery_boost_equity,

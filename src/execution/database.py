@@ -258,10 +258,21 @@ class ShadowDatabase:
                     portfolio_beta REAL NOT NULL,
                     conviction REAL NOT NULL,
                     factor_weights_json TEXT NOT NULL,
-                    factor_tstats_json TEXT NOT NULL
+                    factor_tstats_json TEXT NOT NULL,
+                    p2_weights_json TEXT NOT NULL DEFAULT '{}',
+                    directional_net_usd REAL NOT NULL DEFAULT 0.0,
+                    engine_mode TEXT NOT NULL DEFAULT 'dynamic_online_ic'
                 );
             """
             )
+            with contextlib.suppress(Exception):
+                cursor.execute("ALTER TABLE seven_factor_telemetry ADD COLUMN p2_weights_json TEXT DEFAULT '{}';")
+            with contextlib.suppress(Exception):
+                cursor.execute("ALTER TABLE seven_factor_telemetry ADD COLUMN directional_net_usd REAL DEFAULT 0.0;")
+            with contextlib.suppress(Exception):
+                cursor.execute(
+                    "ALTER TABLE seven_factor_telemetry ADD COLUMN engine_mode TEXT DEFAULT 'dynamic_online_ic';"
+                )
 
             # 11. Runtime Feature Flags (Hot-Reloadable)
             cursor.execute(
@@ -1019,11 +1030,36 @@ class ShadowDatabase:
         conviction: float,
         factor_weights: dict[str, float],
         factor_tstats: dict[str, float],
+        p2_weights: dict[str, float] | None = None,
+        directional_net_usd: float | None = None,
+        engine_mode: str | None = None,
         timestamp: datetime | None = None,
     ) -> None:
-        """Upserts the latest 7-Factor Online Engine and Stepped Leverage telemetry snapshot."""
+        """Upserts the latest 7-Factor Online Engine, Stepped Leverage, and Manga P2 telemetry snapshot."""
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
         with self._lock:
+            existing_row = (
+                self._conn.cursor()
+                .execute(
+                    "SELECT p2_weights_json, directional_net_usd, engine_mode FROM seven_factor_telemetry WHERE id = 1;"
+                )
+                .fetchone()
+            )
+            eff_p2_json = (
+                json.dumps(p2_weights)
+                if p2_weights is not None
+                else (str(existing_row["p2_weights_json"] or "{}") if existing_row else "{}")
+            )
+            eff_dir_net = (
+                float(directional_net_usd)
+                if directional_net_usd is not None
+                else (float(existing_row["directional_net_usd"] or 0.0) if existing_row else 0.0)
+            )
+            eff_mode = (
+                str(engine_mode)
+                if engine_mode is not None
+                else (str(existing_row["engine_mode"] or "dynamic_online_ic") if existing_row else "dynamic_online_ic")
+            )
             self._conn.cursor().execute(
                 """
                 INSERT INTO seven_factor_telemetry (
@@ -1031,8 +1067,9 @@ class ShadowDatabase:
                     drawdown_pct, unlocked_tier, active_base_leverage, vol_scalar,
                     effective_leverage, next_tier_leverage, next_tier_hwm_target,
                     progress_to_next_tier_pct, portfolio_beta, conviction,
-                    factor_weights_json, factor_tstats_json
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    factor_weights_json, factor_tstats_json,
+                    p2_weights_json, directional_net_usd, engine_mode
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     timestamp = excluded.timestamp,
                     initial_capital = excluded.initial_capital,
@@ -1049,7 +1086,10 @@ class ShadowDatabase:
                     portfolio_beta = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.portfolio_beta ELSE excluded.portfolio_beta END,
                     conviction = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.conviction ELSE excluded.conviction END,
                     factor_weights_json = CASE WHEN excluded.factor_weights_json = '{}' THEN seven_factor_telemetry.factor_weights_json ELSE excluded.factor_weights_json END,
-                    factor_tstats_json = CASE WHEN excluded.factor_tstats_json = '{}' THEN seven_factor_telemetry.factor_tstats_json ELSE excluded.factor_tstats_json END;
+                    factor_tstats_json = CASE WHEN excluded.factor_tstats_json = '{}' THEN seven_factor_telemetry.factor_tstats_json ELSE excluded.factor_tstats_json END,
+                    p2_weights_json = excluded.p2_weights_json,
+                    directional_net_usd = excluded.directional_net_usd,
+                    engine_mode = excluded.engine_mode;
                 """,
                 (
                     ts,
@@ -1068,11 +1108,14 @@ class ShadowDatabase:
                     float(conviction),
                     json.dumps(factor_weights),
                     json.dumps(factor_tstats),
+                    eff_p2_json,
+                    eff_dir_net,
+                    eff_mode,
                 ),
             )
 
     def get_latest_seven_factor_telemetry(self) -> dict[str, Any] | None:
-        """Retrieves the latest 7-Factor & Stepped Leverage telemetry snapshot."""
+        """Retrieves the latest 7-Factor, Stepped Leverage & Manga P2 telemetry snapshot."""
         with self._lock:
             row = self._conn.cursor().execute("SELECT * FROM seven_factor_telemetry WHERE id = 1;").fetchone()
             if not row:
@@ -1080,6 +1123,9 @@ class ShadowDatabase:
             res = dict(row)
             res["factor_weights"] = json.loads(res.get("factor_weights_json") or "{}")
             res["factor_tstats"] = json.loads(res.get("factor_tstats_json") or "{}")
+            res["p2_weights"] = json.loads(res.get("p2_weights_json") or "{}")
+            res["directional_net_usd"] = float(res.get("directional_net_usd") or 0.0)
+            res["engine_mode"] = str(res.get("engine_mode") or "dynamic_online_ic")
             return res
 
     # -------------------------------------------------------------------------

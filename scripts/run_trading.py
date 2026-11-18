@@ -380,6 +380,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base equity fraction per Phase 2 Sniper slot before Cushion/SafeRamp scaling (default: 0.24)",
     )
     parser.add_argument(
+        "--enable-yield-collateral",
+        action="store_true",
+        default=False,
+        help="Opt-in passive BFUSD/LDUSDT margin yield simulation (default: False — 100%% USDT Single-Asset Cross-Margin)",
+    )
+    parser.add_argument(
         "--sniper-max-positions",
         type=int,
         default=None,
@@ -761,7 +767,7 @@ def main() -> None:
 
     # Selective Core & Experimental Satellites Promotion (Issues #61, #62, #63, #64, #65):
     # - Proven Core (Dynamic Online IC Softmax, F6 Gate t>=0.75, F8 Smart Money Flow,
-    #   Quarterly Delivery Basis Scalar, Yield Collateral) is enabled in ALL modes (--mainnet & --shadow).
+    #   Quarterly Delivery Basis Scalar, 100% USDT Single-Asset Margin) is enabled in ALL modes (--mainnet & --shadow).
     # - Quarantined Satellite Extensions (Extreme Funding Harvester [Issue #64] & 4.5% Dynamic
     #   Anomaly Sizing [Issue #65]) remain restricted to --shadow (or explicit --enable-experimental-satellites).
     enable_experimental_satellites = (mode == "shadow") or getattr(args, "enable_experimental_satellites", False)
@@ -787,7 +793,7 @@ def main() -> None:
         initial_cash=effective_capital,
         max_gross_leverage=max(6.0, args.max_leverage * 1.25),
         live_broker=live_broker,
-        enable_yield_collateral=enable_dynamic_factor_ic,
+        enable_yield_collateral=bool(getattr(args, "enable_yield_collateral", False)),
     )
     if not cfg["is_live"]:
         broker.scale_capital(effective_capital)
@@ -978,20 +984,19 @@ def main() -> None:
         ),
     )
     # In --shadow mode (or when --rebalance-now is explicitly requested), trigger an immediate rebalance on startup.
-    # In --mainnet mode, preserve the scheduled 4h cadence (`daemon.last_rebalance_time` from SQLite) so container
-    # restarts / deployments never induce spurious mid-bar portfolio churn, EXCEPT a one-time migration when
-    # upgrading a DB that still carries legacy static-prior weights (weight > 5% on a negative-tstat factor).
+    # In --mainnet mode, preserve the scheduled 8h funding-aligned cadence (`daemon.last_rebalance_time` from SQLite)
+    # so container restarts / deployments never induce spurious mid-bar portfolio churn, EXCEPT a one-time migration
+    # when upgrading a DB explicitly recorded under `static_priors` mode.
     if getattr(args, "rebalance_now", False) or (mode == "shadow"):
         daemon.last_rebalance_time = None
     elif mode == "mainnet" and priors_cfg is None and hasattr(db, "get_latest_seven_factor_telemetry"):
         sf_prev = db.get_latest_seven_factor_telemetry() or {}
+        saved_mode = str(sf_prev.get("engine_mode") or "")
         prev_w = sf_prev.get("factor_weights") or {}
-        prev_t = sf_prev.get("factor_tstats") or {}
-        has_legacy_prior_weights = any(
-            float(prev_w.get(k, 0.0)) > 0.05 and float(prev_t.get(k, 0.0)) < -0.05
-            for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
+        is_all_seven_static = len(prev_w) == 7 and all(
+            float(prev_w.get(k, 0.0)) >= 0.08 for k in ("macro", "med", "fast", "rev", "carry", "liq", "size")
         )
-        if has_legacy_prior_weights:
+        if saved_mode == "static_priors" or (not saved_mode and is_all_seven_static):
             logger.info(
                 "🚀 [Dynamic Online IC Migration] Legacy static-prior factor weights detected — scheduling one-time rebalance."
             )

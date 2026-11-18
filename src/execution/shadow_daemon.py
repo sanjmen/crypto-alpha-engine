@@ -375,6 +375,8 @@ class ShadowTradingDaemon:
             if hasattr(db_inst, "get_latest_seven_factor_telemetry"):
                 sf_tel = db_inst.get_latest_seven_factor_telemetry()
                 lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
+                if sf_tel and sf_tel.get("factor_weights"):
+                    self._prev_factor_weights = {str(k): float(v) for k, v in sf_tel["factor_weights"].items()}
                 if sf_tel and lev_ctrl and sf_tel.get("high_water_mark"):
                     tel_init = float(sf_tel.get("initial_capital") or lev_ctrl.initial_capital)
                     saved_hwm = float(sf_tel["high_water_mark"])
@@ -385,8 +387,21 @@ class ShadowTradingDaemon:
                         lev_ctrl.high_water_mark,
                         saved_hwm,
                     )
+                if sf_tel and bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False)):
+                    saved_p2 = sf_tel.get("p2_weights")
+                    if isinstance(saved_p2, dict) and saved_p2:
+                        self.allocator.last_p2_weights = {str(k): float(v) for k, v in saved_p2.items()}
+                    saved_dir_net = float(sf_tel.get("directional_net_usd") or 0.0)
+                    if abs(saved_dir_net) > 1e-6 or (isinstance(saved_p2, dict) and saved_p2):
+                        self.allocator.last_directional_net_usd = saved_dir_net
+                    elif latest_reb and not self.enable_anomalies:
+                        reb_allocs = latest_reb.get("target_allocations") or {}
+                        fallback_net = float(sum(float(v) for v in reb_allocs.values()))
+                        if abs(fallback_net) >= 5.0:
+                            self.allocator.last_directional_net_usd = fallback_net
             if getattr(self.broker, "capital_rescaled_ratio", None) is not None:
                 self.last_rebalance_time = None
+            self._sync_kill_switch_directional_target()
         self._refresh_anomaly_cooldowns()
         self.last_funding_check_time: datetime | None = None
         self.anomaly_scan_interval_sec: float = 30.0
@@ -2472,6 +2487,22 @@ class ShadowTradingDaemon:
                 )
             self._prev_factor_weights = cur_fw
         if sf_res and lev_snap and hasattr(self.broker.db, "save_seven_factor_telemetry"):
+            sf_eng_inst = getattr(self.allocator, "seven_factor_engine", None)
+            eng_mode = (
+                "dynamic_online_ic"
+                if (sf_eng_inst is not None and getattr(sf_eng_inst, "priors", None) is None)
+                else "static_priors"
+            )
+            p2_w_snap = (
+                dict(getattr(self.allocator, "last_p2_weights", {}) or {})
+                if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
+                else {}
+            )
+            dir_net_snap = (
+                float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+                if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
+                else 0.0
+            )
             self.broker.db.save_seven_factor_telemetry(
                 initial_capital=lev_snap.initial_capital,
                 current_equity=lev_snap.current_equity,
@@ -2488,6 +2519,9 @@ class ShadowTradingDaemon:
                 conviction=sf_res.conviction,
                 factor_weights=sf_res.factor_weights,
                 factor_tstats=sf_res.factor_tstats,
+                p2_weights=p2_w_snap,
+                directional_net_usd=dir_net_snap,
+                engine_mode=eng_mode,
             )
 
         if getattr(self.broker, "is_live", False) and hasattr(self.broker, "sync_from_live_exchange"):
@@ -2742,6 +2776,7 @@ class ShadowTradingDaemon:
         live_b = getattr(self.broker, "live_broker", None)
         ks = getattr(live_b, "kill_switch", None) if live_b is not None else None
         if ks is not None:
+            self._sync_kill_switch_directional_target(portfolio=portfolio)
             ks.equity_floor_usd = self.equity_floor_usd if self.enable_hard_equity_floor else 0.0
             ks_status = ks.evaluate_and_enforce(portfolio, broker=self.broker)
             if ks_status.triggered and ks.is_locked():
