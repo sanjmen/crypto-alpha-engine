@@ -278,6 +278,7 @@ class ShadowTradingDaemon:
         self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
         self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
         self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+        self._sync_allocator_with_feature_flags()
         self.is_halted: bool = False
         self.halt_reason: str = ""
         self.intracycle_rebalance_count: int = 0
@@ -324,6 +325,7 @@ class ShadowTradingDaemon:
                         self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
                         self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
                         self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+                        self._sync_allocator_with_feature_flags()
                     merged_ff = self.feature_flags.to_dict()
                     if existing_ff:
                         merged_ff.update(existing_ff)
@@ -1187,6 +1189,113 @@ class ShadowTradingDaemon:
                 logger.debug(f"Could not persist taker_flow cache {tk_path}: {e}")
         return merged.tail(limit).reset_index(drop=True)
 
+    def fetch_warm_1m_taker_klines(self, symbol: str, target_bars: int = 50400) -> pd.DataFrame:
+        """
+        Fetches trailing 1-minute OHLC + Quote Volume + Taker Buy Quote Volume klines
+        for Manga P2 (`CausalDollarBarTSMOMEngine`), combining local warm cache
+        (`data/cache/bars/1m/{CLEAN_SYM}.parquet`) with paginated Binance Futures `/fapi/v1/klines`.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        m1_path = self.cache_dir / "bars" / "1m" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+        req_cols = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+
+        if self.enable_warm_start and m1_path.exists():
+            try:
+                raw_m1 = pd.read_parquet(m1_path)
+                if not raw_m1.empty and "timestamp" in raw_m1.columns and "close" in raw_m1.columns:
+                    c_df = raw_m1.tail(max(target_bars, 55000)).copy()
+                    c_df["timestamp"] = self._normalize_timestamp_series(c_df["timestamp"])
+                    if "quote_volume" not in c_df.columns:
+                        c_df["quote_volume"] = pd.to_numeric(c_df.get("volume", 0.0), errors="coerce").fillna(0.0) * (
+                            pd.to_numeric(c_df["close"], errors="coerce").fillna(0.0)
+                        )
+                    if "taker_buy_quote_volume" not in c_df.columns:
+                        c_df["taker_buy_quote_volume"] = 0.5 * pd.to_numeric(
+                            c_df["quote_volume"], errors="coerce"
+                        ).fillna(0.0)
+                    cached_df = (
+                        c_df[req_cols]
+                        .drop_duplicates(subset=["timestamp"], keep="last")
+                        .sort_values("timestamp")
+                        .reset_index(drop=True)
+                    )
+                    cached_df = self._drop_unclosed_bars(cached_df, timeframe="1m")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Could not read 1m warm cache {m1_path}: {exc}")
+
+        live_records: list[dict[str, Any]] = []
+        fn = getattr(self.exchange, "fapiPublicGetKlines", None)
+        if callable(fn) and not isinstance(fn, MagicMock):
+            try:
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                if not cached_df.empty:
+                    last_ms = int(cached_df["timestamp"].iloc[-1].timestamp() * 1000)
+                    start_ms = last_ms + 60_000
+                else:
+                    start_ms = now_ms - target_bars * 60_000
+
+                cur_ms = start_ms
+                max_pages = 38
+                for _ in range(max_pages):
+                    if cur_ms >= now_ms - 60_000:
+                        break
+                    if self.rate_limiter:
+                        self.rate_limiter.acquire(weight=5, priority="LOW", wait=True)
+                    rows = fn({"symbol": clean_sym, "interval": "1m", "startTime": cur_ms, "limit": 1500})
+                    if not isinstance(rows, list) or not rows:
+                        break
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) >= 11:
+                            ts_ms = int(r[0])
+                            if ts_ms > 0:
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "open": float(r[1]),
+                                        "high": float(r[2]),
+                                        "low": float(r[3]),
+                                        "close": float(r[4]),
+                                        "quote_volume": float(r[7]),
+                                        "taker_buy_quote_volume": float(r[10]),
+                                    }
+                                )
+                    last_row_ms = int(rows[-1][0])
+                    if last_row_ms <= cur_ms or len(rows) < 1500:
+                        break
+                    cur_ms = last_row_ms + 60_000
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Live 1m kline top-up note for {clean_sym}: {exc}")
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+        )
+        merged = self._drop_unclosed_bars(merged, timeframe="1m")
+
+        if (
+            self.enable_warm_start
+            and live_records
+            and not isinstance(self.exchange, MagicMock)
+            and self.cache_dir.exists()
+        ):
+            try:
+                m1_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(target_bars, 55000)).to_parquet(m1_path, index=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Could not persist 1m cache {m1_path}: {exc}")
+
+        return merged.tail(target_bars).reset_index(drop=True)
+
     def fetch_premium_index_history(self, symbol: str, limit: int = 240) -> pd.DataFrame:
         """
         Fetches trailing hourly Spot-Perp Premium Index (`close`) for `symbol`
@@ -1592,6 +1701,17 @@ class ShadowTradingDaemon:
             return eff_tp, eff_lock_trig, eff_lock_lvl
 
         clean_sym = symbol.split(":")[0].replace("/", "")
+        p2_w_map = getattr(self.allocator, "last_p2_weights", None) or {}
+        p2_w_sym = float(p2_w_map.get(clean_sym, 0.0))
+        if abs(p2_w_sym) >= 0.15:
+            pf_cur = self.broker.get_portfolio()
+            pos_cur = pf_cur.positions.get(symbol) or pf_cur.positions.get(clean_sym)
+            if pos_cur is not None and (
+                (pos_cur.side == PositionSide.LONG and p2_w_sym > 0)
+                or (pos_cur.side == PositionSide.SHORT and p2_w_sym < 0)
+            ):
+                return eff_tp, eff_lock_trig, eff_lock_lvl
+
         use_dyn = bool(getattr(self.feature_flags, "enable_dynamic_barriers", True))
         sigma_1h = float(vol_map.get(clean_sym) or vol_map.get(symbol) or 0.0)
 
@@ -2032,6 +2152,18 @@ class ShadowTradingDaemon:
                 current_weights_map[sym.replace("/", "")] = signed_val / total_equity
 
         if use_7f:
+            bars_1m_majors: dict[str, pd.DataFrame] = {}
+            if bool(getattr(self.feature_flags, "enable_dollar_bar_tsmom", False)) and bool(
+                getattr(self.allocator, "enable_dollar_bar_tsmom", False)
+            ):
+                db_eng = getattr(self.allocator, "dollar_bar_engine", None)
+                p2_syms = getattr(db_eng, "symbols", ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
+                for m_sym in p2_syms:
+                    if m_sym in market_data:
+                        df_1m_m = self.fetch_warm_1m_taker_klines(m_sym, target_bars=50400)
+                        if not df_1m_m.empty:
+                            bars_1m_majors[m_sym] = df_1m_m
+
             active_cd_sides: dict[str, PositionSide] = {}
             if self.core_bracket_cooldown_sec > 0 and self.core_bracket_last_exit:
                 now_cd = datetime.now(timezone.utc)
@@ -2051,6 +2183,7 @@ class ShadowTradingDaemon:
                 smart_money_data=smart_money_data if smart_money_data else None,
                 quarterly_basis_data=quarterly_basis_data if quarterly_basis_data else None,
                 cooldown_blocked_sides=active_cd_sides if active_cd_sides else None,
+                bars_1m=bars_1m_majors if bars_1m_majors else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
@@ -2061,6 +2194,13 @@ class ShadowTradingDaemon:
             )
 
         target_dollars = self._apply_core_bracket_cooldowns(target_dollars)
+        live_b_ks = getattr(self.broker, "live_broker", None)
+        ks_inst = getattr(live_b_ks, "kill_switch", None) if live_b_ks is not None else None
+        if ks_inst is not None:
+            if use_7f and bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False)):
+                ks_inst.target_net_exposure_usd = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+            else:
+                ks_inst.target_net_exposure_usd = 0.0
 
         if getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None) is not None:
             lev_snap_live = getattr(self.allocator, "last_leverage_snapshot", None)
@@ -2389,10 +2529,46 @@ class ShadowTradingDaemon:
                 return True
         return False
 
+    def _sync_allocator_with_feature_flags(self) -> None:
+        """Synchronizes allocator, Dollar-Bar P2 sleeve, and Cushion-Safe CPPI parameters with `self.feature_flags`."""
+        sf_eng = getattr(self.allocator, "seven_factor_engine", None)
+        if sf_eng is not None:
+            sf_eng.enable_chop_range_arb = bool(self.feature_flags.enable_chop_range_arb)
+            sf_eng.enable_holistic_regime_shields = bool(
+                getattr(self.feature_flags, "enable_holistic_regime_shields", True)
+            )
+
+        lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
+        if lev_ctrl is not None:
+            use_cushion = bool(
+                getattr(self.feature_flags, "enable_cushion_governor", True)
+                and self.enable_hard_equity_floor
+                and self.equity_floor_usd > 0.0
+            )
+            lev_ctrl.cushion_floor_usd = float(self.equity_floor_usd) if use_cushion else None
+            lev_ctrl.cushion_buffer_usd = max(25.0, float(getattr(self.feature_flags, "cushion_buffer_usd", 240.0)))
+
+        if getattr(self.allocator, "use_seven_factor_engine", False):
+            en_p2 = bool(getattr(self.feature_flags, "enable_dollar_bar_tsmom", False))
+            self.allocator.enable_dollar_bar_tsmom = en_p2
+            self.allocator.core_p1_risk_scale = float(
+                max(0.25, min(1.0, getattr(self.feature_flags, "core_p1_risk_scale", 0.88)))
+            )
+            if en_p2 and getattr(self.allocator, "dollar_bar_engine", None) is None:
+                from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
+
+                self.allocator.dollar_bar_engine = CausalDollarBarTSMOMEngine(
+                    max_gross_leverage=float(getattr(self.feature_flags, "dollar_bar_max_gross", 0.95))
+                )
+            elif getattr(self.allocator, "dollar_bar_engine", None) is not None:
+                self.allocator.dollar_bar_engine.max_gross_leverage = float(
+                    getattr(self.feature_flags, "dollar_bar_max_gross", 0.95)
+                )
+
     def sync_feature_flags_from_db(self) -> FeatureFlags:
         """
         Hot-reloads runtime feature flags from SQLite (`feature_flags` table) so
-        features like Anomaly Capsule or Equity Floor can be toggled live without restart.
+        features like Anomaly Capsule, Dollar-Bar P2, or Equity Floor can be toggled live without restart.
         """
         db_inst = getattr(self.broker, "db", None) or getattr(self.broker, "database", None)
         if db_inst and hasattr(db_inst, "get_feature_flags"):
@@ -2412,12 +2588,7 @@ class ShadowTradingDaemon:
                     self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
                     self.enable_smart_money = bool(self.feature_flags.enable_smart_money)
                     self.enable_quarterly_basis = bool(self.feature_flags.enable_quarterly_basis)
-                    sf_eng = getattr(self.allocator, "seven_factor_engine", None)
-                    if sf_eng is not None:
-                        sf_eng.enable_chop_range_arb = bool(self.feature_flags.enable_chop_range_arb)
-                        sf_eng.enable_holistic_regime_shields = bool(
-                            getattr(self.feature_flags, "enable_holistic_regime_shields", True)
-                        )
+                    self._sync_allocator_with_feature_flags()
                     if prev_anom != self.enable_anomalies or abs(prev_floor - self.equity_floor_usd) > 1e-6:
                         logger.info(
                             f"🚩 Runtime Feature Flags updated: enable_anomaly_capsule={self.enable_anomalies}, "
@@ -2516,10 +2687,14 @@ class ShadowTradingDaemon:
 
         eq = max(float(pf.total_equity), 1.0)
         denom = max(core_gross_usd, eq, 1.0)
-        core_net_drift_pct = (abs(core_long_usd - core_short_usd) / denom) if core_gross_usd > 0 else 0.0
+        p2_active_map = getattr(self.allocator, "last_p2_weights", {}) or {}
+        dir_net_usd = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+        residual_core_net_usd = (core_long_usd - core_short_usd) - dir_net_usd
+        core_net_drift_pct = (abs(residual_core_net_usd) / denom) if core_gross_usd > 0 else 0.0
+        max_side_legs = 5 + min(3, len(p2_active_map))
 
         inv1_ok = self._last_factor_l1_delta <= 0.50
-        inv2_ok = len(zombie_stubs) == 0 and core_long_count <= 5 and core_short_count <= 5
+        inv2_ok = len(zombie_stubs) == 0 and core_long_count <= max_side_legs and core_short_count <= max_side_legs
         inv3_ok = self.intracycle_rebalance_count == 0
         inv4_ok = core_net_drift_pct <= 0.05
         inv5_ok = (len(open_anomalies) == 0) if not self.enable_anomalies else True

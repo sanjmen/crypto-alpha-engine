@@ -58,12 +58,16 @@ class EmergencyKillSwitch:
         max_margin_ratio: float = 0.50,
         lockout_hours: int = 24,
         equity_floor_usd: float = 0.0,
+        target_net_exposure_usd: float = 0.0,
+        max_directional_net_pct: float = 1.15,
     ) -> None:
         self.max_24h_drawdown_pct = float(max_24h_drawdown_pct)
         self.max_net_exposure_pct = float(max_net_exposure_pct)
         self.max_margin_ratio = float(max_margin_ratio)
         self.lockout_hours = int(lockout_hours)
         self.equity_floor_usd = float(equity_floor_usd)
+        self.target_net_exposure_usd = float(target_net_exposure_usd)
+        self.max_directional_net_pct = float(max_directional_net_pct)
 
         self._equity_window_24h: deque[tuple[datetime, float]] = deque()
         self.halted_until: datetime | None = None
@@ -178,7 +182,10 @@ class EmergencyKillSwitch:
         drawdown_24h = self.record_equity(equity, timestamp=now_dt)
         long_usd, short_usd, net_usd = self.compute_net_exposure(portfolio)
         gross_usd = long_usd + short_usd
-        net_pct = abs(net_usd) / max(gross_usd, equity, 1.0)
+        max_allowed_dir_usd = self.max_directional_net_pct * equity
+        clamped_target_net = float(max(-max_allowed_dir_usd, min(max_allowed_dir_usd, self.target_net_exposure_usd)))
+        unintended_net_usd = net_usd - clamped_target_net
+        net_pct = abs(unintended_net_usd) / max(gross_usd, equity, 1.0)
 
         if self.is_locked(now_dt):
             return KillSwitchStatus(
@@ -223,19 +230,19 @@ class EmergencyKillSwitch:
 
         if net_pct > self.max_net_exposure_pct:
             asymmetry_reason = (
-                f"Net Exposure Asymmetry {net_pct * 100:.2f}% (${net_usd:+,.2f}) "
+                f"Net Exposure Asymmetry {net_pct * 100:.2f}% (${unintended_net_usd:+,.2f}) "
                 f"exceeded {self.max_net_exposure_pct * 100:.2f}% limit"
             )
             if self._last_asymmetry_warn_ts is None or (now_dt - self._last_asymmetry_warn_ts).total_seconds() >= 300.0:
                 logger.warning(f"⚠️ {asymmetry_reason}")
                 self._last_asymmetry_warn_ts = now_dt
             if broker is not None and hasattr(broker, "hedge_excess_exposure"):
-                broker.hedge_excess_exposure(net_usd)
+                broker.hedge_excess_exposure(unintended_net_usd)
             return KillSwitchStatus(
                 triggered=True,
                 reason=asymmetry_reason,
                 rolling_24h_dd_pct=drawdown_24h * 100.0,
-                net_exposure_usd=net_usd,
+                net_exposure_usd=unintended_net_usd,
                 net_exposure_pct=net_pct * 100.0,
                 margin_ratio_pct=margin_ratio * 100.0,
             )

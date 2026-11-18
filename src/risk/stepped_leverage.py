@@ -28,6 +28,7 @@ class LeverageStateSnapshot:
     progress_to_next_tier_pct: float
     proportional_deadband: float
     max_single_asset_weight: float
+    cushion_scalar: float = 1.0
 
     @property
     def next_tier_high_water_mark_target(self) -> float:
@@ -63,6 +64,9 @@ class SteppedLeverageController:
         bhs_hold_top_k: int | None = None,
         recovery_boost_equity: float | None = None,
         recovery_boost_leverage: float | None = None,
+        cushion_floor_usd: float | None = None,
+        cushion_buffer_usd: float = 240.0,
+        min_cushion_scalar: float = 0.15,
     ) -> None:
         self.initial_capital = max(float(initial_capital), 1.0)
         self.start_leverage = float(start_leverage)
@@ -93,6 +97,11 @@ class SteppedLeverageController:
             if recovery_boost_leverage is not None and float(recovery_boost_leverage) > 0
             else None
         )
+        self.cushion_floor_usd = (
+            float(cushion_floor_usd) if cushion_floor_usd is not None and float(cushion_floor_usd) > 0.0 else None
+        )
+        self.cushion_buffer_usd = max(float(cushion_buffer_usd), 25.0)
+        self.min_cushion_scalar = float(np.clip(min_cushion_scalar, 0.05, 1.0))
         self.high_water_mark = max(
             float(high_water_mark) if high_water_mark is not None else self.initial_capital,
             self.initial_capital,
@@ -170,7 +179,15 @@ class SteppedLeverageController:
             active_base = unlocked_tier
 
         clamped_vol_scalar = float(np.clip(vol_scalar, 0.55, 1.15))
-        effective_leverage = float(min(self.max_leverage, active_base * clamped_vol_scalar))
+        cushion_scalar = 1.0
+        if self.cushion_floor_usd is not None and self.cushion_floor_usd > 0.0 and equity_val > 0.0:
+            safe_anchor = self.cushion_floor_usd + 10.0
+            full_risk_eq = safe_anchor + self.cushion_buffer_usd
+            if equity_val < full_risk_eq:
+                cushion_scalar = float(
+                    np.clip((equity_val - safe_anchor) / self.cushion_buffer_usd, self.min_cushion_scalar, 1.0)
+                )
+        effective_leverage = float(min(self.max_leverage, active_base * clamped_vol_scalar * cushion_scalar))
 
         if in_recovery_phase:
             next_tier = min(self.max_leverage, ref_base_lev)
@@ -209,6 +226,7 @@ class SteppedLeverageController:
             progress_to_next_tier_pct=progress_pct,
             proportional_deadband=proportional_deadband,
             max_single_asset_weight=max_single_weight,
+            cushion_scalar=cushion_scalar,
         )
 
     def _keep_top_leg_mask(

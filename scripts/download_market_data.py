@@ -357,129 +357,298 @@ def _fetch_zip_df(url: str, col_names: list[str]) -> pd.DataFrame | None:
         return None
 
 
-def _fetch_month_kline(symbol: str, timeframe: str, year: int, month: int) -> pd.DataFrame | None:
+VISION_TICKER_ALIASES: dict[str, list[str]] = {
+    "RENDERUSDT": ["RNDRUSDT", "RENDERUSDT"],
+    "MATICUSDT": ["MATICUSDT", "POLUSDT"],
+    "FTMUSDT": ["FTMUSDT", "SUSDT"],
+}
+
+
+def _normalize_vision_kline_df(df: pd.DataFrame | None, symbol: str) -> pd.DataFrame | None:
+    if df is None or df.empty or df.shape[1] < 6:
+        return None
+    ts_raw = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna().astype(np.int64)
+    if ts_raw.empty:
+        return None
+    df = df.loc[ts_raw.index]
+    ts_sec = np.where(ts_raw.values > 10**14, ts_raw.values // 10**6, ts_raw.values // 10**3)
+    quote_vol = (
+        pd.to_numeric(df.iloc[:, 7], errors="coerce").fillna(0.0).astype(np.float64)
+        if df.shape[1] > 7
+        else np.zeros(len(df))
+    )
+    trade_cnt = (
+        pd.to_numeric(df.iloc[:, 8], errors="coerce").fillna(0).astype(np.int64)
+        if df.shape[1] > 8
+        else np.zeros(len(df), dtype=np.int64)
+    )
+    tbuy_vol = (
+        pd.to_numeric(df.iloc[:, 9], errors="coerce").fillna(0.0).astype(np.float64)
+        if df.shape[1] > 9
+        else np.zeros(len(df))
+    )
+    tbuy_qvol = (
+        pd.to_numeric(df.iloc[:, 10], errors="coerce").fillna(0.0).astype(np.float64)
+        if df.shape[1] > 10
+        else np.zeros(len(df))
+    )
+    return pd.DataFrame(
+        {
+            "timestamp": ts_sec,
+            "symbol": symbol,
+            "open": pd.to_numeric(df.iloc[:, 1], errors="coerce").astype(np.float64),
+            "high": pd.to_numeric(df.iloc[:, 2], errors="coerce").astype(np.float64),
+            "low": pd.to_numeric(df.iloc[:, 3], errors="coerce").astype(np.float64),
+            "close": pd.to_numeric(df.iloc[:, 4], errors="coerce").astype(np.float64),
+            "volume": pd.to_numeric(df.iloc[:, 5], errors="coerce").astype(np.float64),
+            "quote_volume": quote_vol,
+            "trade_count": trade_cnt,
+            "taker_buy_vol": tbuy_vol,
+            "taker_buy_quote_volume": tbuy_qvol,
+        }
+    )
+
+
+def _fetch_month_kline(
+    symbol: str, timeframe: str, year: int, month: int, url_ticker: str | None = None
+) -> pd.DataFrame | None:
+    tk = url_ticker or symbol
     month_str = f"{month:02d}"
-    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/klines/{symbol}/{timeframe}/{symbol}-{timeframe}-{year}-{month_str}.zip"
-    df = _fetch_zip_df(url, KLINES_COLS)
+    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/klines/{tk}/{timeframe}/{tk}-{timeframe}-{year}-{month_str}.zip"
+    return _normalize_vision_kline_df(_fetch_zip_df(url, KLINES_COLS), symbol)
+
+
+def _fetch_daily_kline(
+    symbol: str, timeframe: str, date_str: str, url_ticker: str | None = None
+) -> pd.DataFrame | None:
+    tk = url_ticker or symbol
+    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/daily/klines/{tk}/{timeframe}/{tk}-{timeframe}-{date_str}.zip"
+    return _normalize_vision_kline_df(_fetch_zip_df(url, KLINES_COLS), symbol)
+
+
+def _resample_1m_df(df_1m: pd.DataFrame, rule: str, symbol: str) -> pd.DataFrame:
+    d = df_1m.copy()
+    d["dt"] = pd.to_datetime(d["timestamp"], unit="s", utc=True)
+    d = d.set_index("dt").sort_index()
+    res = (
+        d.resample(rule, label="left", closed="left")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+                "quote_volume": "sum",
+                "trade_count": "sum",
+                "taker_buy_vol": "sum",
+                "taker_buy_quote_volume": "sum",
+            }
+        )
+        .dropna(subset=["open", "close"])
+    )
+    res["timestamp"] = res.index.as_unit("s").astype(np.int64)
+    res["symbol"] = symbol
+    return res.reset_index(drop=True)[
+        [
+            "timestamp",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "trade_count",
+            "taker_buy_vol",
+            "taker_buy_quote_volume",
+        ]
+    ]
+
+
+def _fetch_month_funding(symbol: str, year: int, month: int, url_ticker: str | None = None) -> pd.DataFrame | None:
+    tk = url_ticker or symbol
+    month_str = f"{month:02d}"
+    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/fundingRate/{tk}/{tk}-fundingRate-{year}-{month_str}.zip"
+    df = _fetch_zip_df(url, FUNDING_COLS)
     if df is not None and not df.empty:
-        trade_count = (
-            pd.to_numeric(df["trade_count"], errors="coerce").fillna(0).astype(np.int64)
-            if "trade_count" in df.columns
-            else np.zeros(len(df), dtype=np.int64)
-        )
-        taker_vol = (
-            pd.to_numeric(df["taker_buy_base_vol"], errors="coerce").fillna(0.0).astype(np.float64)
-            if "taker_buy_base_vol" in df.columns
-            else np.zeros(len(df), dtype=np.float64)
-        )
+        ts_raw = pd.to_numeric(df["calc_time"], errors="coerce").dropna().astype(np.int64)
+        df = df.loc[ts_raw.index]
+        ts_sec = np.where(ts_raw.values > 10**14, ts_raw.values // 10**6, ts_raw.values // 10**3)
         return pd.DataFrame(
             {
-                "timestamp": (pd.to_numeric(df["open_time"]) // 1000).astype(np.int64),
+                "timestamp": ts_sec,
                 "symbol": symbol,
-                "open": pd.to_numeric(df["open"], errors="coerce").astype(np.float64),
-                "high": pd.to_numeric(df["high"], errors="coerce").astype(np.float64),
-                "low": pd.to_numeric(df["low"], errors="coerce").astype(np.float64),
-                "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float64),
-                "volume": pd.to_numeric(df["volume"], errors="coerce").astype(np.float64),
-                "trade_count": trade_count,
-                "taker_buy_vol": taker_vol,
+                "interval_hours": pd.to_numeric(df["funding_interval_hours"], errors="coerce")
+                .fillna(8)
+                .astype(np.int64),
+                "funding_rate": pd.to_numeric(df["last_funding_rate"], errors="coerce").fillna(0.0).astype(np.float64),
             }
         )
     return None
 
 
-def _fetch_month_funding(symbol: str, year: int, month: int) -> pd.DataFrame | None:
+def _fetch_month_premium(symbol: str, year: int, month: int, url_ticker: str | None = None) -> pd.DataFrame | None:
+    tk = url_ticker or symbol
     month_str = f"{month:02d}"
-    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{year}-{month_str}.zip"
-    df = _fetch_zip_df(url, FUNDING_COLS)
+    url = f"{BINANCE_VISION_S3_BASE}/data/futures/um/monthly/premiumIndexKlines/{tk}/1h/{tk}-1h-{year}-{month_str}.zip"
+    df = _fetch_zip_df(url, KLINES_COLS)
     if df is not None and not df.empty:
+        ts_raw = pd.to_numeric(df["open_time"], errors="coerce").dropna().astype(np.int64)
+        df = df.loc[ts_raw.index]
+        ts_sec = np.where(ts_raw.values > 10**14, ts_raw.values // 10**6, ts_raw.values // 10**3)
         return pd.DataFrame(
             {
-                "timestamp": (pd.to_numeric(df["calc_time"]) // 1000).astype(np.int64),
+                "timestamp": ts_sec,
                 "symbol": symbol,
-                "interval_hours": pd.to_numeric(df["funding_interval_hours"], errors="coerce").astype(np.int64),
-                "funding_rate": pd.to_numeric(df["last_funding_rate"], errors="coerce").astype(np.float64),
+                "open": pd.to_numeric(df["open"], errors="coerce").astype(np.float64),
+                "high": pd.to_numeric(df["high"], errors="coerce").astype(np.float64),
+                "low": pd.to_numeric(df["low"], errors="coerce").astype(np.float64),
+                "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float64),
             }
         )
     return None
 
 
 def run_vision_mode(args: argparse.Namespace) -> None:
+    import shutil
+
     start_time = time.time()
     base_output_dir = Path(args.output_dir)
     base_output_dir.mkdir(parents=True, exist_ok=True)
     symbols = [_raw_symbol(s) for s in PRESETS[args.preset]]
     years = [int(y) for y in args.years.split(",")]
     timeframes = ["1h", "15m"] if args.include_subhourly else [args.timeframe]
+    resample_1m = bool(getattr(args, "resample_from_1m", False)) and args.timeframe == "1m"
+    include_prem = bool(getattr(args, "include_premium", False))
+    clean_local = bool(getattr(args, "clean_local", False)) and bool(args.sync_drive)
+
+    now_utc = datetime.now(timezone.utc)
+    cur_ym_prefix = f"{now_utc.year:04d}-{now_utc.month:02d}"
+    recent_days = [f"{cur_ym_prefix}-{d:02d}" for d in range(1, now_utc.day)] if now_utc.year in years else []
 
     print("=" * 70)
-    print("  CRYPTO ALPHA ENGINE: BINANCE VISION S3 HIGH-THROUGHPUT INGESTION")
+    print("  CRYPTO ALPHA ENGINE: BINANCE VISION S3 -> GOOGLE DRIVE INGESTION")
     print("=" * 70)
-    print(f"  Output Dir: {base_output_dir} | Symbols: {len(symbols)} | Years: {years} | TFs: {timeframes}")
+    print(
+        f"  Staging: {base_output_dir} | Symbols: {len(symbols)} | Years: {years} | "
+        f"TFs: {timeframes} | Resample1m: {resample_1m} | SyncDrive: {args.sync_drive} | CleanLocal: {clean_local}"
+    )
     print("-" * 70)
 
     total_klines = 0
     total_funding = 0
+    batch_size = 6 if clean_local else len(symbols)
 
-    for tf in timeframes:
-        for sym in symbols:
-            dfs = []
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                futures = [ex.submit(_fetch_month_kline, sym, tf, y, m) for y in years for m in range(1, 13)]
-                for f in as_completed(futures):
-                    res_df = f.result()
-                    if res_df is not None:
-                        dfs.append(res_df)
-            if dfs:
-                merged = (
-                    pd.concat(dfs, ignore_index=True)
-                    .drop_duplicates(subset=["timestamp"])
-                    .sort_values("timestamp")
-                    .reset_index(drop=True)
+    for b_start in range(0, len(symbols), max(1, batch_size)):
+        batch_syms = symbols[b_start : b_start + batch_size]
+        for sym in batch_syms:
+            tickers = VISION_TICKER_ALIASES.get(sym, [sym])
+            for tf in timeframes:
+                dfs = []
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    futs = [
+                        ex.submit(_fetch_month_kline, sym, tf, y, m, tk)
+                        for tk in tickers
+                        for y in years
+                        for m in range(1, 13)
+                    ] + [ex.submit(_fetch_daily_kline, sym, tf, ds, tk) for tk in tickers for ds in recent_days]
+                    for f in as_completed(futs):
+                        res_df = f.result()
+                        if res_df is not None:
+                            dfs.append(res_df)
+                if dfs:
+                    merged = (
+                        pd.concat(dfs, ignore_index=True)
+                        .drop_duplicates(subset=["timestamp"], keep="last")
+                        .sort_values("timestamp")
+                        .reset_index(drop=True)
+                    )
+                    target_dir = base_output_dir / "bars" / tf
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
+                    total_klines += len(merged)
+                    if resample_1m and tf == "1m":
+                        for r_tf, r_rule in (("5m", "5min"), ("15m", "15min"), ("1h", "1h")):
+                            r_df = _resample_1m_df(merged, r_rule, sym)
+                            r_dir = base_output_dir / "bars" / r_tf
+                            r_dir.mkdir(parents=True, exist_ok=True)
+                            pq.write_table(pa.Table.from_pandas(r_df), r_dir / f"{sym}.parquet", compression="zstd")
+                    print(
+                        f"  ✓ {sym:<13} [{tf}{'+5m/15m/1h' if resample_1m else ''}]: {len(merged):,} bars", flush=True
+                    )
+
+            if args.include_funding:
+                f_dfs = []
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    futs_f = [
+                        ex.submit(_fetch_month_funding, sym, y, m, tk)
+                        for tk in tickers
+                        for y in years
+                        for m in range(1, 13)
+                    ]
+                    for f in as_completed(futs_f):
+                        res_df = f.result()
+                        if res_df is not None:
+                            f_dfs.append(res_df)
+                if f_dfs:
+                    merged_f = (
+                        pd.concat(f_dfs, ignore_index=True)
+                        .drop_duplicates(subset=["timestamp"], keep="last")
+                        .sort_values("timestamp")
+                        .reset_index(drop=True)
+                    )
+                    f_dir = base_output_dir / "funding"
+                    f_dir.mkdir(parents=True, exist_ok=True)
+                    pq.write_table(pa.Table.from_pandas(merged_f), f_dir / f"{sym}.parquet", compression="zstd")
+                    total_funding += len(merged_f)
+
+            if include_prem:
+                p_dfs = []
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    futs_p = [
+                        ex.submit(_fetch_month_premium, sym, y, m, tk)
+                        for tk in tickers
+                        for y in years
+                        for m in range(1, 13)
+                    ]
+                    for f in as_completed(futs_p):
+                        res_df = f.result()
+                        if res_df is not None:
+                            p_dfs.append(res_df)
+                if p_dfs:
+                    merged_p = (
+                        pd.concat(p_dfs, ignore_index=True)
+                        .drop_duplicates(subset=["timestamp"], keep="last")
+                        .sort_values("timestamp")
+                        .reset_index(drop=True)
+                    )
+                    p_dir = base_output_dir / "premium_1h"
+                    p_dir.mkdir(parents=True, exist_ok=True)
+                    pq.write_table(pa.Table.from_pandas(merged_p), p_dir / f"{sym}.parquet", compression="zstd")
+
+        if args.sync_drive:
+            subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    str(base_output_dir),
+                    "gdrive:trading/crypto-alpha-engine/data",
+                    "--transfers",
+                    "12",
+                    "--checkers",
+                    "16",
+                    "-q",
+                ],
+                check=False,
+            )
+            if clean_local and base_output_dir.exists():
+                shutil.rmtree(base_output_dir, ignore_errors=True)
+                base_output_dir.mkdir(parents=True, exist_ok=True)
+                print(
+                    f"  ☁️ Synced batch [{b_start+1}..{b_start+len(batch_syms)}/{len(symbols)}] to Google Drive & cleared local staging.",
+                    flush=True,
                 )
-                target_dir = base_output_dir / "bars" / tf
-                target_dir.mkdir(parents=True, exist_ok=True)
-                pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
-                total_klines += len(merged)
-                print(f"  ✓ {sym} [{tf}]: {len(merged):,} bars")
-
-    if args.include_funding:
-        for sym in symbols:
-            dfs = []
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                futures = [ex.submit(_fetch_month_funding, sym, y, m) for y in years for m in range(1, 13)]
-                for f in as_completed(futures):
-                    res_df = f.result()
-                    if res_df is not None:
-                        dfs.append(res_df)
-            if dfs:
-                merged = (
-                    pd.concat(dfs, ignore_index=True)
-                    .drop_duplicates(subset=["timestamp"])
-                    .sort_values("timestamp")
-                    .reset_index(drop=True)
-                )
-                target_dir = base_output_dir / "funding"
-                target_dir.mkdir(parents=True, exist_ok=True)
-                pq.write_table(pa.Table.from_pandas(merged), target_dir / f"{sym}.parquet", compression="zstd")
-                total_funding += len(merged)
-                print(f"  ✓ {sym} [funding]: {len(merged):,} settlements")
-
-    if args.sync_drive:
-        subprocess.run(
-            [
-                "rclone",
-                "copy",
-                str(base_output_dir),
-                "gdrive:trading/crypto-alpha-engine/data",
-                "--transfers",
-                "8",
-                "--checkers",
-                "16",
-                "-q",
-            ],
-            check=False,
-        )
 
     manifest = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -490,8 +659,14 @@ def run_vision_mode(args: argparse.Namespace) -> None:
         "total_klines_bars": total_klines,
         "total_funding_settlements": total_funding,
     }
-    (base_output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"🎉 Complete in {manifest['elapsed_seconds']}s | Klines: {total_klines:,} | Funding: {total_funding:,}")
+    if not clean_local:
+        (base_output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    else:
+        shutil.rmtree(base_output_dir, ignore_errors=True)
+    print(
+        f"🎉 Complete in {manifest['elapsed_seconds']}s | Klines: {total_klines:,} | Funding: {total_funding:,}",
+        flush=True,
+    )
 
 
 # ==============================================================================
@@ -577,6 +752,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sync-drive", action="store_true", help="Sync downloaded Parquet files to Google Drive via rclone."
+    )
+    parser.add_argument(
+        "--resample-from-1m",
+        action="store_true",
+        help="When --timeframe 1m is used in --mode vision, also deterministically generate 5m, 15m, and 1h Parquets.",
+    )
+    parser.add_argument(
+        "--include-premium",
+        action="store_true",
+        help="Also ingest 1h Spot-Perp Premium Index klines in --mode vision.",
+    )
+    parser.add_argument(
+        "--clean-local",
+        action="store_true",
+        help="Stream in 6-symbol batches to Google Drive and immediately delete local staging files (0 local disk used).",
     )
     parser.add_argument(
         "--colab-session", type=str, default="crypto_data_ingest", help="Colab session name for --mode colab."

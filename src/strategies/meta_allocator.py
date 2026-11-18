@@ -16,6 +16,7 @@ from src.risk.hrp_allocator import HierarchicalRiskParity
 from src.risk.stepped_leverage import LeverageStateSnapshot, SteppedLeverageController
 from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine, DollarBarAllocationResult
 from src.strategies.extreme_anomaly import (
     EarlyBreakoutStrategy,
     ExtremeFundingHarvesterStrategy,
@@ -55,6 +56,9 @@ class MetaStrategyAllocator:
         seven_factor_engine: SevenFactorOnlineEngine | None = None,
         stepped_leverage_controller: SteppedLeverageController | None = None,
         use_seven_factor_engine: bool = False,
+        dollar_bar_engine: CausalDollarBarTSMOMEngine | None = None,
+        enable_dollar_bar_tsmom: bool = False,
+        core_p1_risk_scale: float = 0.88,
     ) -> None:
         self.momentum_strategy = momentum_strategy or CrossSectionalMomentumStrategy()
         self.stat_arb_strategy = stat_arb_strategy or StatArbMeanReversionStrategy()
@@ -73,9 +77,17 @@ class MetaStrategyAllocator:
             SteppedLeverageController() if (use_seven_factor_engine or seven_factor_engine) else None
         )
         self.use_seven_factor_engine = bool(use_seven_factor_engine or seven_factor_engine is not None)
+        self.enable_dollar_bar_tsmom = bool(enable_dollar_bar_tsmom or dollar_bar_engine is not None)
+        self.dollar_bar_engine = dollar_bar_engine or (
+            CausalDollarBarTSMOMEngine() if self.enable_dollar_bar_tsmom else None
+        )
+        self.core_p1_risk_scale = float(max(0.25, min(1.0, core_p1_risk_scale)))
         self.last_dominant_strategy: dict[str, str] = {}
         self.last_seven_factor_result: SevenFactorAllocationResult | None = None
         self.last_leverage_snapshot: LeverageStateSnapshot | None = None
+        self.last_dollar_bar_result: DollarBarAllocationResult | None = None
+        self.last_p2_weights: dict[str, float] = {}
+        self.last_directional_net_usd: float = 0.0
 
         if base_weights:
             self.base_weights = base_weights
@@ -182,9 +194,11 @@ class MetaStrategyAllocator:
         smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
         cooldown_blocked_sides: dict[str, PositionSide] | None = None,
+        bars_1m: dict[str, pd.DataFrame] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
-        Runs the 7-Factor Causal Online Alpha Engine + Stepped Leverage Controller (2.5x -> 5.0x)
+        Runs the 7-Factor Causal Online Alpha Engine (`P1`) + optional Causal 1m Dollar-Bar
+        TSMOM + Taker-CVD (`P2`) + Stepped Leverage Controller (with Cushion-Safe CPPI Governor)
         and returns (net_dollar_positions, detected_regime, online_factor_weights).
         """
         regime = self.detect_market_regime(market_data)
@@ -263,9 +277,25 @@ class MetaStrategyAllocator:
                     signed_qty = -abs(pos.quantity) if pos.side == PositionSide.SHORT else abs(pos.quantity)
                     current_weights[sym] = (signed_qty * price) / equity
 
-        final_weights, leverage_snapshot = leverage_controller.scale_and_deadband_weights(
+        p2_active = bool(self.enable_dollar_bar_tsmom and self.dollar_bar_engine is not None and bars_1m)
+        p1_prev_weights: dict[str, float] | None = None
+        if current_weights:
+            if self.last_p2_weights:
+                # Reconstruct P1's pure market-neutral sub-ledger prior to P1 deadbanding & BHS(3,6)
+                raw_p1_prev: dict[str, float] = {}
+                inv_scale = 1.0 / max(self.core_p1_risk_scale, 0.25)
+                for s_k, tot_w in current_weights.items():
+                    clean_k = s_k.replace("/", "")
+                    p1_est = (float(tot_w) - float(self.last_p2_weights.get(clean_k, 0.0))) * inv_scale
+                    if abs(p1_est) > 1e-6:
+                        raw_p1_prev[clean_k] = p1_est
+                p1_prev_weights = raw_p1_prev if raw_p1_prev else None
+            else:
+                p1_prev_weights = current_weights
+
+        final_p1_weights, leverage_snapshot = leverage_controller.scale_and_deadband_weights(
             unit_weights=effective_unit_weights,
-            current_weights=current_weights,
+            current_weights=p1_prev_weights,
             current_equity=equity,
             vol_scalar=seven_factor_result.vol_scalar,
         )
@@ -278,13 +308,72 @@ class MetaStrategyAllocator:
         )
         top_factor_label = FACTOR_LABELS.get(top_factor_key, f"7Factor:{top_factor_key}")
 
+        combined_weights: dict[str, float] = dict(final_p1_weights)
+        p2_applied_weights: dict[str, float] = {}
+
+        if p2_active and self.dollar_bar_engine is not None:
+            db_res = self.dollar_bar_engine.allocate_latest(bars_1m=bars_1m)
+            self.last_dollar_bar_result = db_res
+            if db_res.dollar_bar_counts:
+                # Scale P1 cleanly by `core_p1_risk_scale` (preserving 100% P1 dollar neutrality)
+                combined_weights = {s: w * self.core_p1_risk_scale for s, w in final_p1_weights.items()}
+                ramp_mult = min(
+                    1.65,
+                    max(
+                        0.50,
+                        leverage_snapshot.active_base_leverage / max(leverage_controller.start_leverage, 1.0),
+                    ),
+                )
+                p2_scale = ramp_mult * leverage_snapshot.cushion_scalar
+                for sym_p2, raw_u2 in db_res.unit_weights.items():
+                    desired_w2 = float(raw_u2 * p2_scale)
+                    prev_w2 = float(self.last_p2_weights.get(sym_p2, 0.0))
+                    # Apply 3.0% turnover deadband on P2 unless closing to zero or flipping sign
+                    if (
+                        abs(desired_w2) >= 1e-6
+                        and (desired_w2 * prev_w2) > 0.0
+                        and abs(desired_w2 - prev_w2) < 0.030 * p2_scale
+                    ):
+                        eff_w2 = prev_w2
+                    else:
+                        eff_w2 = desired_w2
+                    if abs(eff_w2) > 1e-6:
+                        p2_applied_weights[sym_p2] = eff_w2
+                        combined_weights[sym_p2] = combined_weights.get(sym_p2, 0.0) + eff_w2
+
+                # Prune near-zero P1+P2 cancellation stubs (< $155 when gross >= $2,000) so 0 zombie stubs exist
+                gross_comb_usd = sum(abs(v) for v in combined_weights.values()) * equity
+                if gross_comb_usd >= 2000.0:
+                    for sym_c, w_c in list(combined_weights.items()):
+                        if 0.0 < abs(w_c * equity) < 155.0 and sym_c in p2_applied_weights:
+                            p2_applied_weights[sym_c] -= w_c
+                            if abs(p2_applied_weights[sym_c]) < 1e-6:
+                                p2_applied_weights.pop(sym_c, None)
+                            combined_weights[sym_c] = 0.0
+            else:
+                self.last_p2_weights = {}
+        else:
+            self.last_dollar_bar_result = None
+            self.last_p2_weights = {}
+
+        if p2_applied_weights or (
+            p2_active and self.last_dollar_bar_result and self.last_dollar_bar_result.dollar_bar_counts
+        ):
+            self.last_p2_weights = dict(p2_applied_weights)
+
         net_dollar_positions: dict[str, float] = {}
-        for sym, weight in final_weights.items():
+        for sym, weight in combined_weights.items():
             dollar_notional = float(weight * equity)
             if abs(dollar_notional) > 1.0:
                 net_dollar_positions[sym] = dollar_notional
-                self.last_dominant_strategy[sym] = top_factor_label
+                if sym in p2_applied_weights and abs(p2_applied_weights[sym]) > abs(
+                    final_p1_weights.get(sym, 0.0) * self.core_p1_risk_scale
+                ):
+                    self.last_dominant_strategy[sym] = "P2:DollarBar_TSMOM"
+                else:
+                    self.last_dominant_strategy[sym] = top_factor_label
 
+        self.last_directional_net_usd = float(sum(p2_applied_weights.values()) * equity)
         return net_dollar_positions, regime, seven_factor_result.factor_weights
 
     def generate_portfolio_allocations(
@@ -303,6 +392,7 @@ class MetaStrategyAllocator:
         smart_money_data: dict[str, pd.DataFrame | pd.Series] | None = None,
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
         cooldown_blocked_sides: dict[str, PositionSide] | None = None,
+        bars_1m: dict[str, pd.DataFrame] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Executes end-to-end multi-strategy signal generation, regime/HRP adaptation,
@@ -322,6 +412,7 @@ class MetaStrategyAllocator:
                 smart_money_data=smart_money_data,
                 quarterly_basis_data=quarterly_basis_data,
                 cooldown_blocked_sides=cooldown_blocked_sides,
+                bars_1m=bars_1m,
             )
 
         regime = self.detect_market_regime(market_data)

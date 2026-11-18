@@ -330,6 +330,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Regla #2: Hard capital floor in USDT that flattens all positions and halts trading (default: 2500.0 in --mainnet)",
     )
     parser.add_argument(
+        "--cushion-buffer-usd",
+        type=float,
+        default=None,
+        help="Phase 1 CPPI Cushion-Safe smooth de-risking buffer above equity_floor_usd (default: 240.0 USDT)",
+    )
+    parser.add_argument(
+        "--enable-dollar-bar-tsmom",
+        dest="enable_dollar_bar_tsmom",
+        action="store_true",
+        default=None,
+        help="Enable Manga P2 Causal 1m Dollar-Bar Multi-Horizon TSMOM + Taker-CVD (default: True)",
+    )
+    parser.add_argument(
+        "--disable-dollar-bar-tsmom",
+        dest="enable_dollar_bar_tsmom",
+        action="store_false",
+        help="Disable Manga P2 Causal 1m Dollar-Bar TSMOM sleeve",
+    )
+    parser.add_argument(
+        "--dollar-bar-max-gross",
+        type=float,
+        default=None,
+        help="Maximum gross leverage for Manga P2 Dollar-Bar TSMOM sleeve (default: 0.95)",
+    )
+    parser.add_argument(
+        "--core-p1-risk-scale",
+        type=float,
+        default=None,
+        help="Risk budget scale on Core P1 when Manga P2 is active (default: 0.88)",
+    )
+    parser.add_argument(
         "--max-24h-dd",
         type=float,
         default=0.065,
@@ -757,6 +788,11 @@ def main() -> None:
     )
     eff_rec_eq = getattr(args, "recovery_boost_equity", 0.0)
     eff_rec_lev = getattr(args, "recovery_boost_leverage", 0.0)
+    use_cushion_gov = bool(
+        feature_flags.enable_cushion_governor
+        and feature_flags.enable_hard_equity_floor
+        and feature_flags.equity_floor_usd > 0.0
+    )
     stepped_leverage_ctrl = (
         SteppedLeverageController(
             initial_capital=effective_capital,
@@ -772,6 +808,8 @@ def main() -> None:
             recovery_boost_leverage=(
                 eff_rec_lev if (eff_rec_eq and eff_rec_eq > 0 and eff_rec_lev and eff_rec_lev > start_lev) else None
             ),
+            cushion_floor_usd=feature_flags.equity_floor_usd if use_cushion_gov else None,
+            cushion_buffer_usd=feature_flags.cushion_buffer_usd,
         )
         if use_seven_factor
         else None
@@ -823,6 +861,14 @@ def main() -> None:
         harvester_strat.symbols_filter = None
         harvester_strat.max_position_usd = args.anomaly_size
 
+    from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
+
+    dollar_bar_eng = (
+        CausalDollarBarTSMOMEngine(max_gross_leverage=feature_flags.dollar_bar_max_gross)
+        if (use_seven_factor and feature_flags.enable_dollar_bar_tsmom)
+        else None
+    )
+
     allocator = MetaStrategyAllocator(
         pairs_strategy=pairs_strategy,
         oversold_bounce_strategy=bounce_strat,
@@ -832,6 +878,9 @@ def main() -> None:
         seven_factor_engine=seven_factor_engine,
         stepped_leverage_controller=stepped_leverage_ctrl,
         use_seven_factor_engine=use_seven_factor,
+        dollar_bar_engine=dollar_bar_eng,
+        enable_dollar_bar_tsmom=bool(use_seven_factor and feature_flags.enable_dollar_bar_tsmom),
+        core_p1_risk_scale=feature_flags.core_p1_risk_scale,
     )
 
     rate_limiter = ExchangeRateLimiter()
@@ -853,6 +902,8 @@ def main() -> None:
         f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
         f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%, Lock=' + format(feature_flags.chop_profit_lock_trigger_pct * 100, '.1f') + '%->' + format(feature_flags.chop_profit_lock_level_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
         f"SubhourlyPB={'ENABLED' if feature_flags.enable_subhourly_pullback else 'DISABLED'} | "
+        f"DollarBarP2={'ENABLED (Max=' + format(feature_flags.dollar_bar_max_gross, '.2f') + 'x, P1Scale=' + format(feature_flags.core_p1_risk_scale, '.2f') + 'x)' if feature_flags.enable_dollar_bar_tsmom else 'DISABLED'} | "
+        f"CushionGov={'ENABLED (Buf=$' + format(feature_flags.cushion_buffer_usd, '.0f') + ')' if use_cushion_gov else 'DISABLED'} | "
         f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
         f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"

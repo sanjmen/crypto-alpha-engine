@@ -9,6 +9,7 @@ from typing import Any
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "BaseAnomalyStrategy": ("src.strategies.extreme_anomaly", "BaseAnomalyStrategy"),
+    "CausalDollarBarTSMOMEngine": ("src.strategies.dollar_bar_tsmom", "CausalDollarBarTSMOMEngine"),
     "CointegratedPairsStrategy": ("src.strategies.cointegrated_pairs", "CointegratedPairsStrategy"),
     "CrossSectionalMomentumStrategy": (
         "src.strategies.cross_sectional_momentum",

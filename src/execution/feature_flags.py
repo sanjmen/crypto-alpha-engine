@@ -43,6 +43,9 @@ FLOAT_FLAG_NAMES = frozenset(
         "chop_max_tp_pct",
         "chop_profit_lock_trigger_pct",
         "chop_profit_lock_level_pct",
+        "cushion_buffer_usd",
+        "dollar_bar_max_gross",
+        "core_p1_risk_scale",
     }
 )
 
@@ -53,6 +56,8 @@ class FeatureFlags:
     Runtime Feature Flags & Risk Shield guardrails:
     - `enable_anomaly_capsule` (default False in Mainnet) + `auto_close_anomalies_when_disabled` (True).
     - `enable_hard_equity_floor` (True) + `equity_floor_usd` ($2,500.00 hard stop in Mainnet).
+    - `enable_cushion_governor` (True) — CPPI Cushion-Safe smooth de-risking above `equity_floor_usd`.
+    - `enable_dollar_bar_tsmom` (True) — Manga P2: Causal 1m Dollar-Bar Multi-Horizon TSMOM + Taker-CVD.
     - `enable_invariant_audit` (True) — continuous verification of production invariants.
     - `enable_subhourly_pullback` (False) — disabled after 4-year 1m audit showed 15m iloc[-1] injection hurts breakouts.
     - `chop_profit_lock_trigger_pct` (2.4%) & `chop_profit_lock_level_pct` (1.2%) — active Chop Profit-Lock profile.
@@ -62,6 +67,11 @@ class FeatureFlags:
     auto_close_anomalies_when_disabled: bool = True
     enable_hard_equity_floor: bool = True
     equity_floor_usd: float = 2500.0
+    enable_cushion_governor: bool = True
+    cushion_buffer_usd: float = 240.0
+    enable_dollar_bar_tsmom: bool = True
+    dollar_bar_max_gross: float = 0.95
+    core_p1_risk_scale: float = 0.88
     enable_intracycle_rebalance: bool = True
     enable_invariant_audit: bool = True
     enable_smart_money: bool = True
@@ -206,12 +216,54 @@ class FeatureFlags:
             env.get("FF_CHOP_PROFIT_LOCK_LEVEL_PCT"),
             default=0.012,
         )
+        cli_cushion = getattr(args, "enable_cushion_governor", None) if args is not None else None
+        env_cushion = env.get("FF_ENABLE_CUSHION_GOVERNOR")
+        if env_cushion is not None:
+            enable_cushion = _parse_bool(env_cushion, default=True)
+        elif cli_cushion is not None:
+            enable_cushion = bool(cli_cushion)
+        else:
+            enable_cushion = True
+
+        cushion_buf = _parse_float(
+            env.get("FF_CUSHION_BUFFER_USD", getattr(args, "cushion_buffer_usd", None) if args is not None else None),
+            default=240.0,
+        )
+
+        cli_db_tsmom = getattr(args, "enable_dollar_bar_tsmom", None) if args is not None else None
+        env_db_tsmom = env.get("FF_ENABLE_DOLLAR_BAR_TSMOM")
+        if env_db_tsmom is not None:
+            enable_db_tsmom = _parse_bool(env_db_tsmom, default=True)
+        elif cli_db_tsmom is not None:
+            enable_db_tsmom = bool(cli_db_tsmom)
+        else:
+            enable_db_tsmom = True
+
+        db_max_gross = _parse_float(
+            env.get(
+                "FF_DOLLAR_BAR_MAX_GROSS",
+                getattr(args, "dollar_bar_max_gross", None) if args is not None else None,
+            ),
+            default=0.95,
+        )
+        p1_scale = _parse_float(
+            env.get(
+                "FF_CORE_P1_RISK_SCALE",
+                getattr(args, "core_p1_risk_scale", None) if args is not None else None,
+            ),
+            default=0.88,
+        )
 
         return cls(
             enable_anomaly_capsule=enable_anom,
             auto_close_anomalies_when_disabled=auto_close_anom,
             enable_hard_equity_floor=enable_floor,
             equity_floor_usd=floor_usd,
+            enable_cushion_governor=enable_cushion,
+            cushion_buffer_usd=cushion_buf,
+            enable_dollar_bar_tsmom=enable_db_tsmom,
+            dollar_bar_max_gross=db_max_gross,
+            core_p1_risk_scale=p1_scale,
             enable_intracycle_rebalance=enable_intracycle,
             enable_invariant_audit=enable_invariants,
             enable_smart_money=enable_sm,
@@ -267,6 +319,14 @@ class FeatureFlags:
             "chop_profit_lock_trigger_pct": "chop_profit_lock_trigger_pct",
             "chop_lock_level": "chop_profit_lock_level_pct",
             "chop_profit_lock_level_pct": "chop_profit_lock_level_pct",
+            "cushion_governor": "enable_cushion_governor",
+            "enable_cushion_governor": "enable_cushion_governor",
+            "cushion_buffer": "cushion_buffer_usd",
+            "cushion_buffer_usd": "cushion_buffer_usd",
+            "dollar_bar_tsmom": "enable_dollar_bar_tsmom",
+            "enable_dollar_bar_tsmom": "enable_dollar_bar_tsmom",
+            "dollar_bar_max_gross": "dollar_bar_max_gross",
+            "core_p1_risk_scale": "core_p1_risk_scale",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:

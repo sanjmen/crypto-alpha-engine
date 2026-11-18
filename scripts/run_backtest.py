@@ -46,6 +46,7 @@ from src.domain.entities import Portfolio
 from src.risk.stepped_leverage import SteppedLeverageController
 from src.strategies.cointegrated_pairs import CointegratedPairsStrategy
 from src.strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
 from src.strategies.extreme_anomaly import (
     EarlyBreakoutStrategy,
     OversoldBounceStrategy,
@@ -388,6 +389,14 @@ def run_simulation(
     bhs_hold_top_k: int | None = 6,
     deadband_mult: float = 1.25,
     enable_btc_lead_lag: bool = False,
+    enable_dollar_bar_tsmom: bool = False,
+    dollar_bar_max_gross: float = 0.95,
+    core_p1_risk_scale: float = 0.88,
+    cushion_floor_usd: float | None = None,
+    cushion_buffer_usd: float = 240.0,
+    recovery_boost_equity: float | None = None,
+    recovery_boost_leverage: float | None = None,
+    bars_1m_dict: dict[str, pd.DataFrame] | None = None,
 ) -> BacktestResult:
     """
     Executes historical portfolio simulation across any supported strategy (`seven_factor`,
@@ -523,10 +532,22 @@ def run_simulation(
             base_deadband_ratio=(0.04 / 2.2) * max(0.5, float(deadband_mult)),
             bhs_enter_top_k=bhs_enter_top_k,
             bhs_hold_top_k=bhs_hold_top_k,
+            recovery_boost_equity=recovery_boost_equity,
+            recovery_boost_leverage=recovery_boost_leverage,
+            cushion_floor_usd=cushion_floor_usd,
+            cushion_buffer_usd=cushion_buffer_usd,
         )
+
+        p2_w_mat: np.ndarray | None = None
+        if enable_dollar_bar_tsmom:
+            db_eng = CausalDollarBarTSMOMEngine(max_gross_leverage=dollar_bar_max_gross)
+            src_p2 = bars_1m_dict if bars_1m_dict else {s: bars_1h_in[s] for s in db_eng.symbols if s in bars_1h_in}
+            p2_hist_df = db_eng.compute_historical_weights(src_p2, eval_idx)
+            p2_w_mat = p2_hist_df.reindex(index=eval_idx, columns=valid_symbols, fill_value=0.0).values.astype(float)
 
         n_b, n_s = len(eval_idx), len(valid_symbols)
         curr_w = np.zeros(n_s, dtype=float)
+        prev_p2_w = np.zeros(n_s, dtype=float)
         entry_px = np.zeros(n_s, dtype=float)
         lock_armed = np.zeros(n_s, dtype=bool)
         cooldown_until = np.zeros((n_s, 2), dtype=int)
@@ -566,18 +587,48 @@ def run_simulation(
                 else:
                     raw_u[:] = 0.0
                 u_dict = {valid_symbols[s_i]: float(raw_u[s_i]) for s_i in range(n_s)}
-                prev_dict = (
-                    {valid_symbols[s_i]: float(curr_w[s_i]) for s_i in range(n_s)}
-                    if np.any(np.abs(curr_w) > 1e-8)
-                    else None
-                )
-                scaled_d, _ = ctrl.scale_and_deadband_weights(
+                if p2_w_mat is not None and np.any(np.abs(prev_p2_w) > 1e-8):
+                    inv_sc = 1.0 / max(core_p1_risk_scale, 0.25)
+                    p1_est_arr = (curr_w - prev_p2_w) * inv_sc
+                    prev_dict = (
+                        {valid_symbols[s_i]: float(p1_est_arr[s_i]) for s_i in range(n_s)}
+                        if np.any(np.abs(p1_est_arr) > 1e-6)
+                        else None
+                    )
+                else:
+                    prev_dict = (
+                        {valid_symbols[s_i]: float(curr_w[s_i]) for s_i in range(n_s)}
+                        if np.any(np.abs(curr_w) > 1e-8)
+                        else None
+                    )
+                scaled_d, snap_t = ctrl.scale_and_deadband_weights(
                     unit_weights=u_dict,
                     current_weights=prev_dict,
                     current_equity=sim_eq,
                     vol_scalar=float(vol_sh[t]),
                 )
-                desired_w = np.array([scaled_d.get(sym, 0.0) for sym in valid_symbols], dtype=float)
+                desired_p1 = np.array([scaled_d.get(sym, 0.0) for sym in valid_symbols], dtype=float)
+                if p2_w_mat is not None:
+                    ramp_m = min(1.65, max(0.50, snap_t.active_base_leverage / max(start_leverage, 1.0)))
+                    p2_sc = ramp_m * snap_t.cushion_scalar
+                    raw_p2 = p2_w_mat[t] * p2_sc
+                    eff_p2 = np.where(
+                        (np.abs(raw_p2) >= 1e-6)
+                        & ((raw_p2 * prev_p2_w) > 0.0)
+                        & (np.abs(raw_p2 - prev_p2_w) < 0.030 * p2_sc),
+                        prev_p2_w,
+                        raw_p2,
+                    )
+                    desired_w = desired_p1 * core_p1_risk_scale + eff_p2
+                    if float(np.sum(np.abs(desired_w)) * sim_eq) >= 2000.0:
+                        stub_m = (
+                            (np.abs(desired_w) > 0.0) & (np.abs(desired_w * sim_eq) < 155.0) & (np.abs(eff_p2) > 0.0)
+                        )
+                        eff_p2 = np.where(stub_m, eff_p2 - desired_w, eff_p2)
+                        desired_w = np.where(stub_m, 0.0, desired_w)
+                    prev_p2_w = eff_p2
+                else:
+                    desired_w = desired_p1
                 for s_i in range(n_s):
                     dw = desired_w[s_i] - curr_w[s_i]
                     if abs(dw) < 1e-6:
@@ -1124,6 +1175,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Disable Holistic Regime Shields 1A & 1B.",
     )
+    parser.add_argument(
+        "--enable-dollar-bar-tsmom",
+        action="store_true",
+        default=False,
+        help="Enable Phase 1 Manga P2 Causal Dollar-Bar TSMOM + Taker-CVD sleeve.",
+    )
+    parser.add_argument(
+        "--cushion-floor-usd",
+        type=float,
+        default=None,
+        help="Enable Phase 1 Cushion-Safe CPPI equity floor protection (e.g. 2500.0).",
+    )
+    parser.add_argument(
+        "--cushion-buffer-usd",
+        type=float,
+        default=240.0,
+        help="Buffer zone above cushion-floor-usd for smooth CPPI de-risking (default: 240.0).",
+    )
+    parser.add_argument(
+        "--recovery-boost-equity",
+        type=float,
+        default=None,
+        help="Two-Phase SafeRamp HWM threshold (e.g. 3050.0).",
+    )
+    parser.add_argument(
+        "--recovery-boost-leverage",
+        type=float,
+        default=None,
+        help="Two-Phase SafeRamp unlocked base leverage (e.g. 3.2).",
+    )
     parser.add_argument("--report", default=None, help="Output path for HTML tearsheet report.")
     return parser
 
@@ -1204,6 +1285,11 @@ def main() -> None:
         bhs_hold_top_k=args.bhs_hold_top_k,
         deadband_mult=args.deadband_mult,
         enable_btc_lead_lag=args.enable_btc_lead_lag,
+        enable_dollar_bar_tsmom=args.enable_dollar_bar_tsmom,
+        cushion_floor_usd=args.cushion_floor_usd,
+        cushion_buffer_usd=args.cushion_buffer_usd,
+        recovery_boost_equity=args.recovery_boost_equity,
+        recovery_boost_leverage=args.recovery_boost_leverage,
     )
 
     print("\n📈 Portfolio Equity Curve:")
