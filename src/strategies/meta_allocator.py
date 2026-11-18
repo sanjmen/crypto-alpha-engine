@@ -195,6 +195,7 @@ class MetaStrategyAllocator:
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
         cooldown_blocked_sides: dict[str, PositionSide] | None = None,
         bars_1m: dict[str, pd.DataFrame] | None = None,
+        blocked_symbols: set[str] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Runs the 7-Factor Causal Online Alpha Engine (`P1`) + optional Causal 1m Dollar-Bar
@@ -220,14 +221,24 @@ class MetaStrategyAllocator:
         self.last_seven_factor_result = seven_factor_result
 
         effective_unit_weights = dict(seven_factor_result.unit_weights)
-        if cooldown_blocked_sides:
+        blocked_clean = {s.replace("/", "").split(":")[0] for s in (blocked_symbols or set())}
+        if cooldown_blocked_sides or blocked_clean:
             orig_l = sum(v for v in effective_unit_weights.values() if v > 0)
             orig_s = sum(abs(v) for v in effective_unit_weights.values() if v < 0)
             orig_leg = max(orig_l, orig_s)
             blocked_cd = False
             for sym_key, weight_val in list(effective_unit_weights.items()):
                 clean_key = sym_key.replace("/", "")
-                blocked_side = cooldown_blocked_sides.get(clean_key) or cooldown_blocked_sides.get(sym_key)
+                if clean_key in blocked_clean:
+                    if abs(weight_val) > 0:
+                        effective_unit_weights[sym_key] = 0.0
+                        blocked_cd = True
+                    continue
+                blocked_side = (
+                    (cooldown_blocked_sides.get(clean_key) or cooldown_blocked_sides.get(sym_key))
+                    if cooldown_blocked_sides
+                    else None
+                )
                 if blocked_side is not None and (
                     (weight_val > 0 and blocked_side == PositionSide.LONG)
                     or (weight_val < 0 and blocked_side == PositionSide.SHORT)
@@ -326,6 +337,8 @@ class MetaStrategyAllocator:
                 )
                 p2_scale = ramp_mult * leverage_snapshot.cushion_scalar
                 for sym_p2, raw_u2 in db_res.unit_weights.items():
+                    if sym_p2 in blocked_clean:
+                        continue
                     desired_w2 = float(raw_u2 * p2_scale)
                     prev_w2 = float(self.last_p2_weights.get(sym_p2, 0.0))
                     # Apply 3.0% turnover deadband on P2 unless closing to zero or flipping sign
@@ -393,6 +406,7 @@ class MetaStrategyAllocator:
         quarterly_basis_data: dict[str, pd.DataFrame | pd.Series] | pd.DataFrame | pd.Series | float | None = None,
         cooldown_blocked_sides: dict[str, PositionSide] | None = None,
         bars_1m: dict[str, pd.DataFrame] | None = None,
+        blocked_symbols: set[str] | None = None,
     ) -> tuple[dict[str, float], MarketRegime, dict[str, float]]:
         """
         Executes end-to-end multi-strategy signal generation, regime/HRP adaptation,
@@ -413,6 +427,7 @@ class MetaStrategyAllocator:
                 quarterly_basis_data=quarterly_basis_data,
                 cooldown_blocked_sides=cooldown_blocked_sides,
                 bars_1m=bars_1m,
+                blocked_symbols=blocked_symbols,
             )
 
         regime = self.detect_market_regime(market_data)

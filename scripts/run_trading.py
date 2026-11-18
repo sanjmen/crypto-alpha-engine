@@ -358,7 +358,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--core-p1-risk-scale",
         type=float,
         default=None,
-        help="Risk budget scale on Core P1 when Manga P2 is active (default: 0.88)",
+        help="Risk budget scale on Core P1 when Manga P2 / Snipers are active (default: 0.85)",
+    )
+    parser.add_argument(
+        "--enable-event-snipers",
+        dest="enable_event_snipers",
+        action="store_true",
+        default=None,
+        help="Enable Phase 2 Event-Driven Microstructure Snipers M09, M23 & M04 (default: True)",
+    )
+    parser.add_argument(
+        "--disable-event-snipers",
+        dest="enable_event_snipers",
+        action="store_false",
+        help="Disable Phase 2 Event-Driven Microstructure Snipers",
+    )
+    parser.add_argument(
+        "--sniper-slot-leverage",
+        type=float,
+        default=None,
+        help="Base equity fraction per Phase 2 Sniper slot before Cushion/SafeRamp scaling (default: 0.24)",
+    )
+    parser.add_argument(
+        "--sniper-max-positions",
+        type=int,
+        default=None,
+        help="Maximum concurrent Phase 2 Event Sniper positions (default: 3)",
     )
     parser.add_argument(
         "--max-24h-dd",
@@ -903,6 +928,7 @@ def main() -> None:
         f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%, Lock=' + format(feature_flags.chop_profit_lock_trigger_pct * 100, '.1f') + '%->' + format(feature_flags.chop_profit_lock_level_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
         f"SubhourlyPB={'ENABLED' if feature_flags.enable_subhourly_pullback else 'DISABLED'} | "
         f"DollarBarP2={'ENABLED (Max=' + format(feature_flags.dollar_bar_max_gross, '.2f') + 'x, P1Scale=' + format(feature_flags.core_p1_risk_scale, '.2f') + 'x)' if feature_flags.enable_dollar_bar_tsmom else 'DISABLED'} | "
+        f"EventSnipers={'ENABLED (M09/M23/M04, Max=' + str(feature_flags.sniper_max_positions) + 'x' + format(feature_flags.sniper_slot_leverage, '.2f') + ')' if feature_flags.enable_event_snipers else 'DISABLED'} | "
         f"CushionGov={'ENABLED (Buf=$' + format(feature_flags.cushion_buffer_usd, '.0f') + ')' if use_cushion_gov else 'DISABLED'} | "
         f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "

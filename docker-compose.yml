@@ -25,7 +25,10 @@ services:
       - FF_CUSHION_BUFFER_USD=240.0
       - FF_ENABLE_DOLLAR_BAR_TSMOM=true
       - FF_DOLLAR_BAR_MAX_GROSS=0.95
-      - FF_CORE_P1_RISK_SCALE=0.88
+      - FF_CORE_P1_RISK_SCALE=0.85
+      - FF_ENABLE_EVENT_SNIPERS=true
+      - FF_SNIPER_SLOT_LEVERAGE=0.24
+      - FF_SNIPER_MAX_POSITIONS=3
     command: ["python", "scripts/run_trading.py", "--daemon", "--mainnet", "--capital", "3000", "--rebalance-interval", "28800", "--align-funding-clock", "--bhs-enter-top-k", "3", "--bhs-hold-top-k", "6", "--deadband-mult", "1.25", "--start-leverage", "2.5", "--recovery-boost-equity", "3050.0", "--recovery-boost-leverage", "3.2", "--max-leverage", "5.0", "--dd-bracket", "0.06", "--disable-anomalies", "--equity-floor-usd", "2500.0"]
     volumes:
       - ./data:/app/data

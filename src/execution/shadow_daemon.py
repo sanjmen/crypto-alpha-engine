@@ -31,6 +31,12 @@ from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.ws_manager import PriceTick, ResilientWebSocketClient
 from src.features.volatility import parkinson_volatility
+from src.strategies.event_snipers import (
+    SNIPER_BRACKET_PROFILES,
+    SNIPER_STRATEGIES,
+    SNIPER_UNIVERSE_82,
+    EventDrivenSniperEngine,
+)
 from src.strategies.extreme_anomaly import compute_anomaly_confluence_size
 from src.strategies.meta_allocator import MetaStrategyAllocator
 
@@ -61,6 +67,8 @@ ANOMALY_STRATEGIES: set[str] = {
     "Extreme Funding Harvester",
     "Funding Harvester Hedge",
 }
+
+ISOLATED_SATELLITE_STRATEGIES: set[str] = ANOMALY_STRATEGIES | set(SNIPER_STRATEGIES)
 
 NON_CRYPTO_TRADFI_BASES: set[str] = {
     "AAOI",
@@ -278,6 +286,13 @@ class ShadowTradingDaemon:
         self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
         self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
         self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
+        self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
+        self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
+        self.sniper_max_positions = int(getattr(self.feature_flags, "sniper_max_positions", 3))
+        self.sniper_engine = EventDrivenSniperEngine()
+        self._last_sniper_15m_bucket: int = -1
+        self._last_sniper_1h_bucket: int = -1
+        self.sniper_last_exit: dict[str, tuple[datetime, bool]] = {}
         self._sync_allocator_with_feature_flags()
         self.is_halted: bool = False
         self.halt_reason: str = ""
@@ -1770,7 +1785,28 @@ class ShadowTradingDaemon:
             if entry <= 0:
                 continue
 
-            if pos.strategy in anomaly_strats:
+            if pos.strategy in SNIPER_BRACKET_PROFILES:
+                spec = SNIPER_BRACKET_PROFILES[pos.strategy]
+                dec = 6 if entry < 1.0 else (4 if entry < 100.0 else 2)
+                tp_s = (
+                    round(entry * (1.0 + spec.take_profit_pct), dec)
+                    if pos.side == PositionSide.LONG
+                    else round(entry * (1.0 - spec.take_profit_pct), dec)
+                )
+                init_sl = (
+                    round(entry * (1.0 - spec.stop_loss_pct), dec)
+                    if pos.side == PositionSide.LONG
+                    else round(entry * (1.0 + spec.stop_loss_pct), dec)
+                )
+                # Preserve ratcheted stop_loss if already improved beyond initial SL
+                if pos.stop_loss is not None and (
+                    (pos.side == PositionSide.LONG and pos.stop_loss > init_sl)
+                    or (pos.side == PositionSide.SHORT and pos.stop_loss < init_sl)
+                ):
+                    init_sl = pos.stop_loss
+                if pos.take_profit is None or pos.stop_loss is None:
+                    self.broker.create_bracket_orders(symbol=sym, take_profit=tp_s, stop_loss=init_sl)
+            elif pos.strategy in anomaly_strats:
                 if pos.take_profit is None or pos.stop_loss is None:
                     if pos.strategy == "Extreme Drop Bounce":
                         tp = round(entry * 1.06, 6 if entry < 1.0 else 2)
@@ -1898,6 +1934,30 @@ class ShadowTradingDaemon:
             # Determine candidate ratcheted stop-loss
             candidate_sl: float | None = None
             is_anomaly = pos.strategy in ANOMALY_STRATEGIES
+            is_sniper = pos.strategy in SNIPER_BRACKET_PROFILES
+
+            # Auto-close open Sniper positions when `enable_event_snipers` is disabled at runtime
+            if is_sniper and (not self.enable_event_snipers and self.auto_close_anomalies_when_disabled):
+                close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+                qty_to_close = pos.quantity
+                strat_name = pos.strategy or "Sniper"
+                try:
+                    self.broker.set_market_price(sym, price=curr_p)
+                    self.broker.create_order(
+                        symbol=sym,
+                        side=close_side,
+                        order_type=OrderType.MARKET,
+                        quantity=qty_to_close,
+                        strategy=strat_name,
+                    )
+                    self._sync_kill_switch_directional_target()
+                    logger.info(
+                        f"🛡️ [Feature Flag] Event Snipers disabled: auto-closed position "
+                        f"{sym} ({strat_name}) @ ${curr_p:,.4f}"
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Error auto-closing disabled sniper position {sym}: {exc}")
 
             # Regla #1 (Feature Flag): Auto-close open Anomaly positions when Anomaly Capsule is disabled
             if (is_anomaly or pos.strategy == "Funding Harvester Hedge") and (
@@ -1949,8 +2009,14 @@ class ShadowTradingDaemon:
                     except Exception as e:
                         logger.warning(f"Error closing orphan Funding Harvester Hedge {sym}: {e}")
 
-            # Enforce Time-Stop (48h default) on open Anomaly positions so stagnant slots never zombie-lock
-            if is_anomaly and self.anomaly_max_hold_hours and self.anomaly_max_hold_hours > 0:
+            # Enforce Time-Stop (48h default on Anomalies, 12h/16h on Snipers) so stagnant slots never zombie-lock
+            sniper_spec = SNIPER_BRACKET_PROFILES.get(pos.strategy or "")
+            eff_max_hold_h = (
+                sniper_spec.max_hold_hours
+                if sniper_spec is not None
+                else (self.anomaly_max_hold_hours if is_anomaly else 0.0)
+            )
+            if (is_anomaly or is_sniper) and eff_max_hold_h and eff_max_hold_h > 0:
                 opened_dt = getattr(pos, "opened_at", None)
                 if opened_dt is None and hasattr(self.broker, "db") and hasattr(self.broker.db, "get_position"):
                     try:
@@ -1968,7 +2034,7 @@ class ShadowTradingDaemon:
                         opened_dt = opened_dt.replace(tzinfo=timezone.utc)
                     now_utc = datetime.now(timezone.utc)
                     age_hours = (now_utc - opened_dt).total_seconds() / 3600.0
-                    if age_hours >= self.anomaly_max_hold_hours:
+                    if age_hours >= eff_max_hold_h:
                         close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
                         qty_to_close = pos.quantity
                         strat_name = pos.strategy
@@ -1982,21 +2048,32 @@ class ShadowTradingDaemon:
                                 strategy=strat_name,
                             )
                             was_loss = (curr_p < entry) if close_side == OrderSide.SELL else (curr_p > entry)
-                            self.anomaly_last_exit[sym.replace("/", "")] = (now_utc, was_loss)
+                            if is_sniper:
+                                self.sniper_last_exit[sym.replace("/", "")] = (now_utc, was_loss)
+                                self._sync_kill_switch_directional_target()
+                            else:
+                                self.anomaly_last_exit[sym.replace("/", "")] = (now_utc, was_loss)
                             logger.info(
-                                f"⏰ Time-Stop ({age_hours:.1f}h >= {self.anomaly_max_hold_hours:.0f}h) "
-                                f"closed stagnant anomaly position {sym} @ ${curr_p:,.4f}"
+                                f"⏰ Time-Stop ({age_hours:.1f}h >= {eff_max_hold_h:.0f}h) "
+                                f"closed position {sym} ({strat_name}) @ ${curr_p:,.4f}"
                             )
                             continue
                         except Exception as e:
-                            logger.warning(f"Error closing time-stopped anomaly position {sym}: {e}")
+                            logger.warning(f"Error closing time-stopped position {sym}: {e}")
 
-            trail_trig = self.anomaly_trailing_trigger_pct if is_anomaly else self.trailing_trigger_pct
-            trail_dist = self.anomaly_trailing_distance_pct if is_anomaly else self.trailing_distance_pct
-            if is_anomaly:
+            if sniper_spec is not None:
+                trail_trig = sniper_spec.trail_trigger_pct
+                trail_dist = sniper_spec.trail_distance_pct
+                lock_trig = sniper_spec.lock_trigger_pct
+                lock_lvl = sniper_spec.lock_level_pct
+            elif is_anomaly:
+                trail_trig = self.anomaly_trailing_trigger_pct
+                trail_dist = self.anomaly_trailing_distance_pct
                 lock_trig = self.anomaly_profit_lock_trigger_pct
                 lock_lvl = self.anomaly_profit_lock_level_pct
             else:
+                trail_trig = self.trailing_trigger_pct
+                trail_dist = self.trailing_distance_pct
                 _, lock_trig, lock_lvl = self.compute_dynamic_barrier_profile(sym)
 
             # Phase 3: Trailing Stop (only active when trail_trig > 0)
@@ -2056,11 +2133,16 @@ class ShadowTradingDaemon:
         current_prices: dict[str, float] = {}
 
         # Collect symbols to evaluate: curated universe + any open core positions
-        # (Exclude isolated satellite anomaly positions so 4h rebalance doesn't flatten their TP/SL brackets)
+        # (Exclude isolated satellite anomaly & sniper positions so 8h rebalance doesn't flatten their TP/SL brackets)
+        active_sniper_clean_syms = {
+            s.replace("/", "")
+            for s, p in portfolio.positions.items()
+            if p and p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy in SNIPER_STRATEGIES
+        }
         open_pos_symbols = [
             s
             for s, p in portfolio.positions.items()
-            if p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy not in ANOMALY_STRATEGIES
+            if p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy not in ISOLATED_SATELLITE_STRATEGIES
         ]
         base_clean_set = {s.replace("/", "") for s in self.symbols}
         scan_symbols = list(dict.fromkeys(list(self.symbols) + open_pos_symbols))
@@ -2146,7 +2228,12 @@ class ShadowTradingDaemon:
         total_equity = max(portfolio.total_equity, 1.0)
         current_weights_map: dict[str, float] = {}
         for sym, pos in portfolio.positions.items():
-            if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and pos.strategy not in ANOMALY_STRATEGIES:
+            if (
+                pos
+                and pos.side != PositionSide.FLAT
+                and pos.quantity > 0
+                and pos.strategy not in ISOLATED_SATELLITE_STRATEGIES
+            ):
                 px = current_prices.get(sym) or pos.current_price or pos.entry_price
                 signed_val = (-pos.quantity * px) if pos.side == PositionSide.SHORT else (pos.quantity * px)
                 current_weights_map[sym.replace("/", "")] = signed_val / total_equity
@@ -2184,6 +2271,7 @@ class ShadowTradingDaemon:
                 quarterly_basis_data=quarterly_basis_data if quarterly_basis_data else None,
                 cooldown_blocked_sides=active_cd_sides if active_cd_sides else None,
                 bars_1m=bars_1m_majors if bars_1m_majors else None,
+                blocked_symbols=active_sniper_clean_syms if active_sniper_clean_syms else None,
             )
         else:
             target_dollars, regime, weights = self.allocator.generate_portfolio_allocations(
@@ -2194,13 +2282,7 @@ class ShadowTradingDaemon:
             )
 
         target_dollars = self._apply_core_bracket_cooldowns(target_dollars)
-        live_b_ks = getattr(self.broker, "live_broker", None)
-        ks_inst = getattr(live_b_ks, "kill_switch", None) if live_b_ks is not None else None
-        if ks_inst is not None:
-            if use_7f and bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False)):
-                ks_inst.target_net_exposure_usd = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
-            else:
-                ks_inst.target_net_exposure_usd = 0.0
+        self._sync_kill_switch_directional_target(portfolio=portfolio)
 
         if getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None) is not None:
             lev_snap_live = getattr(self.allocator, "last_leverage_snapshot", None)
@@ -2229,12 +2311,14 @@ class ShadowTradingDaemon:
 
         rebalance_candidates: list[dict[str, Any]] = []
         for sym in scan_symbols:
+            clean_sym = sym.replace("/", "")
+            if clean_sym in active_sniper_clean_syms:
+                continue
             live_tick_px = float(self.latest_tickers.get(sym, {}).get("price") or 0.0)
             price = live_tick_px if live_tick_px > 0 else float(current_prices.get(sym) or 0.0)
             if price <= 0:
                 continue
 
-            clean_sym = sym.replace("/", "")
             target_val = float(target_dollars.get(clean_sym, target_dollars.get(sym, 0.0)))
 
             pos = portfolio.positions.get(sym)
@@ -2529,8 +2613,33 @@ class ShadowTradingDaemon:
                 return True
         return False
 
+    def _sync_kill_switch_directional_target(self, portfolio: Portfolio | None = None) -> None:
+        """Synchronizes `EmergencyKillSwitch.target_net_exposure_usd` with authorized P2 + Event-Sniper net USD."""
+        live_b_ks = getattr(self.broker, "live_broker", None)
+        ks_inst = getattr(live_b_ks, "kill_switch", None) if live_b_ks is not None else None
+        if ks_inst is None:
+            return
+        pf = portfolio or self.broker.get_portfolio()
+        p2_net = (
+            float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+            if bool(getattr(self.allocator, "enable_dollar_bar_tsmom", False))
+            else 0.0
+        )
+        sniper_net = 0.0
+        if self.enable_event_snipers:
+            for pos in pf.positions.values():
+                if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and pos.strategy in SNIPER_STRATEGIES:
+                    val = abs(float(pos.market_value))
+                    sniper_net += val if pos.side == PositionSide.LONG else -val
+        ks_inst.max_directional_net_pct = 1.85 if (self.enable_event_snipers or abs(p2_net) > 0) else 1.15
+        ks_inst.target_net_exposure_usd = p2_net + sniper_net
+
     def _sync_allocator_with_feature_flags(self) -> None:
-        """Synchronizes allocator, Dollar-Bar P2 sleeve, and Cushion-Safe CPPI parameters with `self.feature_flags`."""
+        """Synchronizes allocator, Dollar-Bar P2, Event Snipers, and Cushion-Safe CPPI parameters with `self.feature_flags`."""
+        self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
+        self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
+        self.sniper_max_positions = max(1, int(getattr(self.feature_flags, "sniper_max_positions", 3)))
+
         sf_eng = getattr(self.allocator, "seven_factor_engine", None)
         if sf_eng is not None:
             sf_eng.enable_chop_range_arb = bool(self.feature_flags.enable_chop_range_arb)
@@ -2659,12 +2768,15 @@ class ShadowTradingDaemon:
         core_short_count = 0
         zombie_stubs: list[str] = []
         open_anomalies: list[str] = []
+        open_snipers: list[str] = []
 
         for sym, pos in pf.positions.items():
             if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
                 continue
             notional = abs(float(pos.market_value))
-            if pos.strategy in ANOMALY_STRATEGIES or pos.strategy == "Funding Harvester Hedge":
+            if pos.strategy in SNIPER_STRATEGIES:
+                open_snipers.append(f"{sym}:{pos.strategy}:${notional:.1f}")
+            elif pos.strategy in ANOMALY_STRATEGIES or pos.strategy == "Funding Harvester Hedge":
                 open_anomalies.append(f"{sym}:${notional:.1f}")
             else:
                 if pos.side == PositionSide.LONG:
@@ -2679,7 +2791,7 @@ class ShadowTradingDaemon:
             for sym, pos in pf.positions.items():
                 if not pos or pos.side == PositionSide.FLAT or pos.quantity <= 0:
                     continue
-                if pos.strategy in ANOMALY_STRATEGIES or pos.strategy == "Funding Harvester Hedge":
+                if pos.strategy in ISOLATED_SATELLITE_STRATEGIES:
                     continue
                 notional = abs(float(pos.market_value))
                 if notional < 150.0:
@@ -2723,6 +2835,7 @@ class ShadowTradingDaemon:
             "core_net_drift_pct": round(core_net_drift_pct * 100.0, 2),
             "zombie_stubs": zombie_stubs,
             "open_anomalies": open_anomalies,
+            "open_snipers": open_snipers,
             "intracycle_rebalance_count": self.intracycle_rebalance_count,
             "equity_usd": round(float(pf.total_equity), 2),
             "equity_floor_usd": round(self.equity_floor_usd, 2),
@@ -2760,7 +2873,12 @@ class ShadowTradingDaemon:
         core_long_usd = 0.0
         core_short_usd = 0.0
         for pos in portfolio.positions.values():
-            if pos and pos.side != PositionSide.FLAT and pos.quantity > 0 and pos.strategy not in ANOMALY_STRATEGIES:
+            if (
+                pos
+                and pos.side != PositionSide.FLAT
+                and pos.quantity > 0
+                and pos.strategy not in ISOLATED_SATELLITE_STRATEGIES
+            ):
                 if pos.side == PositionSide.LONG:
                     core_long_usd += pos.market_value
                 elif pos.side == PositionSide.SHORT:
@@ -2772,7 +2890,8 @@ class ShadowTradingDaemon:
 
         equity = max(portfolio.total_equity, 1.0)
         denom = max(core_gross_usd, equity, 1.0)
-        net_drift_pct = abs(core_long_usd - core_short_usd) / denom
+        dir_net = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
+        net_drift_pct = abs((core_long_usd - core_short_usd) - dir_net) / denom
         if net_drift_pct >= self.intracycle_drift_threshold_pct:
             self.intracycle_rebalance_count += 1
             logger.info(
@@ -3156,6 +3275,303 @@ class ShadowTradingDaemon:
         self.last_anomaly_scan_time = now
         return executed_orders
 
+    def fetch_sniper_taker_klines(self, symbol: str, timeframe: str = "1h", target_bars: int = 750) -> pd.DataFrame:
+        """
+        Fetches closed klines with `quote_volume` & `taker_buy_quote_volume` for Phase 2 Event Snipers,
+        combining lightweight warm cache (`data/cache/sniper_{timeframe}/{CLEAN_SYM}.parquet`)
+        with incremental `/fapi/v1/klines` top-ups.
+        """
+        clean_sym = symbol.split(":")[0].replace("/", "")
+        cache_path = self.cache_dir / f"sniper_{timeframe}" / f"{clean_sym}.parquet"
+        cached_df = pd.DataFrame()
+        cols = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+
+        if self.enable_warm_start and cache_path.exists():
+            try:
+                raw_df = pd.read_parquet(cache_path)
+                if not raw_df.empty and {"timestamp", "close", "quote_volume", "taker_buy_quote_volume"}.issubset(
+                    raw_df.columns
+                ):
+                    c_df = raw_df.tail(max(target_bars, 800)).copy()
+                    c_df["timestamp"] = self._normalize_timestamp_series(c_df["timestamp"])
+                    cached_df = (
+                        c_df[cols]
+                        .drop_duplicates(subset=["timestamp"], keep="last")
+                        .sort_values("timestamp")
+                        .reset_index(drop=True)
+                    )
+                    cached_df = self._drop_unclosed_bars(cached_df, timeframe=timeframe)
+            except Exception:
+                cached_df = pd.DataFrame()
+
+        live_records: list[dict[str, Any]] = []
+        fn = getattr(self.exchange, "fapiPublicGetKlines", None)
+        if callable(fn) and not isinstance(fn, MagicMock):
+            try:
+                tf_sec = 3600.0 if timeframe == "1h" else 900.0
+                if not cached_df.empty:
+                    gap = int(
+                        max(
+                            3.0,
+                            (datetime.now(timezone.utc) - cached_df["timestamp"].iloc[-1]).total_seconds() / tf_sec
+                            + 2.0,
+                        )
+                    )
+                    fetch_lim = min(1500, max(5, gap))
+                else:
+                    fetch_lim = min(1500, target_bars + 2)
+                if self.rate_limiter:
+                    self.rate_limiter.acquire(weight=2 if fetch_lim <= 100 else 5, priority="LOW", wait=True)
+                rows = fn({"symbol": clean_sym, "interval": timeframe, "limit": fetch_lim})
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) >= 11:
+                            ts_ms = int(r[0])
+                            if ts_ms > 0:
+                                live_records.append(
+                                    {
+                                        "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True),
+                                        "open": float(r[1]),
+                                        "high": float(r[2]),
+                                        "low": float(r[3]),
+                                        "close": float(r[4]),
+                                        "quote_volume": float(r[7]),
+                                        "taker_buy_quote_volume": float(r[10]),
+                                    }
+                                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Sniper {timeframe} kline fetch note for {clean_sym}: {exc}")
+
+        if live_records:
+            live_df = pd.DataFrame(live_records)
+            merged = pd.concat([cached_df, live_df], ignore_index=True) if not cached_df.empty else live_df
+        else:
+            merged = cached_df
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+        )
+        merged = self._drop_unclosed_bars(merged, timeframe=timeframe)
+
+        if (
+            self.enable_warm_start
+            and live_records
+            and timeframe == "1h"
+            and not isinstance(self.exchange, MagicMock)
+            and self.cache_dir.exists()
+        ):
+            with contextlib.suppress(Exception):
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                merged.tail(max(target_bars, 800)).to_parquet(cache_path, index=False)
+
+        return merged.tail(target_bars).reset_index(drop=True)
+
+    def run_event_sniper_scan(
+        self,
+        now: datetime | None = None,
+        bars_1h_override: dict[str, pd.DataFrame] | None = None,
+        bars_15m_override: dict[str, pd.DataFrame] | None = None,
+        funding_override: dict[str, float] | None = None,
+    ) -> list[Order]:
+        """
+        Phase 2 Event-Driven Sniper Orchestrator:
+        - Evaluates `M04_NegFundSqueeze` once every 15m candle boundary across Top-60 symbols.
+        - Evaluates `M09_CoilBreakout` (Top-25) & `M23_BreadthThrust` (82-symbol sensor -> Majors)
+          once every 1h candle boundary.
+        - Sizes slots with Cushion-Safe CPPI + SafeRamp scaling, enforces One-Way non-collision,
+          and attaches exact 1m-validated SL/TP/Profit-Lock/Trailing brackets.
+        """
+        if not self.enable_event_snipers:
+            return []
+
+        now_dt = now or datetime.now(timezone.utc)
+        portfolio = self.broker.get_portfolio()
+        all_open = {
+            s: p for s, p in portfolio.positions.items() if p and p.quantity > 0 and p.side != PositionSide.FLAT
+        }
+        active_snipers = {s: p for s, p in all_open.items() if p.strategy in SNIPER_STRATEGIES}
+        if len(active_snipers) >= self.sniper_max_positions:
+            return []
+
+        # Compute Cushion-Safe & SafeRamp scaling from SteppedLeverageController
+        equity = max(float(portfolio.total_equity), 1.0)
+        lev_ctrl = getattr(self.allocator, "stepped_leverage_controller", None)
+        cushion_sc = 1.0
+        ramp_mult = 1.0
+        if lev_ctrl is not None:
+            snap = lev_ctrl.update_state(current_equity=equity, vol_scalar=1.0)
+            cushion_sc = float(snap.cushion_scalar)
+            ramp_mult = min(1.65, max(0.50, snap.active_base_leverage / max(lev_ctrl.start_leverage, 1.0)))
+
+        slot_notional = float(self.sniper_slot_leverage * equity * cushion_sc * ramp_mult)
+        if slot_notional < 15.0 or portfolio.cash < 15.0:
+            return []
+
+        blocked_clean = {s.replace("/", "").split(":")[0] for s in all_open}
+        for sym_cd, (last_ts, was_loss) in list(self.sniper_last_exit.items()):
+            cd_sec = 14400.0 if was_loss else 3600.0
+            if (now_dt - last_ts).total_seconds() < cd_sec:
+                blocked_clean.add(sym_cd)
+
+        now_sec = int(now_dt.timestamp())
+        q_bucket = now_sec // 900
+        h_bucket = now_sec // 3600
+        if bars_15m_override is None and self._last_sniper_15m_bucket < 0 and (now_dt.minute % 15) > 3:
+            self._last_sniper_15m_bucket = q_bucket
+        if bars_1h_override is None and self._last_sniper_1h_bucket < 0 and now_dt.minute > 3:
+            self._last_sniper_1h_bucket = h_bucket
+
+        due_15m = (bars_15m_override is not None) or (q_bucket > self._last_sniper_15m_bucket)
+        due_1h = (bars_1h_override is not None) or (h_bucket > self._last_sniper_1h_bucket)
+        if not due_15m and not due_1h:
+            return []
+
+        # Rank 82 universe by live 24h quote volume when available (fallback to canonical SNIPER_UNIVERSE_82 order)
+        vol_pairs = []
+        for idx_default, clean_s in enumerate(SNIPER_UNIVERSE_82):
+            slash_s = f"{clean_s[:-4]}/USDT"
+            t_info = self.latest_tickers.get(slash_s) or self.latest_tickers.get(clean_s) or {}
+            v24 = float(t_info.get("volume_24h", 0.0) or 0.0)
+            vol_pairs.append((clean_s, v24, idx_default))
+        if any(v > 0 for _, v, _ in vol_pairs):
+            vol_pairs.sort(key=lambda x: (-x[1], x[2]))
+        adv_ranks = {clean_s: rk for rk, (clean_s, _, _) in enumerate(vol_pairs)}
+
+        candidates = []
+
+        # 1) 15m Negative-Funding Short-Squeeze Scan (`M04`)
+        if due_15m:
+            self._last_sniper_15m_bucket = q_bucket
+            f_map = funding_override if funding_override is not None else self.fetch_universe_funding_rates()
+            if f_map:
+                if bars_15m_override is not None:
+                    b15_map = bars_15m_override
+                else:
+                    b15_map = {}
+                    neg_syms = [
+                        s
+                        for s, rk in adv_ranks.items()
+                        if rk < 60
+                        and s not in blocked_clean
+                        and float(f_map.get(s, f_map.get(f"{s[:-4]}/USDT", 0.0))) <= -0.0004
+                    ]
+                    for ns_sym in neg_syms[:8]:
+                        df15 = self.fetch_sniper_taker_klines(ns_sym, timeframe="15m", target_bars=105)
+                        if not df15.empty:
+                            b15_map[ns_sym] = df15
+                if b15_map:
+                    candidates.extend(
+                        self.sniper_engine.evaluate_15m_squeeze_snipers(
+                            bars_15m_map=b15_map,
+                            funding_rates=f_map,
+                            adv_ranks=adv_ranks,
+                            blocked_symbols=blocked_clean,
+                        )
+                    )
+
+        # 2) 1h Dispersion-Coil (`M09`) & 82-Symbol Breadth Thrust (`M23`) Scan
+        if due_1h:
+            self._last_sniper_1h_bucket = h_bucket
+            if bars_1h_override is not None:
+                b1h_map = bars_1h_override
+            else:
+                b1h_map = {}
+                scan_45 = [s for s, rk in adv_ranks.items() if rk < 45]
+                if not isinstance(self.exchange, MagicMock):
+
+                    def _load_1h(s_c: str) -> tuple[str, pd.DataFrame]:
+                        return s_c, self.fetch_sniper_taker_klines(s_c, timeframe="1h", target_bars=750)
+
+                    with ThreadPoolExecutor(max_workers=6) as pool:
+                        for sym_k, df_k in pool.map(_load_1h, scan_45):
+                            if not df_k.empty:
+                                b1h_map[sym_k] = df_k
+            if b1h_map:
+                candidates.extend(
+                    self.sniper_engine.evaluate_1h_snipers(
+                        bars_1h_map=b1h_map,
+                        blocked_symbols=blocked_clean,
+                    )
+                )
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        executed: list[Order] = []
+        is_live = bool(getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None))
+
+        for sig in candidates:
+            if len(active_snipers) + len(executed) >= self.sniper_max_positions:
+                break
+            if sig.symbol in blocked_clean or sig.reference_price <= 0:
+                continue
+
+            slash_sym = f"{sig.symbol[:-4]}/USDT" if sig.symbol.endswith("USDT") else sig.symbol
+            t_q = self.latest_tickers.get(slash_sym) or self.latest_tickers.get(sig.symbol) or {}
+            exec_px = float(t_q.get("price") or sig.reference_price)
+            if exec_px <= 0:
+                continue
+
+            eff_notional = min(slot_notional, float(portfolio.cash) * 1.8)
+            if is_live:
+                min_not = float(self.broker.live_broker.get_min_notional(slash_sym, reduce_only=False))
+                if eff_notional < max(15.0, min_not):
+                    continue
+                if slash_sym not in self.broker._configured_live_symbols:
+                    with contextlib.suppress(Exception):
+                        self.broker.live_broker.kill_switch.sync_margin_and_leverage(
+                            exchange_client=self.broker.live_broker.client,
+                            symbols=[slash_sym],
+                            effective_leverage=3.0,
+                            dry_run=False,
+                        )
+                        self.broker._configured_live_symbols.add(slash_sym)
+
+            qty = round(eff_notional / exec_px, 6)
+            if qty <= 0:
+                continue
+
+            order_side = OrderSide.BUY if sig.side > 0 else OrderSide.SELL
+            try:
+                self.broker.set_market_price(slash_sym, price=exec_px)
+                ord_res = self.broker.create_order(
+                    symbol=slash_sym,
+                    side=order_side,
+                    order_type=OrderType.MARKET,
+                    quantity=qty,
+                    strategy=sig.strategy,
+                )
+                fill_px = float(ord_res.average_fill_price or exec_px)
+                dec = 6 if fill_px < 1.0 else (4 if fill_px < 100.0 else 2)
+                tp_px = (
+                    round(fill_px * (1.0 + sig.bracket.take_profit_pct), dec)
+                    if sig.side > 0
+                    else round(fill_px * (1.0 - sig.bracket.take_profit_pct), dec)
+                )
+                sl_px = (
+                    round(fill_px * (1.0 - sig.bracket.stop_loss_pct), dec)
+                    if sig.side > 0
+                    else round(fill_px * (1.0 + sig.bracket.stop_loss_pct), dec)
+                )
+                self.broker.create_bracket_orders(symbol=slash_sym, take_profit=tp_px, stop_loss=sl_px)
+                blocked_clean.add(sig.symbol)
+                executed.append(ord_res)
+                logger.info(
+                    f"🎯 [Phase 2 Sniper] Executed {order_side.value} {slash_sym} ({sig.strategy}) "
+                    f"@ ${fill_px:,.4f} | Notional=${eff_notional:,.1f} | TP=${tp_px} SL=${sl_px} | {sig.reason}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Failed executing Phase 2 Sniper {sig.strategy} on {slash_sym}: {exc}")
+
+        if executed:
+            self._sync_kill_switch_directional_target()
+        return executed
+
     def step(self) -> dict[str, Any]:
         """
         Performs a single synchronous step across fast, rebalance, and funding cycles.
@@ -3180,7 +3596,7 @@ class ShadowTradingDaemon:
                 "halt_reason": self.halt_reason,
             }
 
-        # 2. Event-driven Anomaly Scan (every 30s)
+        # 2. Event-driven Anomaly Scan (every 30s) & Phase 2 Event Snipers (`M09`/`M23` 1h, `M04` 15m)
         anomaly_orders = []
         if self.enable_anomalies:
             anomaly_due = False
@@ -3191,6 +3607,8 @@ class ShadowTradingDaemon:
                 anomaly_due = True
             if anomaly_due:
                 anomaly_orders = self.run_anomaly_scan()
+
+        sniper_orders = self.run_event_sniper_scan(now=now) if self.enable_event_snipers else []
 
         # 3. Check if funding settlement is due (00:00, 08:00, 16:00 UTC) BEFORE scheduled rebalance
         funding_due = False
@@ -3229,6 +3647,7 @@ class ShadowTradingDaemon:
             "cash": portfolio.cash,
             "filled_orders": len(filled_orders),
             "anomaly_orders": len(anomaly_orders),
+            "sniper_orders": len(sniper_orders),
             "rebalance_orders": len(rebalance_orders),
             "funding_cashflows": funding_cashflows,
         }

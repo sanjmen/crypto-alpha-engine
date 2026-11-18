@@ -46,8 +46,11 @@ FLOAT_FLAG_NAMES = frozenset(
         "cushion_buffer_usd",
         "dollar_bar_max_gross",
         "core_p1_risk_scale",
+        "sniper_slot_leverage",
     }
 )
+
+INT_FLAG_NAMES = frozenset({"sniper_max_positions"})
 
 
 @dataclass
@@ -71,7 +74,10 @@ class FeatureFlags:
     cushion_buffer_usd: float = 240.0
     enable_dollar_bar_tsmom: bool = True
     dollar_bar_max_gross: float = 0.95
-    core_p1_risk_scale: float = 0.88
+    core_p1_risk_scale: float = 0.85
+    enable_event_snipers: bool = True
+    sniper_slot_leverage: float = 0.24
+    sniper_max_positions: int = 3
     enable_intracycle_rebalance: bool = True
     enable_invariant_audit: bool = True
     enable_smart_money: bool = True
@@ -98,7 +104,9 @@ class FeatureFlags:
         for field_info in fields(cls):
             name = field_info.name
             if name in data:
-                if name in FLOAT_FLAG_NAMES:
+                if name in INT_FLAG_NAMES:
+                    merged[name] = max(0, int(round(_parse_float(data[name], merged[name]))))
+                elif name in FLOAT_FLAG_NAMES:
                     merged[name] = _parse_float(data[name], merged[name])
                 else:
                     merged[name] = _parse_bool(data[name], merged[name])
@@ -251,7 +259,37 @@ class FeatureFlags:
                 "FF_CORE_P1_RISK_SCALE",
                 getattr(args, "core_p1_risk_scale", None) if args is not None else None,
             ),
-            default=0.88,
+            default=0.85,
+        )
+        cli_snipers = getattr(args, "enable_event_snipers", None) if args is not None else None
+        env_snipers = env.get("FF_ENABLE_EVENT_SNIPERS")
+        if env_snipers is not None:
+            enable_snipers = _parse_bool(env_snipers, default=True)
+        elif cli_snipers is not None:
+            enable_snipers = bool(cli_snipers)
+        else:
+            enable_snipers = True
+
+        sniper_lev = _parse_float(
+            env.get(
+                "FF_SNIPER_SLOT_LEVERAGE",
+                getattr(args, "sniper_slot_leverage", None) if args is not None else None,
+            ),
+            default=0.24,
+        )
+        sniper_max_pos = max(
+            1,
+            int(
+                round(
+                    _parse_float(
+                        env.get(
+                            "FF_SNIPER_MAX_POSITIONS",
+                            getattr(args, "sniper_max_positions", None) if args is not None else None,
+                        ),
+                        default=3.0,
+                    )
+                )
+            ),
         )
 
         return cls(
@@ -264,6 +302,9 @@ class FeatureFlags:
             enable_dollar_bar_tsmom=enable_db_tsmom,
             dollar_bar_max_gross=db_max_gross,
             core_p1_risk_scale=p1_scale,
+            enable_event_snipers=enable_snipers,
+            sniper_slot_leverage=sniper_lev,
+            sniper_max_positions=sniper_max_pos,
             enable_intracycle_rebalance=enable_intracycle,
             enable_invariant_audit=enable_invariants,
             enable_smart_money=enable_sm,
@@ -327,13 +368,19 @@ class FeatureFlags:
             "enable_dollar_bar_tsmom": "enable_dollar_bar_tsmom",
             "dollar_bar_max_gross": "dollar_bar_max_gross",
             "core_p1_risk_scale": "core_p1_risk_scale",
+            "event_snipers": "enable_event_snipers",
+            "enable_event_snipers": "enable_event_snipers",
+            "sniper_slot_leverage": "sniper_slot_leverage",
+            "sniper_max_positions": "sniper_max_positions",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:
             valid = ", ".join(sorted(asdict(self).keys()))
             raise ValueError(f"Unknown feature flag '{key}'. Valid flags: {valid}")
 
-        if norm_key in FLOAT_FLAG_NAMES:
+        if norm_key in INT_FLAG_NAMES:
+            parsed: Any = max(0, int(round(_parse_float(raw_value, getattr(self, norm_key)))))
+        elif norm_key in FLOAT_FLAG_NAMES:
             parsed: Any = _parse_float(raw_value, getattr(self, norm_key))
         else:
             parsed = _parse_bool(raw_value, getattr(self, norm_key))

@@ -16,6 +16,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
         "CrossSectionalMomentumStrategy",
     ),
     "EarlyBreakoutStrategy": ("src.strategies.extreme_anomaly", "EarlyBreakoutStrategy"),
+    "EventDrivenSniperEngine": ("src.strategies.event_snipers", "EventDrivenSniperEngine"),
     "ExtremeFundingHarvesterStrategy": (
         "src.strategies.extreme_anomaly",
         "ExtremeFundingHarvesterStrategy",
