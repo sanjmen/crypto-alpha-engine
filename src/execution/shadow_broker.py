@@ -599,6 +599,7 @@ class ShadowExecutionBroker(IExecutionClient):
             role="TAKER",
         )
         realized_pnl = self._update_portfolio_position(trade)
+        order._realized_pnl = realized_pnl
         self.db.save_trade(trade, is_maker=False, realized_pnl=realized_pnl, strategy=getattr(order, "strategy", None))
         if self.is_live:
             self.sync_from_live_exchange(sync_positions=False)
@@ -673,6 +674,7 @@ class ShadowExecutionBroker(IExecutionClient):
             role=role_label,
         )
         realized_pnl = self._update_portfolio_position(trade)
+        order._realized_pnl = realized_pnl
         self.db.save_trade(
             trade,
             is_maker=is_maker_fill,

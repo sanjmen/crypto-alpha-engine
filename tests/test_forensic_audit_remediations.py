@@ -506,3 +506,101 @@ def test_novymarx_bhs_hysteresis_two_phase_safe_ramp_and_8h_funding_clock():
     max_diff = float((mats_shocked["w_base_1x"].iloc[99] - mats_trunc["w_base_1x"].iloc[-1]).abs().max())
     assert max_diff < 1e-12
     assert pytest.approx(float(mats_full["w_base_1x"].iloc[-1].sum()), abs=1e-6) == 0.0
+
+
+def test_1m_audit_pillar1_fixes_and_chop_profit_lock_profile():
+    """
+    Verifies the 3 Pillar-1 adjustments from the 4-year (2023-2026) 1m Exact Physics Audit:
+    1. `enable_subhourly_pullback` defaults to False in FeatureFlags & ShadowTradingDaemon.
+    2. `compute_dynamic_barrier_profile` activates Chop Profit-Lock (`+2.4% -> +1.2%`) alongside
+       dynamic Chop TP (`[2.8%, 3.6%]`), and `manage_trailing_and_profit_locks` ratchets SL at +2.4%.
+    3. Winning Core Take-Profit & positive Profit-Lock exits do NOT populate `core_bracket_last_exit`,
+       whereas negative Stop-Loss exits DO populate `core_bracket_last_exit`.
+    """
+    from types import SimpleNamespace
+
+    from src.domain.enums import OrderSide, OrderType, PositionSide
+    from src.execution.feature_flags import FeatureFlags
+    from src.strategies.meta_allocator import MetaStrategyAllocator
+
+    flags = FeatureFlags.from_env_and_args(mode="mainnet", environ={})
+    assert flags.enable_subhourly_pullback is False
+    assert pytest.approx(flags.chop_profit_lock_trigger_pct, abs=1e-6) == 0.024
+    assert pytest.approx(flags.chop_profit_lock_level_pct, abs=1e-6) == 0.012
+
+    flags.apply_override("chop_lock_trigger", "0.025")
+    flags.apply_override("chop_lock_level", "0.013")
+    assert pytest.approx(flags.chop_profit_lock_trigger_pct, abs=1e-6) == 0.025
+    assert pytest.approx(flags.chop_profit_lock_level_pct, abs=1e-6) == 0.013
+
+    # Reset to production 2.4% -> 1.2% profile
+    flags = FeatureFlags.from_env_and_args(mode="mainnet", environ={})
+    db = ShadowDatabase(db_path=":memory:")
+    broker = ShadowExecutionBroker(database=db, initial_cash=3000.0)
+    sf_eng = SevenFactorOnlineEngine(priors=None, enable_chop_range_arb=True, enable_holistic_regime_shields=True)
+    alloc = MetaStrategyAllocator(seven_factor_engine=sf_eng, use_seven_factor_engine=True)
+    alloc.last_seven_factor_result = SimpleNamespace(
+        factor_tstats={"macro": -0.20, "med": -0.10, "fast": -0.05},
+        chop_overlay_weight=0.45,
+        asset_vol_24h={"SOLUSDT": 0.0090, "ADAUSDT": 0.0080},
+    )
+
+    daemon = ShadowTradingDaemon(
+        broker=broker,
+        allocator=alloc,
+        symbols=["SOL/USDT", "ADA/USDT"],
+        enable_anomalies=False,
+        enable_warm_start=False,
+        core_take_profit_pct=0.050,
+        profit_lock_trigger_pct=0.035,
+        profit_lock_level_pct=0.015,
+        trailing_trigger_pct=0.0,
+        core_stop_loss_pct=None,
+        feature_flags=flags,
+    )
+    assert daemon.enable_subhourly_pullback is False
+
+    # 1. Verify Chop Profit-Lock 2.4% -> 1.2% ratchets at +2.5% peak and exits profitably without cooldown
+    broker.set_market_price("SOL/USDT", 100.0)
+    broker.create_order(
+        symbol="SOL/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        strategy="F4_Rev_24_72h (MeanRev)",
+    )
+    daemon.ensure_position_brackets()
+    tp_eff, lk_trig, lk_lvl = daemon.compute_dynamic_barrier_profile("SOL/USDT")
+    assert 0.028 <= tp_eff <= 0.036
+    assert pytest.approx(lk_trig, abs=1e-6) == 0.024
+    assert pytest.approx(lk_lvl, abs=1e-6) == 0.012
+
+    # Price reaches +2.50% ($102.50 >= +2.40% chop trigger, below +3.50% trend trigger!)
+    broker.set_market_price("SOL/USDT", 102.50)
+    ratcheted = daemon.manage_trailing_and_profit_locks(ticks={"SOL/USDT": {"price": 102.50}})
+    assert len(ratcheted) == 1
+    assert pytest.approx(broker.portfolio.positions["SOL/USDT"].stop_loss, abs=1e-2) == 101.20
+
+    # Price pulls back to $101.10 -> ratcheted Profit-Lock fills with positive realized PnL!
+    filled = broker.check_pending_orders({"SOL/USDT": {"price": 101.10, "bid": 101.09, "ask": 101.11}})
+    assert len(filled) == 1
+    daemon._refresh_anomaly_cooldowns(filled)
+    assert "SOLUSDT" not in daemon.core_bracket_last_exit
+
+    # 2. Verify genuine negative Stop-Loss exit DOES record cooldown in `core_bracket_last_exit`
+    daemon.core_stop_loss_pct = 0.030
+    broker.set_market_price("ADA/USDT", 1.0000)
+    broker.create_order(
+        symbol="ADA/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=500.0,
+        strategy="F3_Fast_Swing_PB (12h-48h)",
+    )
+    daemon.ensure_position_brackets()
+    filled_loss = broker.check_pending_orders({"ADA/USDT": {"price": 0.9680, "bid": 0.9679, "ask": 0.9681}})
+    assert len(filled_loss) == 1
+    daemon._refresh_anomaly_cooldowns(filled_loss)
+    assert "ADAUSDT" in daemon.core_bracket_last_exit
+    assert daemon.core_bracket_last_exit["ADAUSDT"][1] == PositionSide.LONG
+    db.close()

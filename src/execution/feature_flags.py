@@ -41,6 +41,8 @@ FLOAT_FLAG_NAMES = frozenset(
         "chop_take_profit_pct",
         "chop_min_tp_pct",
         "chop_max_tp_pct",
+        "chop_profit_lock_trigger_pct",
+        "chop_profit_lock_level_pct",
     }
 )
 
@@ -52,6 +54,8 @@ class FeatureFlags:
     - `enable_anomaly_capsule` (default False in Mainnet) + `auto_close_anomalies_when_disabled` (True).
     - `enable_hard_equity_floor` (True) + `equity_floor_usd` ($2,500.00 hard stop in Mainnet).
     - `enable_invariant_audit` (True) — continuous verification of production invariants.
+    - `enable_subhourly_pullback` (False) — disabled after 4-year 1m audit showed 15m iloc[-1] injection hurts breakouts.
+    - `chop_profit_lock_trigger_pct` (2.4%) & `chop_profit_lock_level_pct` (1.2%) — active Chop Profit-Lock profile.
     """
 
     enable_anomaly_capsule: bool = False
@@ -62,12 +66,15 @@ class FeatureFlags:
     enable_invariant_audit: bool = True
     enable_smart_money: bool = True
     enable_quarterly_basis: bool = True
+    enable_subhourly_pullback: bool = False
     enable_chop_range_arb: bool = True
     enable_dynamic_barriers: bool = True
     enable_holistic_regime_shields: bool = True
     chop_take_profit_pct: float = 0.035
     chop_min_tp_pct: float = 0.028
     chop_max_tp_pct: float = 0.036
+    chop_profit_lock_trigger_pct: float = 0.024
+    chop_profit_lock_level_pct: float = 0.012
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +190,22 @@ class FeatureFlags:
             env.get("FF_CHOP_MAX_TP_PCT"),
             default=0.036,
         )
+        cli_sub_pb = getattr(args, "enable_subhourly_pullback", None) if args is not None else None
+        env_sub_pb = env.get("FF_ENABLE_SUBHOURLY_PULLBACK")
+        if env_sub_pb is not None:
+            enable_sub_pb = _parse_bool(env_sub_pb, default=False)
+        elif cli_sub_pb is not None:
+            enable_sub_pb = bool(cli_sub_pb)
+        else:
+            enable_sub_pb = False
+        chop_lock_trig = _parse_float(
+            env.get("FF_CHOP_PROFIT_LOCK_TRIGGER_PCT"),
+            default=0.024,
+        )
+        chop_lock_lvl = _parse_float(
+            env.get("FF_CHOP_PROFIT_LOCK_LEVEL_PCT"),
+            default=0.012,
+        )
 
         return cls(
             enable_anomaly_capsule=enable_anom,
@@ -193,12 +216,15 @@ class FeatureFlags:
             enable_invariant_audit=enable_invariants,
             enable_smart_money=enable_sm,
             enable_quarterly_basis=enable_qb,
+            enable_subhourly_pullback=enable_sub_pb,
             enable_chop_range_arb=enable_chop,
             enable_dynamic_barriers=enable_dyn_b,
             enable_holistic_regime_shields=enable_holistic,
             chop_take_profit_pct=chop_tp,
             chop_min_tp_pct=chop_min_tp,
             chop_max_tp_pct=chop_max_tp,
+            chop_profit_lock_trigger_pct=chop_lock_trig,
+            chop_profit_lock_level_pct=chop_lock_lvl,
         )
 
     def apply_override(self, key: str, raw_value: Any) -> tuple[str, Any]:
@@ -222,6 +248,8 @@ class FeatureFlags:
             "enable_smart_money": "enable_smart_money",
             "quarterly_basis": "enable_quarterly_basis",
             "enable_quarterly_basis": "enable_quarterly_basis",
+            "subhourly_pullback": "enable_subhourly_pullback",
+            "enable_subhourly_pullback": "enable_subhourly_pullback",
             "chop_range_arb": "enable_chop_range_arb",
             "enable_chop_range_arb": "enable_chop_range_arb",
             "dynamic_barriers": "enable_dynamic_barriers",
@@ -235,6 +263,10 @@ class FeatureFlags:
             "chop_min_tp_pct": "chop_min_tp_pct",
             "chop_max_tp": "chop_max_tp_pct",
             "chop_max_tp_pct": "chop_max_tp_pct",
+            "chop_lock_trigger": "chop_profit_lock_trigger_pct",
+            "chop_profit_lock_trigger_pct": "chop_profit_lock_trigger_pct",
+            "chop_lock_level": "chop_profit_lock_level_pct",
+            "chop_profit_lock_level_pct": "chop_profit_lock_level_pct",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:

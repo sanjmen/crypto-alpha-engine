@@ -604,7 +604,10 @@ def run_simulation(
                         entry_px[s_i] = (abs(curr_w[s_i]) * entry_px[s_i] + add_w * cur_o[s_i]) / abs(desired_w[s_i])
                 curr_w = desired_w
 
-            tp_tgt = 0.032 if chop_sh[t] >= 0.35 else 0.050
+            is_chop_b = chop_sh[t] >= 0.25
+            tp_tgt = 0.032 if is_chop_b else 0.050
+            lk_trig_b = 0.024 if is_chop_b else 0.035
+            lk_lvl_b = 0.012 if is_chop_b else 0.015
             for s_i in range(n_s):
                 w_i = curr_w[s_i]
                 if abs(w_i) < 1e-8 or entry_px[s_i] <= 0:
@@ -618,10 +621,10 @@ def run_simulation(
                 exit_px = cur_c[s_i]
                 exit_fee = 0.0002
                 if lock_armed[s_i]:
-                    if pnl_open <= 0.015:
+                    if pnl_open <= lk_lvl_b:
                         exit_px, exit_fee, exited = cur_o[s_i], 0.00055, True
-                    elif adv_pnl <= 0.015:
-                        exit_px, exit_fee, exited = ep * (1.0 + sgn * 0.015), 0.00055, True
+                    elif adv_pnl <= lk_lvl_b:
+                        exit_px, exit_fee, exited = ep * (1.0 + sgn * lk_lvl_b), 0.00055, True
                     elif fav_pnl >= tp_tgt:
                         exit_px = cur_o[s_i] if pnl_open >= tp_tgt else ep * (1.0 + sgn * tp_tgt)
                         exit_fee, exited = 0.00020, True
@@ -630,13 +633,14 @@ def run_simulation(
                         exit_px, exit_fee, exited = cur_o[s_i], 0.00020, True
                     elif fav_pnl >= tp_tgt:
                         exit_px, exit_fee, exited = ep * (1.0 + sgn * tp_tgt), 0.00020, True
-                    elif fav_pnl >= 0.035:
+                    elif fav_pnl >= lk_trig_b:
                         lock_armed[s_i] = True
                 if exited:
                     bar_gross += w_i * ((exit_px - cur_o[s_i]) / cur_o[s_i])
                     bar_fee += abs(w_i) * exit_fee
                     bar_turn += abs(w_i)
-                    cooldown_until[s_i, 0 if sgn > 0 else 1] = t + 4
+                    if sgn * (exit_px - ep) < 0:
+                        cooldown_until[s_i, 0 if sgn > 0 else 1] = t + 4
                     curr_w[s_i] = 0.0
                     entry_px[s_i] = 0.0
                     lock_armed[s_i] = False

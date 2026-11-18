@@ -851,7 +851,8 @@ def main() -> None:
     logger.info(
         f"🚩 Feature Flags & 3 Reglas de Blindaje [{mode.upper()}]: "
         f"AnomalyCapsule={'ENABLED' if feature_flags.enable_anomaly_capsule else 'DISABLED (100% Pure Core 7-Factor)'} | "
-        f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
+        f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%, Lock=' + format(feature_flags.chop_profit_lock_trigger_pct * 100, '.1f') + '%->' + format(feature_flags.chop_profit_lock_level_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
+        f"SubhourlyPB={'ENABLED' if feature_flags.enable_subhourly_pullback else 'DISABLED'} | "
         f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "
         f"InvariantAudit={'ENABLED' if feature_flags.enable_invariant_audit else 'DISABLED'}"
@@ -873,6 +874,7 @@ def main() -> None:
         # Issue #65: Quarantine 4.5% dynamic anomaly equity sizing from Mainnet (keep $45 cap)
         anomaly_pct_equity=args.anomaly_pct_equity if enable_experimental_satellites else None,
         anomaly_prefer_maker=args.anomaly_prefer_maker,
+        enable_subhourly_pullback=feature_flags.enable_subhourly_pullback,
         enable_smart_money=feature_flags.enable_smart_money,
         enable_quarterly_basis=feature_flags.enable_quarterly_basis,
         profit_lock_trigger_pct=args.profit_lock_trigger,

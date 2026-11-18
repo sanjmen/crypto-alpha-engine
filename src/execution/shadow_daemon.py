@@ -195,7 +195,7 @@ class ShadowTradingDaemon:
         core_stop_loss_pct: float = 0.025,
         cache_dir: str = "data/cache",
         enable_warm_start: bool = True,
-        enable_subhourly_pullback: bool = True,
+        enable_subhourly_pullback: bool = False,
         enable_smart_money: bool = True,
         enable_quarterly_basis: bool = True,
         equity_floor_usd: float = 0.0,
@@ -268,7 +268,10 @@ class ShadowTradingDaemon:
             enable_invariant_audit=bool(enable_invariant_audit),
             enable_smart_money=bool(enable_smart_money),
             enable_quarterly_basis=bool(enable_quarterly_basis),
+            enable_subhourly_pullback=bool(enable_subhourly_pullback),
         )
+        if feature_flags is not None and not enable_subhourly_pullback:
+            self.enable_subhourly_pullback = bool(self.feature_flags.enable_subhourly_pullback)
         self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
         self.auto_close_anomalies_when_disabled = bool(self.feature_flags.auto_close_anomalies_when_disabled)
         self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
@@ -405,9 +408,13 @@ class ShadowTradingDaemon:
     def _refresh_anomaly_cooldowns(self, filled_orders: list[Order] | None = None) -> None:
         """
         Hydrates and updates per-symbol anomaly exit timestamps and win/loss state,
-        as well as Core bracket exit timestamps and exited position side (`core_bracket_last_exit`),
+        as well as Core loss-stop exit timestamps and exited position side (`core_bracket_last_exit`),
         from filled bracket orders and/or the SQLite trades table so cooldowns
         persist across fast cycles and daemon restarts.
+
+        Note (1m 4-Year Audit Remediation): Profitable Core Take-Profit (`TAKE_PROFIT` / `shd_tp_`)
+        and positive ratcheted Profit-Lock (`realized_pnl > 0`) exits do NOT block top-conviction
+        leaders from re-selection at the next 8h rebalance; only loss-making Core stops trigger cooldown.
         """
         now = datetime.now(timezone.utc)
         if filled_orders:
@@ -419,7 +426,14 @@ class ShadowTradingDaemon:
                     else:
                         self.last_core_bracket_fill_time = now
                         exited_side = PositionSide.LONG if o.side == OrderSide.SELL else PositionSide.SHORT
-                        self.core_bracket_last_exit[clean_sym] = (now, exited_side)
+                        rpnl_o = getattr(o, "_realized_pnl", None)
+                        is_winning_exit = (o.order_type == OrderType.TAKE_PROFIT) or (
+                            rpnl_o is not None and float(rpnl_o) > 1e-8
+                        )
+                        if is_winning_exit:
+                            self.core_bracket_last_exit.pop(clean_sym, None)
+                        else:
+                            self.core_bracket_last_exit[clean_sym] = (now, exited_side)
 
         db_inst = getattr(self.broker, "db", None)
         if db_inst and hasattr(db_inst, "get_trades"):
@@ -449,11 +463,14 @@ class ShadowTradingDaemon:
                             ts = datetime.fromisoformat(str(ts_raw))
                             if ts.tzinfo is None:
                                 ts = ts.replace(tzinfo=timezone.utc)
-                            side_str = str(r.get("side") or "").upper()
-                            exited_side = PositionSide.LONG if side_str == "SELL" else PositionSide.SHORT
-                            self.core_bracket_last_exit[clean_sym] = (ts, exited_side)
                             if self.last_core_bracket_fill_time is None or ts > self.last_core_bracket_fill_time:
                                 self.last_core_bracket_fill_time = ts
+                            if oid.startswith("shd_tp_") or rpnl > 1e-8:
+                                self.core_bracket_last_exit.pop(clean_sym, None)
+                            else:
+                                side_str = str(r.get("side") or "").upper()
+                                exited_side = PositionSide.LONG if side_str == "SELL" else PositionSide.SHORT
+                                self.core_bracket_last_exit[clean_sym] = (ts, exited_side)
             except Exception:
                 pass
 
@@ -1535,7 +1552,7 @@ class ShadowTradingDaemon:
           (e.g. +5.0% TP, +3.5% -> +1.5% Profit-Lock).
         - In Sideways Chop / Range-Arb Regime (`max_trend_t <= 0` or `chop_overlay_weight >= 0.25`):
           Scales TP dynamically to `clip(2 * sigma_1h_24h * chop_mult, chop_min_tp_pct, chop_max_tp_pct)`
-          (in `[2.8%, 3.6%]`) and Profit-Lock to `(0.72 * eff_tp -> 0.40 * eff_tp)` (e.g. `+2.02% -> +1.12%`).
+          (in `[2.8%, 3.6%]`) and activates the Chop Profit-Lock profile (`+2.4% -> +1.2%`).
         """
         eff_tp = self.core_take_profit_pct
         eff_lock_trig = self.profit_lock_trigger_pct
@@ -1598,6 +1615,18 @@ class ShadowTradingDaemon:
             chop_tp_val = float(getattr(self.feature_flags, "chop_take_profit_pct", 0.035) or 0.035)
             if chop_tp_val > 0.0:
                 eff_tp = chop_tp_val
+
+        c_lock_trig = float(getattr(self.feature_flags, "chop_profit_lock_trigger_pct", 0.024) or 0.024)
+        c_lock_lvl = float(getattr(self.feature_flags, "chop_profit_lock_level_pct", 0.012) or 0.012)
+        if c_lock_trig > 0.0:
+            eff_lock_trig = (
+                min(c_lock_trig, max(0.005, round(eff_tp - 0.0020, 4)))
+                if (eff_tp is not None and eff_tp > 0.0)
+                else c_lock_trig
+            )
+            eff_lock_lvl = (
+                min(c_lock_lvl, round(eff_lock_trig * 0.60, 4)) if c_lock_lvl >= eff_lock_trig else c_lock_lvl
+            )
 
         return eff_tp, eff_lock_trig, eff_lock_lvl
 

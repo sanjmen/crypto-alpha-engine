@@ -574,23 +574,44 @@ def test_nov5_core_bracket_cooldown_and_neutrality_recentering(daemon: ShadowTra
     adj_expired = daemon._apply_core_bracket_cooldowns(raw_targets, now=exit_ts + timedelta(hours=4, minutes=1))
     assert adj_expired["RENDERUSDT"] == -410.0
 
-    # 5. Verify SQLite hydration of `core_bracket_last_exit` across daemon restarts
+    # 5. Verify SQLite hydration of `core_bracket_last_exit` across daemon restarts:
+    #    - Winning Take-Profit (`shd_tp_`) or positive Profit-Lock (`realized_pnl > 0`) must NOT block re-entry.
+    #    - Loss-making Stop-Loss (`shd_sl_` with `realized_pnl <= 0`) MUST hydrate cooldown cleanly.
     daemon.core_bracket_last_exit.clear()
     daemon.broker.db.get_trades = MagicMock(
         return_value=[
             {
+                "timestamp": (now - timedelta(minutes=25)).isoformat(),
+                "symbol": "SOL/USDT",
+                "side": "SELL",
+                "order_id": "shd_tp_1111111111",
+                "realized_pnl": 28.40,
+                "strategy": "F3_Fast_Swing_PB (12h-48h)",
+            },
+            {
+                "timestamp": (now - timedelta(minutes=20)).isoformat(),
+                "symbol": "BNB/USDT",
+                "side": "SELL",
+                "order_id": "shd_sl_2222222222",
+                "realized_pnl": 14.10,
+                "strategy": "F4_Rev_24_72h (MeanRev)",
+            },
+            {
                 "timestamp": (now - timedelta(minutes=15)).isoformat(),
                 "symbol": "ETH/USDT",
                 "side": "SELL",
-                "order_id": "shd_tp_9dbfd234fa",
-                "realized_pnl": 23.20,
+                "order_id": "shd_sl_9dbfd234fa",
+                "realized_pnl": -23.20,
                 "strategy": "F7_HighLiq_Size (Quality)",
-            }
+            },
         ]
     )
     daemon._refresh_anomaly_cooldowns()
+    assert "SOLUSDT" not in daemon.core_bracket_last_exit
+    assert "BNBUSDT" not in daemon.core_bracket_last_exit
     assert "ETHUSDT" in daemon.core_bracket_last_exit
     assert daemon.core_bracket_last_exit["ETHUSDT"][1] == PositionSide.LONG
+    assert daemon.enable_subhourly_pullback is False
 
 
 def test_nov9_zombie_ticker_eviction_kline_price_sync_and_tradfi_filter(daemon: ShadowTradingDaemon):
@@ -1118,10 +1139,12 @@ def test_chop_range_arb_specialist_and_adaptive_chop_tp():
     btc_tp, btc_trig, btc_lock = daemon.compute_dynamic_barrier_profile("BTC/USDT")
     apt_tp, apt_trig, apt_lock = daemon.compute_dynamic_barrier_profile("APT/USDT")
     assert pytest.approx(btc_tp, abs=1e-4) == 0.0280
-    assert pytest.approx(btc_trig, abs=1e-4) == 0.0350
-    assert pytest.approx(btc_lock, abs=1e-4) == 0.0150
+    assert pytest.approx(btc_trig, abs=1e-4) == 0.0240
+    assert pytest.approx(btc_lock, abs=1e-4) == 0.0120
     # Higher-vol symbol (sigma_1h = 0.0100 -> 2*0.0100*1.6933 = 3.39%, within [2.8%, 3.6%])
     assert pytest.approx(apt_tp, abs=1e-4) == 0.0339
+    assert pytest.approx(apt_trig, abs=1e-4) == 0.0240
+    assert pytest.approx(apt_lock, abs=1e-4) == 0.0120
 
     # In Active Trend Regime, TP stays at +5.0% so winning trends are never cut early
     allocator.last_seven_factor_result.factor_tstats["macro"] = 1.20
