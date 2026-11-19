@@ -8,6 +8,7 @@ Eliminates temporal data leakage caused by:
 """
 
 from collections.abc import Generator
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -249,3 +250,96 @@ def compute_cv_metrics(
         "mean_pearson_ic": float(np.mean(pearson_ics)),
         "directional_accuracy": float(np.mean(dir_accs)),
     }
+
+
+class CombinatorialPurgedCV:
+    """
+    Combinatorial Purged Cross-Validation (CPCV — López de Prado, AFML Ch. 12).
+    Partitions `N` contiguous chronological groups and tests all `C(N, k)` test-group
+    combinations (e.g., `N=6, k=2 -> 15` combinatorial splits generating `5` complete backtest paths),
+    enforcing strict label-overlap purging and post-test embargo around every test block.
+    """
+
+    def __init__(self, n_groups: int = 6, k_test_groups: int = 2, embargo_pct: float = 0.01) -> None:
+        if n_groups < 3 or k_test_groups < 1 or k_test_groups >= n_groups:
+            raise ValueError("Require n_groups >= 3 and 1 <= k_test_groups < n_groups")
+        self.n_groups = n_groups
+        self.k_test_groups = k_test_groups
+        self.embargo_pct = embargo_pct
+
+    def split(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: pd.Series | np.ndarray | None = None,
+        t1: pd.Series | None = None,
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        n_samples = len(X)
+        if n_samples == 0:
+            return
+        indices = np.arange(n_samples, dtype=int)
+        t1_positions = _resolve_t1_positions(X, t1)
+        embargo_samples = int(np.ceil(n_samples * self.embargo_pct))
+        bounds = np.linspace(0, n_samples, self.n_groups + 1, dtype=int)
+
+        for test_groups in combinations(range(self.n_groups), self.k_test_groups):
+            test_mask = np.zeros(n_samples, dtype=bool)
+            forbidden_mask = np.zeros(n_samples, dtype=bool)
+            for g in test_groups:
+                s_idx, e_idx = int(bounds[g]), int(bounds[g + 1])
+                test_mask[s_idx:e_idx] = True
+                forbidden_mask[s_idx : min(n_samples, e_idx + embargo_samples)] = True
+                # Purge any sample prior to s_idx whose horizon t1 reaches >= s_idx
+                overlap = (indices < s_idx) & (t1_positions >= s_idx)
+                forbidden_mask |= overlap
+
+            train_idx = indices[~forbidden_mask]
+            test_idx = indices[test_mask]
+            if len(train_idx) > 0 and len(test_idx) > 0:
+                yield train_idx, test_idx
+
+
+def compute_deflated_sharpe_ratio(
+    returns: np.ndarray | pd.Series,
+    num_trials: int = 1,
+    periods_per_year: float = 365.25,
+    trials_sharpe_std: float | None = None,
+) -> float:
+    """
+    Computes Bailey & López de Prado (2014) Deflated Sharpe Ratio (DSR in [0, 1]),
+    correcting for non-normality (skewness & kurtosis), finite sample length `T`,
+    and selection bias across `num_trials` (`M`) tested configurations.
+    """
+    r = np.asarray(returns, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    n = len(r)
+    if n < 10:
+        return 0.0
+    std_r = float(np.std(r, ddof=1))
+    if std_r <= 1e-12:
+        return 0.0
+
+    # Non-annualized per-period Sharpe `sr_hat`
+    sr_hat = float(np.mean(r)) / std_r
+    skew = float(stats.skew(r, bias=False))
+    kurt = float(stats.kurtosis(r, fisher=False, bias=False))  # Pearson kurtosis (Normal = 3.0)
+
+    # Expected maximum per-period Sharpe ratio `sr_0` under null across M independent trials
+    m_eff = max(1, int(num_trials))
+    if m_eff <= 1:
+        sr_0 = 0.0
+    else:
+        # Variance of per-period Sharpe across trials (~ 1 / (n - 1) under null if not supplied)
+        sigma_sr = (
+            float(trials_sharpe_std) / np.sqrt(periods_per_year)
+            if (trials_sharpe_std is not None and trials_sharpe_std > 0.0)
+            else 1.0 / np.sqrt(max(2.0, n - 1.0))
+        )
+        euler_gamma = 0.5772156649015329
+        z1 = float(stats.norm.ppf(1.0 - 1.0 / m_eff))
+        z2 = float(stats.norm.ppf(1.0 - 1.0 / (m_eff * np.e)))
+        sr_0 = sigma_sr * ((1.0 - euler_gamma) * z1 + euler_gamma * z2)
+
+    denom_var = 1.0 - skew * sr_hat + ((kurt - 1.0) / 4.0) * (sr_hat**2)
+    denom = np.sqrt(max(1e-12, denom_var))
+    z_stat = ((sr_hat - sr_0) * np.sqrt(n - 1.0)) / denom
+    return float(np.clip(stats.norm.cdf(z_stat), 0.0, 1.0))

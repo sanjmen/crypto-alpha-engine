@@ -1,0 +1,151 @@
+{
+  "issue": "M16-5 (#71)",
+  "elapsed_sec": 242.1,
+  "survivors_integrated": [
+    "A1_FAST_1H_POST_SETTLE_UNWIND_20BPS",
+    "A3_MIDCAP_LOW_VOL_QUALITY_8H"
+  ],
+  "ablation_rows": [
+    {
+      "variant": "00_CURRENT_PROD",
+      "const_1x_sharpe": 0.61,
+      "maker_full_sharpe": 0.436,
+      "maker_sharpe_lift": 0.0,
+      "maker_geom_daily_pct": 0.0129,
+      "maker_cagr_pct": 4.81,
+      "maker_max_dd_pct": 29.4,
+      "maker_calmar": 0.16,
+      "maker_min_eq_usd": 2701.91,
+      "maker_final_eq_usd": 3240.05,
+      "maker_worst_24h_pct": -4.86,
+      "maker_monthly_win_pct": 57.4,
+      "maker_yearly_sharpe": {
+        "2023": 1.26,
+        "2024": 0.88,
+        "2025": 1.27,
+        "2026": -1.97
+      },
+      "holdout_2026_sharpe": -1.242,
+      "holdout_2026_lift": 0.0,
+      "holdout_2026_geom_daily_pct": -0.0185,
+      "holdout_2026_max_dd_pct": 10.32,
+      "holdout_2026_min_eq_usd": 2531.88,
+      "cons_full_sharpe": -0.269,
+      "cons_geom_daily_pct": -0.0051,
+      "cons_max_dd_pct": 13.9,
+      "cons_min_eq_usd": 2508.69,
+      "cons_2026_sharpe": -1.749,
+      "go_for_m16_6": true
+    },
+    {
+      "variant": "01_PROD_PLUS_A1_FAST_1H_POST_SETTLE_UNWIND_20BPS",
+      "const_1x_sharpe": 2.35,
+      "maker_full_sharpe": 2.057,
+      "maker_sharpe_lift": 1.621,
+      "maker_geom_daily_pct": 0.0957,
+      "maker_cagr_pct": 41.81,
+      "maker_max_dd_pct": 23.63,
+      "maker_calmar": 1.77,
+      "maker_min_eq_usd": 2693.91,
+      "maker_final_eq_usd": 10469.39,
+      "maker_worst_24h_pct": -7.49,
+      "maker_monthly_win_pct": 72.3,
+      "maker_yearly_sharpe": {
+        "2023": 2.73,
+        "2024": 2.91,
+        "2025": 2.46,
+        "2026": 0.18
+      },
+      "holdout_2026_sharpe": -0.175,
+      "holdout_2026_lift": 1.067,
+      "holdout_2026_geom_daily_pct": -0.0092,
+      "holdout_2026_max_dd_pct": 16.48,
+      "holdout_2026_min_eq_usd": 2567.31,
+      "cons_full_sharpe": 1.243,
+      "cons_geom_daily_pct": 0.0538,
+      "cons_max_dd_pct": 28.6,
+      "cons_min_eq_usd": 2635.38,
+      "cons_2026_sharpe": -0.421,
+      "go_for_m16_6": false
+    },
+    {
+      "variant": "01_PROD_PLUS_A3_MIDCAP_LOW_VOL_QUALITY_8H",
+      "const_1x_sharpe": 0.788,
+      "maker_full_sharpe": 0.585,
+      "maker_sharpe_lift": 0.149,
+      "maker_geom_daily_pct": 0.0226,
+      "maker_cagr_pct": 8.59,
+      "maker_max_dd_pct": 23.45,
+      "maker_calmar": 0.37,
+      "maker_min_eq_usd": 2654.47,
+      "maker_final_eq_usd": 3717.69,
+      "maker_worst_24h_pct": -4.85,
+      "maker_monthly_win_pct": 53.2,
+      "maker_yearly_sharpe": {
+        "2023": 1.01,
+        "2024": 0.93,
+        "2025": 0.65,
+        "2026": -0.21
+      },
+      "holdout_2026_sharpe": -0.339,
+      "holdout_2026_lift": 0.903,
+      "holdout_2026_geom_daily_pct": -0.0099,
+      "holdout_2026_max_dd_pct": 11.23,
+      "holdout_2026_min_eq_usd": 2566.13,
+      "cons_full_sharpe": -0.162,
+      "cons_geom_daily_pct": -0.0046,
+      "cons_max_dd_pct": 14.91,
+      "cons_min_eq_usd": 2516.54,
+      "cons_2026_sharpe": -0.784,
+      "go_for_m16_6": false
+    },
+    {
+      "variant": "99_M16_FULL_ORTHOGONAL_ENSEMBLE",
+      "const_1x_sharpe": 2.371,
+      "maker_full_sharpe": 2.155,
+      "maker_sharpe_lift": 1.719,
+      "maker_geom_daily_pct": 0.0998,
+      "maker_cagr_pct": 43.97,
+      "maker_max_dd_pct": 15.58,
+      "maker_calmar": 2.82,
+      "maker_min_eq_usd": 2633.96,
+      "maker_final_eq_usd": 11101.44,
+      "maker_worst_24h_pct": -6.25,
+      "maker_monthly_win_pct": 70.2,
+      "maker_yearly_sharpe": {
+        "2023": 2.44,
+        "2024": 2.88,
+        "2025": 1.97,
+        "2026": 1.44
+      },
+      "holdout_2026_sharpe": 1.126,
+      "holdout_2026_lift": 2.368,
+      "holdout_2026_geom_daily_pct": 0.0445,
+      "holdout_2026_max_dd_pct": 13.59,
+      "holdout_2026_min_eq_usd": 2735.74,
+      "cons_full_sharpe": 1.347,
+      "cons_geom_daily_pct": 0.058,
+      "cons_max_dd_pct": 18.22,
+      "cons_min_eq_usd": 2614.42,
+      "cons_2026_sharpe": 0.172,
+      "go_for_m16_6": true
+    }
+  ],
+  "correlation_matrix": {
+    "00_CURRENT_PROD": {
+      "00_CURRENT_PROD": 1.0,
+      "A1_FAST_1H_POST_SETTLE_UNWIND_20BPS": 0.013,
+      "A3_MIDCAP_LOW_VOL_QUALITY_8H": 0.005
+    },
+    "A1_FAST_1H_POST_SETTLE_UNWIND_20BPS": {
+      "00_CURRENT_PROD": 0.013,
+      "A1_FAST_1H_POST_SETTLE_UNWIND_20BPS": 1.0,
+      "A3_MIDCAP_LOW_VOL_QUALITY_8H": 0.293
+    },
+    "A3_MIDCAP_LOW_VOL_QUALITY_8H": {
+      "00_CURRENT_PROD": 0.005,
+      "A1_FAST_1H_POST_SETTLE_UNWIND_20BPS": 0.293,
+      "A3_MIDCAP_LOW_VOL_QUALITY_8H": 1.0
+    }
+  }
+}

@@ -23,27 +23,19 @@ class ColabClient:
         self.colab_bin = shutil.which(colab_bin) or (str(local_bin) if local_bin.exists() else colab_bin)
 
     def get_active_sessions(self) -> list[str]:
-        """Returns list of active Colab session names."""
+        """Returns list of active Colab session names parsed from `colab status`."""
         try:
-            res = subprocess.run([self.colab_bin, "sessions"], capture_output=True, text=True, timeout=60)
+            res = subprocess.run([self.colab_bin, "status"], capture_output=True, text=True, timeout=90)
         except subprocess.TimeoutExpired:
             return []
         lines = (res.stdout + res.stderr).splitlines()
         sessions: list[str] = []
         for raw_line in lines:
             line = raw_line.strip()
-            if (
-                line
-                and not line.startswith("[colab]")
-                and not line.startswith("Session")
-                and not line.startswith("-")
-                and not line.startswith("No active")
-            ):
-                parts = line.split()
-                if parts:
-                    name = parts[0].strip("[]")
-                    if name:
-                        sessions.append(name)
+            if line.startswith("[") and "]" in line and not line.startswith("[colab]"):
+                name = line[1 : line.index("]")].strip()
+                if name:
+                    sessions.append(name)
         return sessions
 
     def is_session_active(self) -> bool:
@@ -81,7 +73,7 @@ class ColabClient:
     def is_drive_mounted(self, drive_path: str = "/content/drive/MyDrive") -> bool:
         """Checks if Google Drive is currently mounted inside the session."""
         code = f'import os\nprint("MOUNTED_TRUE" if os.path.exists({drive_path!r}) else "MOUNTED_FALSE")\n'
-        _, out, _ = self.exec_inline(code, timeout=30)
+        _, out, _ = self.exec_inline(code, timeout=90)
         return "MOUNTED_TRUE" in out
 
     def install_packages(self, packages: list[str]) -> bool:
@@ -142,7 +134,7 @@ class ColabClient:
                 f"os.remove({remote_tar!r}); "
                 "print('BUNDLE_SYNC_OK')"
             )
-            rc, out, _ = self.exec_inline(untar_py, timeout=60)
+            rc, out, _ = self.exec_inline(untar_py, timeout=120)
             return rc == 0 and "BUNDLE_SYNC_OK" in out
         finally:
             bundle_path.unlink(missing_ok=True)
