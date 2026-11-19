@@ -3002,7 +3002,11 @@ class ShadowTradingDaemon:
 
         inv1_ok = self._last_factor_l1_delta <= 0.50
         inv2_ok = len(zombie_stubs) == 0 and core_long_count <= max_side_legs and core_short_count <= max_side_legs
-        inv3_ok = self.intracycle_rebalance_count == 0
+        inv3_ok = (
+            self.intracycle_rebalance_count <= 2
+            if self.enable_intracycle_rebalance
+            else self.intracycle_rebalance_count == 0
+        )
         inv4_ok = core_net_drift_pct <= 0.05
         inv5_ok = (len(open_anomalies) == 0) if not self.enable_anomalies else True
         inv6_ok = (not self.is_halted) and (
@@ -3086,14 +3090,18 @@ class ShadowTradingDaemon:
         equity = max(portfolio.total_equity, 1.0)
         denom = max(core_gross_usd, equity, 1.0)
         dir_net = float(getattr(self.allocator, "last_directional_net_usd", 0.0) or 0.0)
-        net_drift_pct = abs((core_long_usd - core_short_usd) - dir_net) / denom
-        if net_drift_pct >= self.intracycle_drift_threshold_pct:
+        residual_drift_usd = abs((core_long_usd - core_short_usd) - dir_net)
+        net_drift_pct = residual_drift_usd / denom
+        one_side_collapsed = min(core_long_usd, core_short_usd) < 0.20 * max(core_long_usd, core_short_usd)
+        collapsed_unhedged_trigger = one_side_collapsed and residual_drift_usd >= max(250.0, 0.12 * equity)
+        if net_drift_pct >= self.intracycle_drift_threshold_pct or collapsed_unhedged_trigger:
             self.intracycle_rebalance_count += 1
             logger.info(
                 f"⚖️ Intra-cycle Core neutrality drift detected: "
                 f"Long=${core_long_usd:,.1f} vs Short=${core_short_usd:,.1f} "
-                f"(Gross=${core_gross_usd:,.1f}, Net Drift={net_drift_pct * 100:.1f}% >= {self.intracycle_drift_threshold_pct * 100:.1f}%). "
-                f"Triggering automatic neutrality rebalance."
+                f"(Gross=${core_gross_usd:,.1f}, Residual=${residual_drift_usd:,.1f}, "
+                f"Net Drift={net_drift_pct * 100:.1f}%). "
+                f"Triggering automatic 15m post-bracket neutrality rebalance."
             )
             return True
         return False
@@ -3820,9 +3828,10 @@ class ShadowTradingDaemon:
 
         # 4. Check if rebalance is due (8h UTC funding-aligned clock, fixed interval, or intra-cycle drift)
         rebalance_due = False
-        if self.last_rest_tickers_ok and (
-            self._is_scheduled_rebalance_due(now) or self.is_intracycle_rebalance_needed(now)
-        ):
+        scheduled_due = self._is_scheduled_rebalance_due(now)
+        if self.last_rest_tickers_ok and (scheduled_due or self.is_intracycle_rebalance_needed(now)):
+            if scheduled_due:
+                self.intracycle_rebalance_count = 0
             rebalance_due = True
 
         rebalance_orders = []
