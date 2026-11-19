@@ -46,6 +46,14 @@ from src.features.market_impact import (
     CapitalCapacityCeiling,
     NonLinearMarketImpactModel,
 )
+from src.features.multimodal_alpha import (
+    MultiModalFeatureConfig,
+    attach_forward_returns_for_audit,
+    compute_cross_sectional_panel_features,
+    compute_symbol_multimodal_features,
+    evaluate_walk_forward_feature_atlas,
+    list_multimodal_feature_columns,
+)
 from src.features.sector_clustering import SectorTaxonomy, StatisticalSectorClusterer
 from src.risk.hrp_allocator import HierarchicalRiskParity
 from src.strategies.extreme_anomaly import (
@@ -474,13 +482,504 @@ def run_cointegration_benchmark(
     return df_pairs
 
 
+# ==============================================================================
+# SUITE 6: M16-2 MULTI-MODAL FEATURE IC & CONDITIONAL PAYOFF ATLAS (220 PERPS)
+# ==============================================================================
+def _build_existing_sleeves_daily_proxy(panel: pd.DataFrame) -> pd.Series:
+    """
+    Constructs a causal daily return proxy of our existing 3 production pillars
+    (Core 7-Factor Cross-Sectional Momentum/Carry + P2 BTC/ETH/SOL TSMOM + Phase 2 Breakout/Pullback Snipers)
+    to measure true out-of-sample orthogonality (`corr_to_existing_sleeves`) for every candidate feature.
+    """
+    df = panel[["decision_ts", "symbol", "ret_24h", "funding_rate_bps", "rvol_shock_1h_vs_24h", "fwd_ret_4h"]].dropna(
+        subset=["fwd_ret_4h"]
+    )
+    if df.empty:
+        return pd.Series(dtype=np.float64)
+    day = pd.to_datetime(df["decision_ts"], unit="s", utc=True).dt.floor("D")
+    # Pillar 1 proxy: Cross-sectional 24h momentum minus funding carry
+    p1_score = df.groupby("decision_ts")["ret_24h"].transform(
+        lambda s: (s - s.mean()) / max(float(s.std()), 1e-8)
+    ) - 0.35 * np.sign(df["funding_rate_bps"])
+    p1_daily = (p1_score * df["fwd_ret_4h"]).groupby(day).mean()
+
+    # Pillar 2 proxy: Majors (BTC/ETH/SOL) directional TSMOM
+    majors = df[df["symbol"].isin(["BTCUSDT", "ETHUSDT", "SOLUSDT"])]
+    if not majors.empty:
+        m_day = pd.to_datetime(majors["decision_ts"], unit="s", utc=True).dt.floor("D")
+        p2_daily = (np.sign(majors["ret_24h"]) * majors["fwd_ret_4h"]).groupby(m_day).mean()
+    else:
+        p2_daily = pd.Series(0.0, index=p1_daily.index)
+
+    # Pillar 3 (Phase 2 Snipers) proxy: High-RVOL ignition / dip-bounce events
+    sn_mask = df["rvol_shock_1h_vs_24h"] >= 2.2
+    if int(sn_mask.sum()) >= 20:
+        sn_df = df[sn_mask]
+        sn_day = pd.to_datetime(sn_df["decision_ts"], unit="s", utc=True).dt.floor("D")
+        p3_daily = (np.sign(sn_df["ret_24h"]) * sn_df["fwd_ret_4h"]).groupby(sn_day).mean()
+    else:
+        p3_daily = pd.Series(0.0, index=p1_daily.index)
+
+    combined = (
+        0.55 * p1_daily
+        + 0.30 * p2_daily.reindex(p1_daily.index).fillna(0.0)
+        + 0.15 * p3_daily.reindex(p1_daily.index).fillna(0.0)
+    )
+    return combined
+
+
+def run_m16_feature_atlas_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    max_shards: int = 20,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict:
+    """
+    Streams all 20 shards (`220` Point-in-Time symbols, `2023–2026`) from `m16_data_dir`,
+    synthesizes ~102 strictly causal multi-modal features on a `15m` microstructure grid,
+    and generates the Walk-Forward (`2023–2024` Train / `2025` Val / `2026` Holdout)
+    IC & Conditional Tail Payoff Atlas (`reports/m16_2_feature_atlas_*`).
+    """
+    if colab_session:
+        from src.cloud.colab_client import ColabClient
+
+        client = ColabClient(session_name=colab_session)
+        print(f"[*] Provisioning Colab CPU session '{colab_session}' for M16-2 Feature Atlas...", flush=True)
+        if not client.ensure_session(gpu=None):
+            raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+        try:
+            if not client.is_drive_mounted():
+                rc_m, out_m, err_m = client.mount_drive("/content/drive")
+                print(f"[*] Drive mount ({rc_m}): {(out_m or err_m).strip()}", flush=True)
+            assert client.is_drive_mounted(), "Google Drive mount required at /content/drive/MyDrive"
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing project codebase bundle to Colab"
+            client.exec_inline("import os; os.makedirs('/content/reports', exist_ok=True)", timeout=30)
+
+            drive_m16 = "/content/drive/MyDrive/trading/crypto-alpha-engine/data/m16_multimodal"
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/m16_atlas.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                f"'--suite', 'm16-feature-atlas', '--m16-data-dir', '{drive_m16}', "
+                f"'--max-shards', '{max_shards}', '--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/m16_atlas.pid', 'w').write(str(p.pid)); "
+                "print(f'ATLAS_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=60)
+            print(f"[+] Launched remote M16-2 Atlas ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            import time
+
+            seen = 0
+            while True:
+                time.sleep(20.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/m16_atlas.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}'); "
+                    "lines = open('/content/m16_atlas.log').read().splitlines() if os.path.exists('/content/m16_atlas.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, _ = client.exec_inline(poll_py, timeout=60)
+                if rc_p != 0:
+                    continue
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "M16_2_ATLAS_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote M16-2 Atlas process terminated before completion; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "m16_2_feature_atlas_4h.csv",
+                "m16_2_feature_atlas_1h.csv",
+                "m16_2_feature_atlas_summary.json",
+                "m16_2_feature_atlas_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            print(f"[+] Downloaded M16-2 Atlas artifacts into {output_dir}", flush=True)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            else:
+                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+
+    # In-VM / Local Shard-Streaming Execution
+    from concurrent.futures import ThreadPoolExecutor
+    import gc
+    import json
+    import time
+
+    t0 = time.time()
+    stage_dir: Path | None = None
+    if rclone_stream:
+        import shutil
+        import subprocess
+
+        stage_dir = Path("/tmp/m16_rclone_stage")
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        m16_data_dir = stage_dir
+        subprocess.run(
+            ["rclone", "copy", f"{rclone_stream.rstrip('/')}/universe_catalog.parquet", str(stage_dir)],
+            check=True,
+        )
+
+    try:
+        cat_path = m16_data_dir / "universe_catalog.parquet"
+        onboard_map: dict[str, int] = {}
+        if cat_path.exists():
+            cat_df = pd.read_parquet(cat_path)
+            onboard_map = dict(zip(cat_df["symbol"].astype(str), cat_df["onboard_timestamp"].astype(int), strict=False))
+
+        cfg = MultiModalFeatureConfig(decision_freq="15min", metrics_safety_lag_sec=60, min_adv_usd=15_000_000.0)
+        if rclone_stream:
+            shard_names = [f"shard_{i:02d}.parquet" for i in range(max_shards)]
+        else:
+            shard_files = sorted((m16_data_dir / "bars_1m").glob("shard_*.parquet"))[:max_shards]
+            if not shard_files:
+                raise FileNotFoundError(f"No shard_*.parquet files found under {m16_data_dir / 'bars_1m'}")
+            shard_names = [p.name for p in shard_files]
+
+        src_label = rclone_stream if rclone_stream else str(m16_data_dir)
+        print(
+            f"🔬 M16-2 Multi-Modal Feature Atlas | Streaming {len(shard_names)} shards from {src_label}...",
+            flush=True,
+        )
+        panel_chunks: list[pd.DataFrame] = []
+
+        def _fetch_rclone_shard(sh_name: str) -> None:
+            import subprocess
+
+            assert rclone_stream is not None and stage_dir is not None
+            for sub_mod in ("bars_1m", "spot_bars_1m", "metrics_5m", "funding"):
+                dst_sub = stage_dir / sub_mod
+                dst_sub.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        "--multi-thread-cutoff=16M",
+                        f"{rclone_stream.rstrip('/')}/{sub_mod}/{sh_name}",
+                        str(dst_sub),
+                    ],
+                    check=True,
+                )
+
+        def _proc_sym_task(
+            item: tuple[str, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None],
+        ) -> pd.DataFrame | None:
+            sym_k, p_bars, s_bars, m_bars, f_bars = item
+            f_df = compute_symbol_multimodal_features(
+                perp_bars=p_bars,
+                spot_bars=s_bars,
+                metrics_5m=m_bars,
+                funding=f_bars,
+                symbol=sym_k,
+                onboard_timestamp=onboard_map.get(sym_k),
+                config=cfg,
+            )
+            if f_df.empty:
+                return None
+            f_df = attach_forward_returns_for_audit(f_df, {"1h": 4, "4h": 16, "8h": 32})
+            fnd_abs = f_df["funding_rate_bps"].abs() if "funding_rate_bps" in f_df.columns else 0.0
+            keep_mask = (f_df["decision_ts"] % 3600 == 0) | ((f_df["decision_ts"] % 3600 == 1800) & (fnd_abs >= 15.0))
+            if sym_k != "BTCUSDT":
+                keep_mask = keep_mask & (f_df["adv_7d_usd_lag1"] >= 10_000_000.0)
+            sub = f_df.loc[keep_mask].copy()
+            if sub.empty:
+                return None
+            for col in sub.columns:
+                if col not in ("timestamp", "decision_ts", "symbol") and sub[col].dtype == np.float64:
+                    sub[col] = sub[col].astype(np.float32)
+            return sub
+
+        import os
+
+        perp_cols = [
+            "symbol",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "taker_buy_quote_volume",
+        ]
+        spot_cols = ["symbol", "timestamp", "close", "quote_volume", "taker_buy_quote_volume"]
+        worker_cnt = min(2, max(1, os.cpu_count() or 2))
+
+        def _rss_mb() -> float:
+            try:
+                for ln in Path("/proc/self/status").read_text().splitlines():
+                    if ln.startswith("VmRSS:"):
+                        return int(ln.split()[1]) / 1024.0
+            except Exception:
+                pass
+            return 0.0
+
+        prefetch_pool = ThreadPoolExecutor(max_workers=1) if rclone_stream else None
+        prefetch_fut = prefetch_pool.submit(_fetch_rclone_shard, shard_names[0]) if prefetch_pool else None
+
+        for idx_sh, sh_name in enumerate(shard_names):
+            t_sh = time.time()
+            if prefetch_fut is not None:
+                prefetch_fut.result()
+                if prefetch_pool is not None and idx_sh + 1 < len(shard_names):
+                    prefetch_fut = prefetch_pool.submit(_fetch_rclone_shard, shard_names[idx_sh + 1])
+                else:
+                    prefetch_fut = None
+
+            sh_path = m16_data_dir / "bars_1m" / sh_name
+            b1m_all = pd.read_parquet(sh_path, columns=perp_cols)
+            sp_path = m16_data_dir / "spot_bars_1m" / sh_name
+            met_path = m16_data_dir / "metrics_5m" / sh_name
+            fnd_path = m16_data_dir / "funding" / sh_name
+
+            sp_by_sym = (
+                dict(tuple(pd.read_parquet(sp_path, columns=spot_cols).groupby("symbol", observed=True)))
+                if sp_path.exists()
+                else {}
+            )
+            met_by_sym = (
+                dict(tuple(pd.read_parquet(met_path).groupby("symbol", observed=True))) if met_path.exists() else {}
+            )
+            fnd_by_sym = (
+                dict(tuple(pd.read_parquet(fnd_path).groupby("symbol", observed=True))) if fnd_path.exists() else {}
+            )
+            perp_by_sym = dict(tuple(b1m_all.groupby("symbol", observed=True)))
+            del b1m_all
+
+            if rclone_stream:
+                for p_rm in (sh_path, sp_path, met_path, fnd_path):
+                    p_rm.unlink(missing_ok=True)
+
+            sym_keys = sorted(perp_by_sym.keys())
+            tasks = [
+                (
+                    s_k,
+                    perp_by_sym.pop(s_k),
+                    sp_by_sym.pop(s_k, None),
+                    met_by_sym.pop(s_k, None),
+                    fnd_by_sym.pop(s_k, None),
+                )
+                for s_k in sym_keys
+            ]
+            del perp_by_sym, sp_by_sym, met_by_sym, fnd_by_sym
+            with ThreadPoolExecutor(max_workers=worker_cnt) as pool:
+                res_list = list(pool.map(_proc_sym_task, tasks))
+            del tasks
+            valid_sh = [r for r in res_list if r is not None and not r.empty]
+            del res_list
+            if valid_sh:
+                sh_panel = pd.concat(valid_sh, ignore_index=True)
+                sh_panel["symbol"] = sh_panel["symbol"].astype("category")
+                panel_chunks.append(sh_panel)
+                n_rows_sh = len(sh_panel)
+            else:
+                n_rows_sh = 0
+            del valid_sh
+            gc.collect()
+            rss_now = _rss_mb()
+            rss_str = f" | RSS={rss_now:.0f}MB" if rss_now > 0 else ""
+            print(
+                f"  ✓ Processed {sh_name} ({n_rows_sh:,} sampled rows) in {time.time() - t_sh:.1f}s{rss_str}",
+                flush=True,
+            )
+
+        if prefetch_pool is not None:
+            prefetch_pool.shutdown(wait=True)
+    finally:
+        if stage_dir is not None and stage_dir.exists():
+            import shutil
+
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+    print("[*] Assembling 220-symbol cross-sectional panel & Family D orthogonal ranks...", flush=True)
+    raw_panel = pd.concat(panel_chunks, ignore_index=True)
+    del panel_chunks
+    gc.collect()
+    raw_panel["symbol"] = raw_panel["symbol"].astype(str)
+    full_panel = compute_cross_sectional_panel_features(raw_panel, inplace=True)
+    del raw_panel
+    gc.collect()
+
+    all_feat_cols = list_multimodal_feature_columns(full_panel)
+    print(f"[*] Total Panel Rows: {len(full_panel):,} | Total Multi-Modal Features: {len(all_feat_cols)}", flush=True)
+
+    bench_daily = _build_existing_sleeves_daily_proxy(full_panel)
+    print(
+        "[*] Evaluating Walk-Forward Atlas (2023-2024 Train -> 2025 Val -> 2026 Holdout) for 4h & 1h horizons...",
+        flush=True,
+    )
+    atlas_4h = evaluate_walk_forward_feature_atlas(
+        full_panel,
+        fwd_col="fwd_ret_4h",
+        tail_z_threshold=2.0,
+        maker_roundtrip_bps=3.2,
+        taker_roundtrip_bps=9.0,
+        periods_per_year=365.25 * 6.0,
+        benchmark_daily_pnl=bench_daily,
+    )
+    atlas_1h = evaluate_walk_forward_feature_atlas(
+        full_panel,
+        fwd_col="fwd_ret_1h",
+        tail_z_threshold=2.2,
+        maker_roundtrip_bps=3.2,
+        taker_roundtrip_bps=9.0,
+        periods_per_year=365.25 * 24.0,
+        benchmark_daily_pnl=bench_daily,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atlas_4h.to_csv(output_dir / "m16_2_feature_atlas_4h.csv", index=False)
+    atlas_1h.to_csv(output_dir / "m16_2_feature_atlas_1h.csv", index=False)
+
+    consistent_4h = atlas_4h[(atlas_4h["sign_consistent_3_eras"]) & (atlas_4h["corr_to_existing_sleeves"].abs() < 0.35)]
+    consistent_1h = atlas_1h[(atlas_1h["sign_consistent_3_eras"]) & (atlas_1h["corr_to_existing_sleeves"].abs() < 0.35)]
+
+    summary = {
+        "issue": "M16-2 (#68)",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "total_panel_rows": int(len(full_panel)),
+        "unique_symbols_evaluated": int(full_panel["symbol"].nunique()),
+        "total_features_evaluated": len(all_feat_cols),
+        "orthogonal_sign_consistent_4h_count": int(len(consistent_4h)),
+        "orthogonal_sign_consistent_1h_count": int(len(consistent_1h)),
+        "top_15_4h_features": atlas_4h.head(15).to_dict(orient="records"),
+        "top_15_1h_features": atlas_1h.head(15).to_dict(orient="records"),
+    }
+    (output_dir / "m16_2_feature_atlas_summary.json").write_text(json.dumps(summary, indent=2))
+
+    md_lines = [
+        "# M16-2 Multi-Modal Microstructure Feature Atlas (2023–2026 Walk-Forward)",
+        "",
+        f"- **Universe Evaluated:** `{summary['unique_symbols_evaluated']}` Point-in-Time USDS-M Perpetuals (`{summary['total_panel_rows']:,}` 30m decision rows, `ADV_7d >= $15M` tradable gate)",
+        f"- **Causal Features Audited:** `{summary['total_features_evaluated']}` across Families A, B, C, and D (`+60s` metrics safety lag, causal settlement clock)",
+        f"- **Sign-Consistent Orthogonal Features (`|corr| < 0.35` across all 3 eras):** `{summary['orthogonal_sign_consistent_4h_count']}` (`4h` horizon) | `{summary['orthogonal_sign_consistent_1h_count']}` (`1h` horizon)",
+        "",
+        "## Top 20 Features — 4h Horizon (Ranked by Out-of-Sample Composite Score)",
+        "",
+        "| Rank | Feature | Family | Pol | Train t | Val 2025 t | Holdout 2026 t | 2026 Tail Net Maker (bps) | 2026 Tail Net Taker (bps) | Corr to Existing | 3-Era Consistent |",
+        "| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for idx_r, r in atlas_4h.head(20).iterrows():
+        md_lines.append(
+            f"| {idx_r + 1} | `{r['feature']}` | `{r['family']}` | `{r['train_polarity']:+d}` | "
+            f"`{r['train_ic_tstat']:+.2f}` | `{r['val_2025_ic_tstat']:+.2f}` | **`{r['holdout_2026_ic_tstat']:+.2f}`** | "
+            f"**`{r['holdout_2026_tail_net_maker_bps']:+.1f}`** | `{r['holdout_2026_tail_net_taker_bps']:+.1f}` | "
+            f"`{r['corr_to_existing_sleeves']:+.2f}` | `{'YES' if r['sign_consistent_3_eras'] else 'no'}` |"
+        )
+
+    md_lines.extend(
+        [
+            "",
+            "## Top 15 Features — 1h Fast Sniper Horizon",
+            "",
+            "| Rank | Feature | Family | Pol | Train t | Val 2025 t | Holdout 2026 t | 2026 Tail Net Maker (bps) | Corr to Existing | 3-Era Consistent |",
+            "| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for idx_r, r in atlas_1h.head(15).iterrows():
+        md_lines.append(
+            f"| {idx_r + 1} | `{r['feature']}` | `{r['family']}` | `{r['train_polarity']:+d}` | "
+            f"`{r['train_ic_tstat']:+.2f}` | `{r['val_2025_ic_tstat']:+.2f}` | **`{r['holdout_2026_ic_tstat']:+.2f}`** | "
+            f"**`{r['holdout_2026_tail_net_maker_bps']:+.1f}`** | `{r['corr_to_existing_sleeves']:+.2f}` | "
+            f"`{'YES' if r['sign_consistent_3_eras'] else 'no'}` |"
+        )
+
+    (output_dir / "m16_2_feature_atlas_report.md").write_text("\n".join(md_lines) + "\n")
+
+    drive_root = Path("/content/drive/MyDrive/trading/crypto-alpha-engine")
+    if drive_root.exists():
+        import shutil
+
+        drive_reports = drive_root / "reports"
+        drive_reports.mkdir(parents=True, exist_ok=True)
+        for fname in (
+            "m16_2_feature_atlas_4h.csv",
+            "m16_2_feature_atlas_1h.csv",
+            "m16_2_feature_atlas_summary.json",
+            "m16_2_feature_atlas_report.md",
+        ):
+            shutil.copy2(output_dir / fname, drive_reports / fname)
+        panel_dir = drive_root / "data" / "m16_multimodal" / "features_panel"
+        panel_dir.mkdir(parents=True, exist_ok=True)
+        full_panel.to_parquet(panel_dir / "m16_2_causal_panel.parquet", compression="zstd", compression_level=9)
+        print(f"[+] Persisted Atlas reports & causal panel to Google Drive ({drive_root})", flush=True)
+    elif rclone_stream:
+        import subprocess
+
+        tmp_panel = Path("/tmp/m16_2_causal_panel.parquet")
+        try:
+            full_panel.to_parquet(tmp_panel, compression="zstd", compression_level=9)
+            subprocess.run(
+                ["rclone", "copy", str(tmp_panel), f"{rclone_stream.rstrip('/')}/features_panel/"],
+                check=False,
+            )
+        finally:
+            tmp_panel.unlink(missing_ok=True)
+
+    print("M16_2_ATLAS_COMPLETE!", flush=True)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
         "--suite",
-        choices=["all", "hrp", "info-bars", "market-impact", "anomalies", "cointegration"],
+        choices=["all", "hrp", "info-bars", "market-impact", "anomalies", "cointegration", "m16-feature-atlas"],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
+    )
+    parser.add_argument(
+        "--m16-data-dir",
+        type=str,
+        default="/tmp/m16_multimodal",
+        help="Path to M16-1 sharded multi-modal directory (or mounted Google Drive path on Colab).",
+    )
+    parser.add_argument(
+        "--max-shards",
+        type=int,
+        default=20,
+        help="Number of M16-1 shards to stream during m16-feature-atlas (default: 20).",
+    )
+    parser.add_argument(
+        "--colab-session",
+        type=str,
+        default=None,
+        help="Optional Colab session name to run m16-feature-atlas remotely against Google Drive.",
+    )
+    parser.add_argument(
+        "--keep-colab",
+        action="store_true",
+        help="Keep the Colab session & Google Drive mount alive across M16-2..M16-5 runs.",
+    )
+    parser.add_argument(
+        "--rclone-stream",
+        type=str,
+        default=None,
+        help="Optional rclone remote dir (e.g. gdrive:trading/.../m16_multimodal) for zero-residue shard streaming.",
     )
     parser.add_argument(
         "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path."
@@ -533,6 +1032,15 @@ def main() -> None:
             run_pure_anomalies_benchmark(cache_dir=cache_path)
         elif s_name == "cointegration":
             run_cointegration_benchmark(cache_dir=cache_path, lookback=args.lookback)
+        elif s_name == "m16-feature-atlas":
+            run_m16_feature_atlas_benchmark(
+                m16_data_dir=Path(args.m16_data_dir),
+                output_dir=out_dir,
+                max_shards=args.max_shards,
+                colab_session=args.colab_session,
+                keep_colab=args.keep_colab,
+                rclone_stream=args.rclone_stream,
+            )
 
 
 if __name__ == "__main__":

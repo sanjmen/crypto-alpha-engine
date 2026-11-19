@@ -7,6 +7,7 @@ remote script execution, keep-alive heartbeat, and clean lifecycle management.
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 
 
@@ -18,7 +19,8 @@ class ColabClient:
 
     def __init__(self, session_name: str = "crypto_data_ingest", colab_bin: str = "colab") -> None:
         self.session_name = session_name
-        self.colab_bin = shutil.which(colab_bin) or colab_bin
+        local_bin = Path.home() / ".local" / "bin" / "colab"
+        self.colab_bin = shutil.which(colab_bin) or (str(local_bin) if local_bin.exists() else colab_bin)
 
     def get_active_sessions(self) -> list[str]:
         """Returns list of active Colab session names."""
@@ -108,6 +110,42 @@ class ColabClient:
             return res.returncode == 0
         except subprocess.TimeoutExpired:
             return False
+
+    def sync_codebase(
+        self,
+        repo_root: str | Path,
+        subdirs: tuple[str, ...] = ("src", "scripts"),
+        remote_root: str = "/content",
+    ) -> bool:
+        """Bundles `src/` and `scripts/` into a single compressed tarball and extracts on the Colab VM."""
+        root = Path(repo_root).resolve()
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            bundle_path = Path(tmp.name)
+        try:
+            with tarfile.open(bundle_path, "w:gz") as tf:
+                for sub in subdirs:
+                    sub_dir = root / sub
+                    if not sub_dir.exists():
+                        continue
+                    for p in sub_dir.rglob("*"):
+                        if "__pycache__" in p.parts or p.suffix in (".pyc", ".pyo"):
+                            continue
+                        if p.is_file():
+                            tf.add(p, arcname=str(p.relative_to(root)))
+            remote_tar = f"{remote_root.rstrip('/')}/_code_bundle.tar.gz"
+            if not self.upload(bundle_path, remote_tar):
+                return False
+            untar_py = (
+                "import os, tarfile; "
+                f"os.makedirs({remote_root!r}, exist_ok=True); "
+                f"tarfile.open({remote_tar!r}, 'r:gz').extractall({remote_root!r}); "
+                f"os.remove({remote_tar!r}); "
+                "print('BUNDLE_SYNC_OK')"
+            )
+            rc, out, _ = self.exec_inline(untar_py, timeout=60)
+            return rc == 0 and "BUNDLE_SYNC_OK" in out
+        finally:
+            bundle_path.unlink(missing_ok=True)
 
     def download(self, remote_path: str, local_path: str | Path) -> bool:
         """Downloads a remote file from the Colab session."""
