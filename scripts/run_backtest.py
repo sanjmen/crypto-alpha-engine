@@ -50,6 +50,7 @@ from src.strategies.dollar_bar_tsmom import CausalDollarBarTSMOMEngine
 from src.strategies.event_snipers import (
     SNIPER_BRACKET_PROFILES,
     SNIPER_M04_STRAT,
+    SNIPER_M25_STRAT,
     EventDrivenSniperEngine,
 )
 from src.strategies.extreme_anomaly import (
@@ -398,6 +399,7 @@ def run_simulation(
     dollar_bar_max_gross: float = 0.95,
     core_p1_risk_scale: float = 0.85,
     enable_event_snipers: bool = False,
+    enable_post_settle_sniper: bool = True,
     sniper_slot_leverage: float = 0.24,
     sniper_max_positions: int = 3,
     cushion_floor_usd: float | None = None,
@@ -612,6 +614,32 @@ def run_simulation(
                     rank_15m=rk_1h_m,
                 )
             )
+            if enable_post_settle_sniper:
+                f_settle_mat = pd.DataFrame(0.0, index=calc_idx, columns=valid_symbols)
+                for sym in valid_symbols:
+                    if sym in funding_dict and not funding_dict[sym].empty:
+                        f_raw_s = funding_dict[sym]["funding_rate"]
+                        f_raw_s = f_raw_s[~f_raw_s.index.duplicated(keep="last")]
+                        f_settle_mat[sym] = f_raw_s.reindex(calc_idx).fillna(0.0)
+                f_settle_arr = f_settle_mat.values.astype(float)
+                adv_24h_usd = adv_30d.values.astype(float) * 24.0
+                settle_t, settle_j = np.where(
+                    (f_settle_arr <= sniper_eng.m25_max_funding_rate)
+                    & (adv_24h_usd >= sniper_eng.m25_min_volume_24h_usd)
+                )
+                for t_m25, j_m25 in zip(settle_t.tolist(), settle_j.tolist(), strict=False):
+                    if 24 <= t_m25 < len(t_grid_1h) - 1:
+                        sc_m25 = float(abs(f_settle_arr[t_m25, j_m25]) * 10_000.0)
+                        raw_evs.append(
+                            (
+                                int(t_grid_1h[t_m25]),
+                                int(j_m25),
+                                -1,
+                                SNIPER_M25_STRAT,
+                                sc_m25,
+                                int(rk_1h_m[t_m25, j_m25]),
+                            )
+                        )
             ts_to_eval_t = {int(ts_v): idx_t for idx_t, ts_v in enumerate((eval_idx.view("int64") // 10**9).tolist())}
             for entry_ts_sec, j_ev, side_ev, strat_ev, sc_ev, rk_ev in raw_evs:
                 eval_t = ts_to_eval_t.get(int(entry_ts_sec)) or ts_to_eval_t.get(int(entry_ts_sec) + 2700)
@@ -832,30 +860,29 @@ def run_simulation(
                 adv_r = sgn_sn * (adv_px - ep_sn) / ep_sn
                 stop_r = -prof.stop_loss_pct
                 if bool(sn["lock"]):
-                    stop_r = max(stop_r, prof.profit_lock_level_pct)
+                    stop_r = max(stop_r, prof.lock_level_pct)
                 peak_r = sgn_sn * (peak_sn - ep_sn) / ep_sn
-                if peak_r >= prof.trailing_trigger_pct:
-                    stop_r = max(stop_r, peak_r - prof.trailing_distance_pct)
+                if peak_r >= prof.trail_trigger_pct:
+                    stop_r = max(stop_r, peak_r - prof.trail_distance_pct)
                 ex_sn = False
                 ex_px_sn = cur_c[j_sn]
                 ex_fee_sn = 0.00055
+                max_hold_bars = max(1, int(round(prof.max_hold_hours)))
                 if adv_r <= stop_r:
                     ex_px_sn, ex_fee_sn, ex_sn = ep_sn * (1.0 + sgn_sn * stop_r), 0.00055, True
                 elif fav_r >= prof.take_profit_pct:
                     ex_px_sn, ex_fee_sn, ex_sn = ep_sn * (1.0 + sgn_sn * prof.take_profit_pct), 0.00020, True
-                elif (t - int(sn["open_t"]) + 1) >= int(round(prof.max_hold_hours)):
+                elif (t - int(sn["open_t"]) + 1) >= max_hold_bars:
                     ex_px_sn, ex_fee_sn, ex_sn = cur_c[j_sn], 0.00055, True
                 else:
-                    if fav_r >= prof.profit_lock_trigger_pct:
+                    if fav_r >= prof.lock_trigger_pct:
                         sn["lock"] = True
                 if ex_sn:
                     bar_gross += w_sn * ((ex_px_sn - cur_o[j_sn]) / cur_o[j_sn])
                     bar_fee += abs(w_sn) * ex_fee_sn
                     bar_turn += abs(w_sn)
                     was_loss_sn = (sgn_sn * (ex_px_sn - ep_sn)) < 0.0
-                    sniper_cooldown_until[j_sn] = t + int(
-                        round(prof.loss_cooldown_hours if was_loss_sn else prof.win_cooldown_hours)
-                    )
+                    sniper_cooldown_until[j_sn] = t + (4 if was_loss_sn else 1)
                     del active_snipers[j_sn]
                 else:
                     bar_gross += w_sn * ((cur_c[j_sn] - cur_o[j_sn]) / cur_o[j_sn])
@@ -1350,7 +1377,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-event-snipers",
         action="store_true",
         default=False,
-        help="Enable Phase 2 Event-Driven Microstructure Snipers (M09, M23, M04).",
+        help="Enable Phase 2 Event-Driven Microstructure Snipers (M09, M23, M04, M25).",
+    )
+    parser.add_argument(
+        "--enable-m16-post-settle",
+        dest="enable_post_settle_sniper",
+        action="store_true",
+        default=True,
+        help="Enable M16-6 Post-Settlement Negative-Funding Unwind Sniper M25 when Event Snipers are active (default: True).",
+    )
+    parser.add_argument(
+        "--disable-m16-post-settle",
+        dest="enable_post_settle_sniper",
+        action="store_false",
+        help="Disable M16-6 Post-Settlement Negative-Funding Unwind Sniper M25.",
     )
     parser.add_argument(
         "--sniper-slot-leverage",
@@ -1470,6 +1510,7 @@ def main() -> None:
         enable_btc_lead_lag=args.enable_btc_lead_lag,
         enable_dollar_bar_tsmom=args.enable_dollar_bar_tsmom,
         enable_event_snipers=args.enable_event_snipers,
+        enable_post_settle_sniper=args.enable_post_settle_sniper,
         sniper_slot_leverage=args.sniper_slot_leverage,
         sniper_max_positions=args.sniper_max_positions,
         cushion_floor_usd=args.cushion_floor_usd,

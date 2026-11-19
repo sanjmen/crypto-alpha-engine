@@ -247,6 +247,58 @@ class SmartExecutionRouter:
         aggregated_order.quantity = quantity
         return aggregated_order
 
+    def route_passive_gtx_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        current_price: float,
+        best_bid: float | None = None,
+        best_ask: float | None = None,
+        offset_bps: float = 1.5,
+        ttl_sec: float = 90.0,
+        strategy: str | None = None,
+    ) -> Order:
+        """
+        Routes a 100% passive Post-Only (`GTX`) Maker limit order at `offset_bps`
+        into the passive book (`<= best_bid` for BUY, `>= best_ask` for SELL) with
+        strict `ttl_sec` expiration and zero Taker fallback (validated in M16-3).
+        """
+        off_frac = max(0.0, float(offset_bps)) / 10_000.0
+        if side == OrderSide.BUY:
+            anchor = float(best_bid) if (best_bid is not None and best_bid > 0) else float(current_price)
+            limit_px = anchor * (1.0 - off_frac)
+        else:
+            anchor = float(best_ask) if (best_ask is not None and best_ask > 0) else float(current_price)
+            limit_px = anchor * (1.0 + off_frac)
+
+        fn_gtx = getattr(self.broker, "create_passive_gtx_order", None)
+        if callable(fn_gtx):
+            order = fn_gtx(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                limit_price=limit_px,
+                ttl_sec=ttl_sec,
+                strategy=strategy,
+            )
+            self.last_chunked_orders = [order]
+            return order
+
+        extra_kwargs = (
+            {"strategy": strategy} if (strategy is not None and self._broker_accepts_strategy_kwarg()) else {}
+        )
+        order = self.broker.create_order(
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=quantity,
+            price=limit_px,
+            **extra_kwargs,
+        )
+        self.last_chunked_orders = [order]
+        return order
+
     @staticmethod
     def estimate_maker_fill_probability(
         distance_to_mid_bps: float,

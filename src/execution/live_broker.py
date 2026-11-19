@@ -801,6 +801,199 @@ class BinanceLiveBroker(CCXTExecutionAdapter):
             self.orders[last_order_id] = final_order
         return final_order
 
+    def place_passive_gtx_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        limit_price: float,
+        reduce_only: bool = False,
+    ) -> tuple[Order, str]:
+        """
+        Places a non-blocking Post-Only (`timeInForce='GTX'`) passive Maker limit order
+        without Taker fallback, returning `(order, exchange_order_id)` for fast-cycle TTL
+        monitoring via `sync_or_cancel_gtx_order`.
+        """
+        q_amt = self.quantize_amount(symbol, quantity)
+        if q_amt <= 0:
+            raise ValueError(f"Quantized amount for {symbol} is zero ({quantity})")
+
+        bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=limit_price)
+        spread = max(ask - bid, bid * 0.0001, 1e-8)
+        if side == OrderSide.BUY:
+            passive_raw = min(float(limit_price), bid)
+            if passive_raw >= ask:
+                passive_raw = ask - spread
+        else:
+            passive_raw = max(float(limit_price), ask)
+            if passive_raw <= bid:
+                passive_raw = bid + spread
+
+        target_px = self.quantize_price(symbol, passive_raw)
+        if not reduce_only:
+            self.verify_risk_circuit_breakers(symbol, q_amt, target_px)
+
+        local_id = f"gtx_{uuid.uuid4().hex[:10]}"
+        if self.dry_run:
+            order = Order(
+                id=local_id,
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=q_amt,
+                price=target_px,
+                status=OrderStatus.PENDING,
+                filled_quantity=0.0,
+                average_fill_price=0.0,
+                created_at=datetime.now(timezone.utc),
+            )
+            with self._lock:
+                self.orders[local_id] = order
+            return order, local_id
+
+        ccxt_side = "buy" if side == OrderSide.BUY else "sell"
+        params: dict[str, Any] = {"timeInForce": "GTX"}
+        if reduce_only:
+            params["reduceOnly"] = True
+
+        res: dict[str, Any] | None = None
+        for attempt in range(2):
+            try:
+                res = self.client.create_order(
+                    symbol=symbol,
+                    type="limit",
+                    side=ccxt_side,
+                    amount=q_amt,
+                    price=target_px,
+                    params=params,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 0:
+                    bid, ask = self.fetch_best_bid_ask(symbol, fallback_price=target_px)
+                    backoff = max(ask - bid, bid * 0.00025, 1e-8)
+                    re_px = (bid - backoff) if side == OrderSide.BUY else (ask + backoff)
+                    target_px = self.quantize_price(symbol, re_px)
+                else:
+                    raise exc
+
+        ex_id = str((res or {}).get("id") or local_id)
+        filled_now = float((res or {}).get("filled") or 0.0)
+        avg_now = float((res or {}).get("average") or target_px)
+        status_raw = str((res or {}).get("status") or "").lower()
+        is_closed = status_raw in ("closed", "filled") or (q_amt > 0 and filled_now >= q_amt - 1e-8)
+        if filled_now > 0 and is_closed:
+            self.maker_fills_count += 1
+            self._apply_fill_to_portfolio(symbol, side, filled_now, avg_now)
+
+        order = Order(
+            id=ex_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=q_amt,
+            price=target_px,
+            status=OrderStatus.FILLED if is_closed else OrderStatus.PENDING,
+            filled_quantity=filled_now,
+            average_fill_price=avg_now if filled_now > 0 else 0.0,
+            created_at=datetime.now(timezone.utc),
+        )
+        if filled_now > 0:
+            order._fee_paid = self._extract_order_fee_usd(res, filled_now, avg_now, self.maker_fee_pct)  # type: ignore[attr-defined]
+        with self._lock:
+            self.orders[ex_id] = order
+        return order, ex_id
+
+    def sync_or_cancel_gtx_order(
+        self,
+        exchange_order_id: str,
+        symbol: str,
+        side: OrderSide,
+        expire: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Polls an open Post-Only (`GTX`) limit order on Binance, and cancels any unfilled
+        remainder when `expire=True` (TTL elapsed), returning normalized fill state.
+        """
+        if self.dry_run:
+            with self._lock:
+                ord_dry = self.orders.get(exchange_order_id)
+                if expire and ord_dry is not None and ord_dry.status == OrderStatus.PENDING:
+                    ord_dry.status = OrderStatus.CANCELED
+            return {
+                "status": "canceled" if expire else "open",
+                "filled": 0.0,
+                "average": 0.0,
+                "fee_usd": 0.0,
+            }
+
+        chk = self.client.fetch_order(exchange_order_id, symbol)
+        status_str = str(chk.get("status") or "").lower()
+        filled_q = float(chk.get("filled") or 0.0)
+        avg_px = float(chk.get("average") or chk.get("price") or 0.0)
+        fee_usd = self._extract_order_fee_usd(chk, filled_q, avg_px, self.maker_fee_pct) if filled_q > 0 else 0.0
+
+        if status_str in ("closed", "filled"):
+            self.maker_fills_count += 1
+            if filled_q > 0 and avg_px > 0:
+                self._apply_fill_to_portfolio(symbol, side, filled_q, avg_px)
+            return {
+                "status": "filled",
+                "filled": filled_q,
+                "average": avg_px,
+                "fee_usd": fee_usd,
+            }
+
+        if status_str in ("canceled", "cancelled", "expired", "rejected"):
+            if filled_q > 0 and avg_px > 0:
+                self.maker_fills_count += 1
+                self._apply_fill_to_portfolio(symbol, side, filled_q, avg_px)
+            return {
+                "status": "filled" if filled_q > 0 else "canceled",
+                "filled": filled_q,
+                "average": avg_px,
+                "fee_usd": fee_usd,
+            }
+
+        if expire:
+            try:
+                cancel_res = self.client.cancel_order(exchange_order_id, symbol)
+                if isinstance(cancel_res, dict):
+                    filled_q = max(filled_q, float(cancel_res.get("filled") or 0.0))
+                    avg_px = float(cancel_res.get("average") or cancel_res.get("price") or avg_px)
+                    if filled_q > 0:
+                        fee_usd = self._extract_order_fee_usd(cancel_res, filled_q, avg_px, self.maker_fee_pct)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    chk_after = self.client.fetch_order(exchange_order_id, symbol)
+                    filled_q = max(filled_q, float(chk_after.get("filled") or 0.0))
+                    avg_px = float(chk_after.get("average") or chk_after.get("price") or avg_px)
+                    if filled_q > 0:
+                        fee_usd = self._extract_order_fee_usd(chk_after, filled_q, avg_px, self.maker_fee_pct)
+
+            if filled_q > 0 and avg_px > 0:
+                self.maker_fills_count += 1
+                self._apply_fill_to_portfolio(symbol, side, filled_q, avg_px)
+                return {
+                    "status": "filled",
+                    "filled": filled_q,
+                    "average": avg_px,
+                    "fee_usd": fee_usd,
+                }
+            return {
+                "status": "canceled",
+                "filled": 0.0,
+                "average": 0.0,
+                "fee_usd": 0.0,
+            }
+
+        return {
+            "status": "open",
+            "filled": filled_q,
+            "average": avg_px,
+            "fee_usd": fee_usd,
+        }
+
     def _apply_fill_to_portfolio(
         self,
         symbol: str,

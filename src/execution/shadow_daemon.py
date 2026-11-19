@@ -22,17 +22,20 @@ import pandas as pd
 from src.domain.entities import Order, Portfolio
 from src.domain.enums import (
     OrderSide,
+    OrderStatus,
     OrderType,
     PositionSide,
 )
 from src.execution.execution_router import ExecutionUrgency, SmartExecutionRouter
 from src.execution.feature_flags import FeatureFlags
+from src.execution.multimodal_feeds import LiveMultiModalFeedAdapter
 from src.execution.rate_limiter import ExchangeRateLimiter
 from src.execution.shadow_broker import ShadowExecutionBroker
 from src.execution.ws_manager import PriceTick, ResilientWebSocketClient
 from src.features.volatility import parkinson_volatility
 from src.strategies.event_snipers import (
     SNIPER_BRACKET_PROFILES,
+    SNIPER_M25_STRAT,
     SNIPER_STRATEGIES,
     SNIPER_UNIVERSE_82,
     EventDrivenSniperEngine,
@@ -289,9 +292,17 @@ class ShadowTradingDaemon:
         self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
         self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
         self.sniper_max_positions = int(getattr(self.feature_flags, "sniper_max_positions", 3))
-        self.sniper_engine = EventDrivenSniperEngine()
+        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", True))
+        self.post_settle_max_funding_bps = float(getattr(self.feature_flags, "post_settle_max_funding_bps", -20.0))
+        self.post_settle_gtx_offset_bps = float(getattr(self.feature_flags, "post_settle_gtx_offset_bps", 1.5))
+        self.post_settle_gtx_ttl_sec = float(getattr(self.feature_flags, "post_settle_gtx_ttl_sec", 90.0))
+        self.sniper_engine = EventDrivenSniperEngine(
+            m25_max_funding_rate=self.post_settle_max_funding_bps / 10_000.0,
+        )
         self._last_sniper_15m_bucket: int = -1
         self._last_sniper_1h_bucket: int = -1
+        self._last_sniper_m25_bucket: int = -1
+        self._executed_post_settle_keys: set[tuple[str, int]] = set()
         self.sniper_last_exit: dict[str, tuple[datetime, bool]] = {}
         self._sync_allocator_with_feature_flags()
         self.is_halted: bool = False
@@ -322,6 +333,10 @@ class ShadowTradingDaemon:
             )
             self._install_linear_market_aliases(self.exchange)
 
+        self.multimodal_feeds = LiveMultiModalFeedAdapter(
+            exchange_client=self.exchange,
+            rate_limiter=self.rate_limiter,
+        )
         self.is_running = False
         self._thread: threading.Thread | None = None
         self.last_rebalance_time: datetime | None = None
@@ -406,6 +421,7 @@ class ShadowTradingDaemon:
         self._closed_core_p1_bracket_shift_usd: float = 0.0
         self._closed_core_bracket_syms: set[str] = set()
         self._counted_core_bracket_oids: set[str] = set()
+        self._hydrate_post_settle_dedup_keys()
         self._refresh_anomaly_cooldowns()
         self._sync_kill_switch_directional_target()
         self.last_funding_check_time: datetime | None = None
@@ -441,6 +457,29 @@ class ShadowTradingDaemon:
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"SQLite maintenance note: {exc}")
             return {"total_deleted": 0}
+
+    def _hydrate_post_settle_dedup_keys(self) -> None:
+        """
+        Hydrates `_executed_post_settle_keys` (`(clean_symbol, hour_bucket)`) from recent
+        SQLite `Sniper:M25_PostSettleUnwind` orders so container restarts never fire twice
+        for the same realized settlement hour.
+        """
+        db_inst = getattr(self.broker, "db", None)
+        if not db_inst or not hasattr(db_inst, "get_recent_orders"):
+            return
+        with contextlib.suppress(Exception):
+            for r in db_inst.get_recent_orders(limit=200):
+                if not isinstance(r, dict) or r.get("strategy") != SNIPER_M25_STRAT:
+                    continue
+                if r.get("order_type") != OrderType.LIMIT.value and r.get("order_type") != OrderType.MARKET.value:
+                    continue
+                sym_c = str(r.get("symbol") or "").replace("/", "").split(":")[0].strip().upper()
+                ts_raw = r.get("created_at")
+                if sym_c and ts_raw:
+                    dt_c = datetime.fromisoformat(str(ts_raw))
+                    if dt_c.tzinfo is None:
+                        dt_c = dt_c.replace(tzinfo=timezone.utc)
+                    self._executed_post_settle_keys.add((sym_c, int(dt_c.timestamp()) // 3600))
 
     def _refresh_anomaly_cooldowns(self, filled_orders: list[Order] | None = None) -> None:
         """
@@ -1679,10 +1718,25 @@ class ShadowTradingDaemon:
         # 2. Ensure open positions have active TP and SL bracket orders
         self.ensure_position_brackets()
 
-        # 3. Check pending limit orders against fresh ticks
+        # 3. Check pending limit orders against fresh ticks & reconcile resting Post-Only GTX TTL orders
         filled_orders = self.broker.check_pending_orders(ticks)
+        if hasattr(self.broker, "reconcile_pending_gtx_orders"):
+            gtx_filled, gtx_expired = self.broker.reconcile_pending_gtx_orders(
+                default_ttl_sec=getattr(self, "post_settle_gtx_ttl_sec", 90.0)
+            )
+            if gtx_filled:
+                filled_orders.extend(gtx_filled)
+            if gtx_expired:
+                for exp_o in gtx_expired:
+                    logger.info(
+                        f"⏰ [GTX TTL Expired] Auto-canceled unfilled passive order {exp_o.id} "
+                        f"({exp_o.symbol}, {getattr(exp_o, 'strategy', 'Maker')}) @ ${float(exp_o.price or 0.0):,.4f}"
+                    )
         if filled_orders:
             self._refresh_anomaly_cooldowns(filled_orders)
+            if any(o.order_type == OrderType.LIMIT and o.strategy in SNIPER_STRATEGIES for o in filled_orders):
+                self.ensure_position_brackets()
+                self._sync_kill_switch_directional_target()
 
         # 4. Manage Dynamic Trailing Stop & Profit-Lock Ratchet
         self.manage_trailing_and_profit_locks(ticks)
@@ -1994,6 +2048,7 @@ class ShadowTradingDaemon:
     def manage_trailing_and_profit_locks(
         self,
         ticks: dict[str, dict[str, float]] | None = None,
+        now: datetime | None = None,
     ) -> list[tuple[str, float, float]]:
         """
         Monitors all active positions on each fast cycle to enforce:
@@ -2003,6 +2058,20 @@ class ShadowTradingDaemon:
 
         Returns list of (symbol, old_sl, new_sl) for ratcheted positions.
         """
+        if (
+            self.auto_close_anomalies_when_disabled
+            and (not self.enable_event_snipers or not getattr(self, "enable_post_settle_sniper", True))
+            and hasattr(self.broker, "db")
+            and hasattr(self.broker.db, "get_pending_orders")
+        ):
+            for pend_o in self.broker.db.get_pending_orders():
+                if pend_o.order_type != OrderType.LIMIT:
+                    continue
+                if (not self.enable_event_snipers and pend_o.strategy in SNIPER_STRATEGIES) or (
+                    not getattr(self, "enable_post_settle_sniper", True) and pend_o.strategy == SNIPER_M25_STRAT
+                ):
+                    self.broker.cancel_order(pend_o.id, pend_o.symbol)
+
         portfolio = self.broker.get_portfolio()
         ratcheted: list[tuple[str, float, float]] = []
 
@@ -2042,8 +2111,11 @@ class ShadowTradingDaemon:
             is_anomaly = pos.strategy in ANOMALY_STRATEGIES
             is_sniper = pos.strategy in SNIPER_BRACKET_PROFILES
 
-            # Auto-close open Sniper positions when `enable_event_snipers` is disabled at runtime
-            if is_sniper and (not self.enable_event_snipers and self.auto_close_anomalies_when_disabled):
+            # Auto-close open Sniper positions when `enable_event_snipers` (or `enable_post_settle_sniper` for M25) is disabled at runtime
+            sniper_disabled = (not self.enable_event_snipers) or (
+                pos.strategy == SNIPER_M25_STRAT and not getattr(self, "enable_post_settle_sniper", True)
+            )
+            if is_sniper and (sniper_disabled and self.auto_close_anomalies_when_disabled):
                 close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
                 qty_to_close = pos.quantity
                 strat_name = pos.strategy or "Sniper"
@@ -2138,9 +2210,16 @@ class ShadowTradingDaemon:
                 if isinstance(opened_dt, datetime):
                     if opened_dt.tzinfo is None:
                         opened_dt = opened_dt.replace(tzinfo=timezone.utc)
-                    now_utc = datetime.now(timezone.utc)
+                    now_utc = now or datetime.now(timezone.utc)
+                    if now_utc.tzinfo is None:
+                        now_utc = now_utc.replace(tzinfo=timezone.utc)
                     age_hours = (now_utc - opened_dt).total_seconds() / 3600.0
-                    if age_hours >= eff_max_hold_h:
+                    # M25 Post-Settlement Unwind strict pre-settlement exit guard (`0.0 bps` funding paid):
+                    # exits at `54m` OR at `>= :56` UTC before any `:00` settlement mark!
+                    pre_settle_guard = (
+                        pos.strategy == SNIPER_M25_STRAT and now_utc.minute >= 56 and age_hours >= (5.0 / 60.0)
+                    )
+                    if age_hours >= eff_max_hold_h or pre_settle_guard:
                         close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
                         qty_to_close = pos.quantity
                         strat_name = pos.strategy
@@ -2159,8 +2238,10 @@ class ShadowTradingDaemon:
                                 self._sync_kill_switch_directional_target()
                             else:
                                 self.anomaly_last_exit[sym.replace("/", "")] = (now_utc, was_loss)
+                            hold_fmt = f"{eff_max_hold_h:.2f}h" if eff_max_hold_h < 1.0 else f"{eff_max_hold_h:.0f}h"
+                            guard_tag = " [Pre-Settlement :56 Guard]" if pre_settle_guard else ""
                             logger.info(
-                                f"⏰ Time-Stop ({age_hours:.1f}h >= {eff_max_hold_h:.0f}h) "
+                                f"⏰ Time-Stop ({age_hours:.2f}h / max {hold_fmt}){guard_tag} "
                                 f"closed position {sym} ({strat_name}) @ ${curr_p:,.4f}"
                             )
                             continue
@@ -2295,6 +2376,11 @@ class ShadowTradingDaemon:
             for s, p in portfolio.positions.items()
             if p and p.side != PositionSide.FLAT and p.quantity > 0 and p.strategy in SNIPER_STRATEGIES
         }
+        if hasattr(self.broker, "db") and hasattr(self.broker.db, "get_pending_orders"):
+            with contextlib.suppress(Exception):
+                for pend_s in self.broker.db.get_pending_orders():
+                    if pend_s.order_type == OrderType.LIMIT and pend_s.strategy in SNIPER_STRATEGIES:
+                        active_sniper_clean_syms.add(pend_s.symbol.replace("/", ""))
         open_pos_symbols = [
             s
             for s, p in portfolio.positions.items()
@@ -2833,6 +2919,12 @@ class ShadowTradingDaemon:
         self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
         self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
         self.sniper_max_positions = max(1, int(getattr(self.feature_flags, "sniper_max_positions", 3)))
+        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", True))
+        self.post_settle_max_funding_bps = float(getattr(self.feature_flags, "post_settle_max_funding_bps", -20.0))
+        self.post_settle_gtx_offset_bps = float(getattr(self.feature_flags, "post_settle_gtx_offset_bps", 1.5))
+        self.post_settle_gtx_ttl_sec = max(10.0, float(getattr(self.feature_flags, "post_settle_gtx_ttl_sec", 90.0)))
+        if hasattr(self, "sniper_engine") and self.sniper_engine is not None:
+            self.sniper_engine.m25_max_funding_rate = self.post_settle_max_funding_bps / 10_000.0
 
         sf_eng = getattr(self.allocator, "seven_factor_engine", None)
         if sf_eng is not None:
@@ -3579,9 +3671,12 @@ class ShadowTradingDaemon:
         bars_1h_override: dict[str, pd.DataFrame] | None = None,
         bars_15m_override: dict[str, pd.DataFrame] | None = None,
         funding_override: dict[str, float] | None = None,
+        settled_funding_override: list[Any] | None = None,
     ) -> list[Order]:
         """
         Phase 2 Event-Driven Sniper Orchestrator:
+        - Evaluates `M25_PostSettleUnwind` (`T+0.5m..10m` post-settlement `<= -20 bps`, passive `GTX`,
+          `0.0 bps` funding paid) once per settlement hour.
         - Evaluates `M04_NegFundSqueeze` once every 15m candle boundary across Top-60 symbols.
         - Evaluates `M09_CoilBreakout` (Top-25) & `M23_BreadthThrust` (82-symbol sensor -> Majors)
           once every 1h candle boundary.
@@ -3597,7 +3692,15 @@ class ShadowTradingDaemon:
             s: p for s, p in portfolio.positions.items() if p and p.quantity > 0 and p.side != PositionSide.FLAT
         }
         active_snipers = {s: p for s, p in all_open.items() if p.strategy in SNIPER_STRATEGIES}
-        if len(active_snipers) >= self.sniper_max_positions:
+        pending_sniper_orders: list[Order] = []
+        if hasattr(self.broker, "db") and hasattr(self.broker.db, "get_pending_orders"):
+            with contextlib.suppress(Exception):
+                pending_sniper_orders = [
+                    o
+                    for o in self.broker.db.get_pending_orders()
+                    if o.order_type == OrderType.LIMIT and o.strategy in SNIPER_STRATEGIES
+                ]
+        if len(active_snipers) + len(pending_sniper_orders) >= self.sniper_max_positions:
             return []
 
         # Compute Cushion-Safe & SafeRamp scaling from SteppedLeverageController
@@ -3615,6 +3718,8 @@ class ShadowTradingDaemon:
             return []
 
         blocked_clean = {s.replace("/", "").split(":")[0] for s in all_open}
+        for pend_o in pending_sniper_orders:
+            blocked_clean.add(pend_o.symbol.replace("/", "").split(":")[0])
         for sym_cd, (last_ts, was_loss) in list(self.sniper_last_exit.items()):
             cd_sec = 14400.0 if was_loss else 3600.0
             if (now_dt - last_ts).total_seconds() < cd_sec:
@@ -3630,7 +3735,12 @@ class ShadowTradingDaemon:
 
         due_15m = (bars_15m_override is not None) or (q_bucket > self._last_sniper_15m_bucket)
         due_1h = (bars_1h_override is not None) or (h_bucket > self._last_sniper_1h_bucket)
-        if not due_15m and not due_1h:
+        en_m25 = bool(getattr(self, "enable_post_settle_sniper", True))
+        due_m25 = en_m25 and (
+            (settled_funding_override is not None)
+            or (1 <= now_dt.minute <= 9 and h_bucket > self._last_sniper_m25_bucket)
+        )
+        if not due_15m and not due_1h and not due_m25:
             return []
 
         # Rank 82 universe by live 24h quote volume when available (fallback to canonical SNIPER_UNIVERSE_82 order)
@@ -3645,6 +3755,88 @@ class ShadowTradingDaemon:
         adv_ranks = {clean_s: rk for rk, (clean_s, _, _) in enumerate(vol_pairs)}
 
         candidates = []
+
+        # 0) M16-6 Post-Settlement Negative-Funding Unwind Scan (`M25`, `0.0 bps` funding paid)
+        if due_m25:
+            max_fr_dec = float(getattr(self, "post_settle_max_funding_bps", -20.0)) / 10_000.0
+            if settled_funding_override is not None:
+                settled_evs = settled_funding_override
+                recent_seen = len(settled_evs)
+            elif hasattr(self, "multimodal_feeds") and self.multimodal_feeds is not None:
+                settled_evs, recent_seen = self.multimodal_feeds.fetch_recent_settled_funding(
+                    now_ts=float(now_sec),
+                    min_elapsed_sec=30.0,
+                    max_elapsed_sec=600.0,
+                    max_funding_rate=max_fr_dec,
+                    min_mins_to_next_settlement=45.0,
+                )
+            else:
+                settled_evs, recent_seen = [], 0
+
+            if recent_seen > 0 or now_dt.minute >= 8 or settled_funding_override is not None:
+                self._last_sniper_m25_bucket = h_bucket
+
+            if settled_evs:
+                vol_24h_map: dict[str, float] = {}
+                px_live_map: dict[str, float] = {}
+                for k_sym, t_val in self.latest_tickers.items():
+                    c_k = k_sym.replace("/", "").split(":")[0].strip().upper()
+                    vol_24h_map[c_k] = float(t_val.get("volume_24h", 0.0) or 0.0)
+                    px_live_map[c_k] = float(t_val.get("price", 0.0) or 0.0)
+
+                basis_snaps: dict[str, Any] = {}
+                pos_snaps: dict[str, Any] = {}
+                if hasattr(self, "multimodal_feeds") and self.multimodal_feeds is not None:
+                    inspected = 0
+                    for ev_item in settled_evs:
+                        ev_sym = (
+                            str(ev_item.get("symbol") or "")
+                            if isinstance(ev_item, dict)
+                            else str(getattr(ev_item, "symbol", "") or "")
+                        ).upper()
+                        if not ev_sym or ev_sym in blocked_clean:
+                            continue
+                        if vol_24h_map.get(ev_sym, 0.0) < self.sniper_engine.m25_min_volume_24h_usd:
+                            continue
+                        ev_px = px_live_map.get(
+                            ev_sym,
+                            float(
+                                ev_item.get("mark_price", 0.0)
+                                if isinstance(ev_item, dict)
+                                else getattr(ev_item, "mark_price", 0.0)
+                            ),
+                        )
+                        if ev_px > 0:
+                            b_snap = self.multimodal_feeds.fetch_spot_perp_basis_snapshot(
+                                perp_symbol=ev_sym,
+                                perp_mid=ev_px,
+                                now_ts=float(now_sec),
+                            )
+                            if b_snap is not None:
+                                basis_snaps[ev_sym] = b_snap
+                        p_snap = self.multimodal_feeds.fetch_derivatives_positioning_5m(
+                            symbol=ev_sym,
+                            now_ts=float(now_sec),
+                        )
+                        if p_snap is not None:
+                            pos_snaps[ev_sym] = p_snap
+                        inspected += 1
+                        if inspected >= 3:
+                            break
+
+                candidates.extend(
+                    self.sniper_engine.evaluate_post_settlement_unwind_snipers(
+                        settled_events=settled_evs,
+                        ticker_volumes_24h=vol_24h_map,
+                        ticker_prices=px_live_map,
+                        adv_ranks=adv_ranks,
+                        basis_snapshots=basis_snaps,
+                        positioning_snapshots=pos_snaps,
+                        blocked_symbols=blocked_clean,
+                        executed_settlement_keys=self._executed_post_settle_keys,
+                        max_funding_rate_override=max_fr_dec,
+                    )
+                )
 
         # 1) 15m Negative-Funding Short-Squeeze Scan (`M04`)
         if due_15m:
@@ -3709,7 +3901,7 @@ class ShadowTradingDaemon:
         is_live = bool(getattr(self.broker, "is_live", False) and getattr(self.broker, "live_broker", None))
 
         for sig in candidates:
-            if len(active_snipers) + len(executed) >= self.sniper_max_positions:
+            if len(active_snipers) + len(pending_sniper_orders) + len(executed) >= self.sniper_max_positions:
                 break
             if sig.symbol in blocked_clean or sig.reference_price <= 0:
                 continue
@@ -3741,7 +3933,40 @@ class ShadowTradingDaemon:
 
             order_side = OrderSide.BUY if sig.side > 0 else OrderSide.SELL
             try:
-                self.broker.set_market_price(slash_sym, price=exec_px)
+                bid_q = float(t_q.get("bid") or exec_px)
+                ask_q = float(t_q.get("ask") or exec_px)
+                self.broker.set_market_price(slash_sym, price=exec_px, bid=bid_q, ask=ask_q)
+
+                if sig.strategy == SNIPER_M25_STRAT:
+                    ord_res = self.router.route_passive_gtx_order(
+                        symbol=slash_sym,
+                        side=order_side,
+                        quantity=qty,
+                        current_price=exec_px,
+                        best_bid=bid_q,
+                        best_ask=ask_q,
+                        offset_bps=float(getattr(self, "post_settle_gtx_offset_bps", 1.5)),
+                        ttl_sec=float(getattr(self, "post_settle_gtx_ttl_sec", 90.0)),
+                        strategy=sig.strategy,
+                    )
+                    settle_hr = int((sig.settlement_ts or now_sec) // 3600)
+                    self._executed_post_settle_keys.add((sig.symbol, settle_hr))
+                    blocked_clean.add(sig.symbol)
+                    executed.append(ord_res)
+                    if ord_res.status == OrderStatus.FILLED:
+                        fill_px = float(ord_res.average_fill_price or ord_res.price or exec_px)
+                        dec = 6 if fill_px < 1.0 else (4 if fill_px < 100.0 else 2)
+                        tp_px = round(fill_px * (1.0 - sig.bracket.take_profit_pct), dec)
+                        sl_px = round(fill_px * (1.0 + sig.bracket.stop_loss_pct), dec)
+                        self.broker.create_bracket_orders(symbol=slash_sym, take_profit=tp_px, stop_loss=sl_px)
+                    logger.info(
+                        f"🎯 [M16 Post-Settle Sniper] Posted Passive GTX {order_side.value} {slash_sym} "
+                        f"({sig.strategy}) @ ${float(ord_res.price or exec_px):,.4f} "
+                        f"[status={ord_res.status.value} | TTL={self.post_settle_gtx_ttl_sec:.0f}s | "
+                        f"Notional=${eff_notional:,.1f}] | {sig.reason}"
+                    )
+                    continue
+
                 ord_res = self.broker.create_order(
                     symbol=slash_sym,
                     side=order_side,

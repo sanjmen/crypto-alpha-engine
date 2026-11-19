@@ -392,6 +392,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum concurrent Phase 2 Event Sniper positions (default: 3)",
     )
     parser.add_argument(
+        "--enable-m16-post-settle",
+        dest="enable_post_settle_sniper",
+        action="store_true",
+        default=None,
+        help="Enable M16-6 Post-Settlement Negative-Funding Unwind Sniper M25 (default: True)",
+    )
+    parser.add_argument(
+        "--disable-m16-post-settle",
+        dest="enable_post_settle_sniper",
+        action="store_false",
+        help="Disable M16-6 Post-Settlement Negative-Funding Unwind Sniper M25",
+    )
+    parser.add_argument(
+        "--post-settle-max-funding-bps",
+        type=float,
+        default=None,
+        help="Maximum (negative) realized funding rate in bps to trigger M25 Sniper (default: -20.0)",
+    )
+    parser.add_argument(
+        "--post-settle-gtx-ttl-sec",
+        type=float,
+        default=None,
+        help="Time-to-live in seconds before auto-canceling unfilled M25 passive GTX order (default: 90.0)",
+    )
+    parser.add_argument(
         "--max-24h-dd",
         type=float,
         default=0.065,
@@ -934,7 +959,7 @@ def main() -> None:
         f"ChopRangeArb={'ENABLED (TP=' + format(feature_flags.chop_take_profit_pct * 100, '.1f') + '%, Lock=' + format(feature_flags.chop_profit_lock_trigger_pct * 100, '.1f') + '%->' + format(feature_flags.chop_profit_lock_level_pct * 100, '.1f') + '%)' if feature_flags.enable_chop_range_arb else 'DISABLED'} | "
         f"SubhourlyPB={'ENABLED' if feature_flags.enable_subhourly_pullback else 'DISABLED'} | "
         f"DollarBarP2={'ENABLED (Max=' + format(feature_flags.dollar_bar_max_gross, '.2f') + 'x, P1Scale=' + format(feature_flags.core_p1_risk_scale, '.2f') + 'x)' if feature_flags.enable_dollar_bar_tsmom else 'DISABLED'} | "
-        f"EventSnipers={'ENABLED (M09/M23/M04, Max=' + str(feature_flags.sniper_max_positions) + 'x' + format(feature_flags.sniper_slot_leverage, '.2f') + ')' if feature_flags.enable_event_snipers else 'DISABLED'} | "
+        f"EventSnipers={'ENABLED (M09/M23/M04' + ('/M25-GTX' if feature_flags.enable_post_settle_sniper else '') + ', Max=' + str(feature_flags.sniper_max_positions) + 'x' + format(feature_flags.sniper_slot_leverage, '.2f') + ')' if feature_flags.enable_event_snipers else 'DISABLED'} | "
         f"CushionGov={'ENABLED (Buf=$' + format(feature_flags.cushion_buffer_usd, '.0f') + ')' if use_cushion_gov else 'DISABLED'} | "
         f"HolisticShields={'ENABLED' if feature_flags.enable_holistic_regime_shields else 'DISABLED'} | "
         f"HardEquityFloor={'$' + format(feature_flags.equity_floor_usd, ',.2f') if feature_flags.enable_hard_equity_floor else 'DISABLED'} | "

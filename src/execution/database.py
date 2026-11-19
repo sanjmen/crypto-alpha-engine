@@ -659,7 +659,7 @@ class ShadowDatabase:
         created_dt = datetime.fromisoformat(row["created_at"])
         if created_dt.tzinfo is None:
             created_dt = created_dt.replace(tzinfo=timezone.utc)
-        return Order(
+        order = Order(
             id=row["id"],
             symbol=row["symbol"],
             side=OrderSide(row["side"]),
@@ -672,6 +672,9 @@ class ShadowDatabase:
             created_at=created_dt,
             strategy=strat,
         )
+        if "client_order_id" in col_keys and row["client_order_id"] is not None:
+            order._client_order_id = str(row["client_order_id"])  # type: ignore[attr-defined]
+        return order
 
     def get_order(self, order_id: str) -> Order | None:
         """Retrieves domain Order entity by id."""

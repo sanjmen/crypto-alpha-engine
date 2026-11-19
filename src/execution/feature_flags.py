@@ -47,6 +47,9 @@ FLOAT_FLAG_NAMES = frozenset(
         "dollar_bar_max_gross",
         "core_p1_risk_scale",
         "sniper_slot_leverage",
+        "post_settle_max_funding_bps",
+        "post_settle_gtx_offset_bps",
+        "post_settle_gtx_ttl_sec",
     }
 )
 
@@ -92,6 +95,10 @@ class FeatureFlags:
     chop_profit_lock_trigger_pct: float = 0.024
     chop_profit_lock_level_pct: float = 0.012
     enable_progressive_profit_lock: bool = False
+    enable_post_settle_sniper: bool = True
+    post_settle_max_funding_bps: float = -20.0
+    post_settle_gtx_offset_bps: float = 1.5
+    post_settle_gtx_ttl_sec: float = 90.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -296,6 +303,39 @@ class FeatureFlags:
                 )
             ),
         )
+        cli_post_settle = getattr(args, "enable_post_settle_sniper", None) if args is not None else None
+        env_post_settle = env.get("FF_ENABLE_POST_SETTLE_SNIPER")
+        if cli_post_settle is not None:
+            enable_post_settle = bool(cli_post_settle)
+        elif env_post_settle is not None:
+            enable_post_settle = _parse_bool(env_post_settle, default=True)
+        else:
+            enable_post_settle = True
+
+        post_settle_max_fr_bps = _parse_float(
+            env.get(
+                "FF_POST_SETTLE_MAX_FUNDING_BPS",
+                getattr(args, "post_settle_max_funding_bps", None) if args is not None else None,
+            ),
+            default=-20.0,
+        )
+        post_settle_offset_bps = _parse_float(
+            env.get(
+                "FF_POST_SETTLE_GTX_OFFSET_BPS",
+                getattr(args, "post_settle_gtx_offset_bps", None) if args is not None else None,
+            ),
+            default=1.5,
+        )
+        post_settle_ttl_sec = max(
+            10.0,
+            _parse_float(
+                env.get(
+                    "FF_POST_SETTLE_GTX_TTL_SEC",
+                    getattr(args, "post_settle_gtx_ttl_sec", None) if args is not None else None,
+                ),
+                default=90.0,
+            ),
+        )
 
         return cls(
             enable_anomaly_capsule=enable_anom,
@@ -324,6 +364,10 @@ class FeatureFlags:
             chop_profit_lock_trigger_pct=chop_lock_trig,
             chop_profit_lock_level_pct=chop_lock_lvl,
             enable_progressive_profit_lock=enable_prog_lock,
+            enable_post_settle_sniper=enable_post_settle,
+            post_settle_max_funding_bps=post_settle_max_fr_bps,
+            post_settle_gtx_offset_bps=post_settle_offset_bps,
+            post_settle_gtx_ttl_sec=post_settle_ttl_sec,
         )
 
     def apply_override(self, key: str, raw_value: Any) -> tuple[str, Any]:
@@ -380,6 +424,12 @@ class FeatureFlags:
             "sniper_max_positions": "sniper_max_positions",
             "progressive_profit_lock": "enable_progressive_profit_lock",
             "enable_progressive_profit_lock": "enable_progressive_profit_lock",
+            "post_settle_sniper": "enable_post_settle_sniper",
+            "m16_post_settle": "enable_post_settle_sniper",
+            "enable_post_settle_sniper": "enable_post_settle_sniper",
+            "post_settle_max_funding_bps": "post_settle_max_funding_bps",
+            "post_settle_gtx_offset_bps": "post_settle_gtx_offset_bps",
+            "post_settle_gtx_ttl_sec": "post_settle_gtx_ttl_sec",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:

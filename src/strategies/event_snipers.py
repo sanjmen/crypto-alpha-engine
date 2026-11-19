@@ -22,19 +22,24 @@ under exact 1-minute intrabar stop/trail physics and tier-realistic transaction 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from src.data.multimodal_vision_ingestor import is_valid_crypto_usdt_perp
+
 SNIPER_M09_STRAT = "Sniper:M09_CoilBreakout"
 SNIPER_M23_STRAT = "Sniper:M23_BreadthThrust"
 SNIPER_M04_STRAT = "Sniper:M04_NegFundSqueeze"
+SNIPER_M25_STRAT = "Sniper:M25_PostSettleUnwind"
 
 SNIPER_STRATEGIES: frozenset[str] = frozenset(
     {
         SNIPER_M09_STRAT,
         SNIPER_M23_STRAT,
         SNIPER_M04_STRAT,
+        SNIPER_M25_STRAT,
     }
 )
 
@@ -178,6 +183,16 @@ SNIPER_BRACKET_PROFILES: dict[str, SniperBracketSpec] = {
         trail_distance_pct=0.022,
         max_hold_hours=12.0,
     ),
+    SNIPER_M25_STRAT: SniperBracketSpec(
+        strategy=SNIPER_M25_STRAT,
+        stop_loss_pct=0.022,
+        take_profit_pct=0.032,
+        lock_trigger_pct=0.010,
+        lock_level_pct=0.0045,
+        trail_trigger_pct=0.016,
+        trail_distance_pct=0.0075,
+        max_hold_hours=0.90,
+    ),
 }
 
 
@@ -193,6 +208,7 @@ class SniperCandidateSignal:
     adv_rank: int
     bracket: SniperBracketSpec
     reason: str
+    settlement_ts: int | None = None
 
 
 def _prep_kline_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -273,6 +289,12 @@ class EventDrivenSniperEngine:
         m04_max_rank: int = 60,
         m04_vol_mult: float = 2.2,
         m04_taker_buy_thresh: float = 0.56,
+        m25_max_funding_rate: float = -0.0020,
+        m25_min_volume_24h_usd: float = 15_000_000.0,
+        m25_min_elapsed_sec: float = 30.0,
+        m25_max_elapsed_sec: float = 600.0,
+        m25_min_mins_to_next: float = 45.0,
+        m25_max_oi_vel_15m: float = 0.08,
     ) -> None:
         self.m09_dispersion_quantile = float(m09_dispersion_quantile)
         self.m09_donchian_hours = int(m09_donchian_hours)
@@ -288,6 +310,13 @@ class EventDrivenSniperEngine:
         self.m04_max_rank = int(m04_max_rank)
         self.m04_vol_mult = float(m04_vol_mult)
         self.m04_taker_buy_thresh = float(m04_taker_buy_thresh)
+
+        self.m25_max_funding_rate = float(m25_max_funding_rate)
+        self.m25_min_volume_24h_usd = float(m25_min_volume_24h_usd)
+        self.m25_min_elapsed_sec = float(m25_min_elapsed_sec)
+        self.m25_max_elapsed_sec = float(m25_max_elapsed_sec)
+        self.m25_min_mins_to_next = float(m25_min_mins_to_next)
+        self.m25_max_oi_vel_15m = float(m25_max_oi_vel_15m)
 
     def evaluate_1h_snipers(
         self,
@@ -499,6 +528,139 @@ class EventDrivenSniperEngine:
                         ),
                     )
                 )
+
+        signals.sort(key=lambda s: s.score, reverse=True)
+        return signals
+
+    def evaluate_post_settlement_unwind_snipers(
+        self,
+        settled_events: list[Any],
+        ticker_volumes_24h: dict[str, float] | None = None,
+        ticker_prices: dict[str, float] | None = None,
+        adv_ranks: dict[str, int] | None = None,
+        basis_snapshots: dict[str, Any] | None = None,
+        positioning_snapshots: dict[str, Any] | None = None,
+        blocked_symbols: set[str] | None = None,
+        executed_settlement_keys: set[tuple[str, int]] | None = None,
+        max_funding_rate_override: float | None = None,
+    ) -> list[SniperCandidateSignal]:
+        """
+        Evaluates M16-4 / M16-5 `GO` mechanism `Sniper:M25_PostSettleUnwind`
+        (`A1_FAST_1H_POST_SETTLE_UNWIND_20BPS`, DSR=0.9511, CPCV=+2.31, corr=+0.013):
+        - Enters SHORT strictly AFTER negative funding settlement (`T + 0.5m .. T + 10m`)
+          when realized `funding_rate <= -20 bps` (`-0.0020`) and `24h QuoteVolume >= $15M`,
+          capturing the mechanical post-settlement funding-harvester unwind while paying
+          `0.0 bps` of negative funding (`max_hold_hours = 0.90h` / `<= :56` UTC exit).
+        """
+        if not settled_events:
+            return []
+
+        eff_max_fr = (
+            float(max_funding_rate_override) if max_funding_rate_override is not None else self.m25_max_funding_rate
+        )
+        blocked = {s.replace("/", "").split(":")[0].strip().upper() for s in (blocked_symbols or set())}
+        done_keys = executed_settlement_keys or set()
+        vol_map = ticker_volumes_24h or {}
+        px_map = ticker_prices or {}
+        rk_map = adv_ranks or {}
+        basis_map = basis_snapshots or {}
+        pos_map = positioning_snapshots or {}
+
+        signals: list[SniperCandidateSignal] = []
+
+        for ev in settled_events:
+            if isinstance(ev, dict):
+                raw_sym = str(ev.get("symbol") or "")
+                ft_sec = int(ev.get("funding_time_sec") or ev.get("fundingTime") or 0)
+                if ft_sec > 100_000_000_000:
+                    ft_sec = int(round(ft_sec / 1000.0))
+                fr_val = float(ev.get("funding_rate") if "funding_rate" in ev else ev.get("fundingRate", 0.0))
+                mark_px = float(ev.get("mark_price") if "mark_price" in ev else ev.get("markPrice", 0.0))
+                elapsed_s = float(ev.get("elapsed_sec", 60.0))
+                mins_next = float(ev.get("mins_to_next_settlement", 55.0))
+            else:
+                raw_sym = str(getattr(ev, "symbol", "") or "")
+                ft_sec = int(getattr(ev, "funding_time_sec", 0) or 0)
+                fr_val = float(getattr(ev, "funding_rate", 0.0))
+                mark_px = float(getattr(ev, "mark_price", 0.0) or 0.0)
+                elapsed_s = float(getattr(ev, "elapsed_sec", 60.0))
+                mins_next = float(getattr(ev, "mins_to_next_settlement", 55.0))
+
+            clean_s = raw_sym.replace("/", "").split(":")[0].strip().upper()
+            if not is_valid_crypto_usdt_perp(clean_s) or clean_s in blocked:
+                continue
+
+            hour_key = (clean_s, int(ft_sec // 3600))
+            if ft_sec > 0 and (hour_key in done_keys or (clean_s, ft_sec) in done_keys):
+                continue
+
+            if elapsed_s < self.m25_min_elapsed_sec or elapsed_s > self.m25_max_elapsed_sec:
+                continue
+            if mins_next < self.m25_min_mins_to_next:
+                continue
+            if not np.isfinite(fr_val) or fr_val > eff_max_fr:
+                continue
+
+            slash_s = f"{clean_s[:-4]}/USDT"
+            v24 = float(vol_map.get(clean_s, vol_map.get(slash_s, 0.0)) or 0.0)
+            if v24 < self.m25_min_volume_24h_usd:
+                continue
+
+            ref_px = float(px_map.get(clean_s, px_map.get(slash_s, mark_px)) or mark_px)
+            if not np.isfinite(ref_px) or ref_px <= 0.0:
+                continue
+
+            # Optional 5m OI velocity veto / boost: skip if OI is violently expanding (> +8% in 15m)
+            pos_snap = pos_map.get(clean_s) or pos_map.get(slash_s)
+            oi_mult = 1.0
+            oi_tag = ""
+            if pos_snap is not None:
+                oi_v15 = float(
+                    pos_snap.get("oi_vel_15m", 0.0)
+                    if isinstance(pos_snap, dict)
+                    else getattr(pos_snap, "oi_vel_15m", 0.0)
+                )
+                if oi_v15 > self.m25_max_oi_vel_15m:
+                    continue
+                if oi_v15 < 0.0:
+                    oi_mult = min(1.25, 1.0 + abs(oi_v15) * 3.0)
+                oi_tag = f" OI15m={oi_v15 * 100:+.1f}%"
+
+            basis_snap = basis_map.get(clean_s) or basis_map.get(slash_s)
+            basis_mult = 1.0
+            basis_tag = ""
+            if basis_snap is not None:
+                b_bps = float(
+                    basis_snap.get("basis_bps", 0.0)
+                    if isinstance(basis_snap, dict)
+                    else getattr(basis_snap, "basis_bps", 0.0)
+                )
+                # Less-discounted perp relative to realized negative funding indicates remaining long-harvester overhang
+                if b_bps > (fr_val * 10_000.0 * 0.5):
+                    basis_mult = 1.10
+                basis_tag = f" Basis={b_bps:+.1f}bps"
+
+            liq_mult = min(1.5, max(0.8, np.log10(max(v24, 1e6) / 1e7)))
+            score = float(abs(fr_val) * 10_000.0 * liq_mult * oi_mult * basis_mult)
+            rk_s = int(rk_map.get(clean_s, 50))
+
+            signals.append(
+                SniperCandidateSignal(
+                    symbol=clean_s,
+                    side=-1,
+                    strategy=SNIPER_M25_STRAT,
+                    score=score,
+                    reference_price=ref_px,
+                    adv_rank=rk_s,
+                    bracket=SNIPER_BRACKET_PROFILES[SNIPER_M25_STRAT],
+                    reason=(
+                        f"PostSettleUnwind FR={fr_val * 10_000:.1f}bps "
+                        f"T+{elapsed_s:.0f}s Next={mins_next:.0f}m Vol24h=${v24 / 1e6:.1f}M"
+                        f"{oi_tag}{basis_tag}"
+                    ),
+                    settlement_ts=ft_sec if ft_sec > 0 else None,
+                )
+            )
 
         signals.sort(key=lambda s: s.score, reverse=True)
         return signals

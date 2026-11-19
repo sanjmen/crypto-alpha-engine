@@ -74,6 +74,7 @@ class ShadowExecutionBroker(IExecutionClient):
         self.last_collateral_breakdown: dict[str, Any] = {}
         self._configured_live_symbols: set[str] = set()
         self._current_live_leverage: int = 3
+        self._gtx_order_deadlines: dict[str, tuple[float, str | None]] = {}
 
         # Restore from database or initialize fresh
         latest_acc = self.db.get_latest_account()
@@ -382,9 +383,14 @@ class ShadowExecutionBroker(IExecutionClient):
         return order
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancels a pending order in the database."""
+        """Cancels a pending order in the database (and on live exchange for resting GTX orders)."""
         order = self.db.get_order(order_id)
         if order and order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
+            deadline_info = self._gtx_order_deadlines.pop(order_id, None)
+            live_ex_id = deadline_info[1] if deadline_info is not None else getattr(order, "_client_order_id", None)
+            if self.is_live and live_ex_id and hasattr(self.live_broker, "client"):
+                with contextlib.suppress(Exception):
+                    self.live_broker.client.cancel_order(live_ex_id, symbol)
             self.db.update_order_fill(
                 order_id=order_id,
                 status=OrderStatus.CANCELED,
@@ -533,6 +539,215 @@ class ShadowExecutionBroker(IExecutionClient):
             raise
 
         return order
+
+    def create_passive_gtx_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        limit_price: float,
+        ttl_sec: float = 90.0,
+        strategy: str | None = None,
+        now: datetime | None = None,
+    ) -> Order:
+        """
+        Places a non-blocking Post-Only (`GTX`) Maker limit order with strict `ttl_sec`
+        expiration (100% Maker-only, zero Taker fallback).
+        """
+        if quantity <= 0:
+            raise ValueError(f"Quantity must be positive, got {quantity}")
+
+        ref_now = now or datetime.now(timezone.utc)
+        if ref_now.tzinfo is None:
+            ref_now = ref_now.replace(tzinfo=timezone.utc)
+        eff_ttl = max(5.0, float(ttl_sec))
+
+        bid = self.market_bids.get(symbol, self.market_prices.get(symbol, limit_price))
+        ask = self.market_asks.get(symbol, self.market_prices.get(symbol, limit_price))
+        if side == OrderSide.BUY:
+            eff_px = min(float(limit_price), float(bid)) if bid and bid > 0 else float(limit_price)
+        else:
+            eff_px = max(float(limit_price), float(ask)) if ask and ask > 0 else float(limit_price)
+
+        self.verify_risk_circuit_breakers(symbol, quantity, eff_px, side=side)
+
+        order_id = f"shd_gtx_{uuid.uuid4().hex[:10]}"
+        if not self.is_live:
+            order = Order(
+                id=order_id,
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=float(quantity),
+                price=eff_px,
+                status=OrderStatus.PENDING,
+                created_at=ref_now,
+                strategy=strategy,
+            )
+            self.db.save_order(order, role="MAKER")
+            self._gtx_order_deadlines[order_id] = (ref_now.timestamp() + eff_ttl, None)
+            return order
+
+        if symbol not in self._configured_live_symbols:
+            with contextlib.suppress(Exception):
+                self.live_broker.client.set_margin_mode("cross", symbol)
+            with contextlib.suppress(Exception):
+                self.live_broker.client.set_leverage(self._current_live_leverage, symbol)
+            self._configured_live_symbols.add(symbol)
+
+        self.live_broker.portfolio.cash = self.portfolio.cash
+        self.live_broker.portfolio.initial_cash = self.portfolio.initial_cash
+        self.live_broker.peak_equity = max(self.live_broker.peak_equity, self.portfolio.total_equity)
+        self.live_broker.max_gross_leverage = max(self.live_broker.max_gross_leverage, self.max_gross_leverage)
+
+        live_ord, live_ex_id = self.live_broker.place_passive_gtx_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            limit_price=eff_px,
+            reduce_only=False,
+        )
+        order = Order(
+            id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=float(live_ord.quantity),
+            price=float(live_ord.price or eff_px),
+            status=OrderStatus.PENDING,
+            created_at=ref_now,
+            strategy=strategy,
+        )
+        order._client_order_id = live_ex_id  # type: ignore[attr-defined]
+        self.db.save_order(order, role="MAKER", client_order_id=live_ex_id)
+
+        if live_ord.status == OrderStatus.FILLED and float(live_ord.filled_quantity or 0.0) > 0:
+            fill_q = float(live_ord.filled_quantity)
+            fill_p = float(live_ord.average_fill_price or live_ord.price or eff_px)
+            fee_u = float(getattr(live_ord, "_fee_paid", 0.0) or (fill_q * fill_p * self.maker_fee_pct))
+            self._finalize_passive_gtx_fill(order, filled_qty=fill_q, fill_price=fill_p, fee_usd=fee_u, now=ref_now)
+        else:
+            self._gtx_order_deadlines[order_id] = (ref_now.timestamp() + eff_ttl, live_ex_id)
+        return order
+
+    def _finalize_passive_gtx_fill(
+        self,
+        order: Order,
+        filled_qty: float,
+        fill_price: float,
+        fee_usd: float,
+        now: datetime | None = None,
+    ) -> None:
+        ts_now = now or datetime.now(timezone.utc)
+        order.quantity = float(filled_qty)
+        order.filled_quantity = float(filled_qty)
+        order.average_fill_price = float(fill_price)
+        order.status = OrderStatus.FILLED
+        trade = Trade(
+            id=f"shd_trd_{uuid.uuid4().hex[:10]}",
+            order_id=order.id,
+            symbol=order.symbol,
+            side=order.side,
+            quantity=float(filled_qty),
+            price=float(fill_price),
+            fee=float(fee_usd),
+            timestamp=ts_now,
+            strategy=getattr(order, "strategy", None),
+        )
+        self.db.update_order_fill(
+            order_id=order.id,
+            status=OrderStatus.FILLED,
+            filled_quantity=float(filled_qty),
+            average_fill_price=float(fill_price),
+            fee=float(fee_usd),
+            role="MAKER",
+        )
+        realized_pnl = self._update_portfolio_position(trade)
+        order._realized_pnl = realized_pnl
+        self.db.save_trade(
+            trade,
+            is_maker=True,
+            realized_pnl=realized_pnl,
+            strategy=getattr(order, "strategy", None),
+        )
+        if self.is_live:
+            self.sync_from_live_exchange(sync_positions=False)
+        else:
+            self._record_account_snapshot(ts_now)
+
+    def reconcile_pending_gtx_orders(
+        self,
+        now: datetime | None = None,
+        default_ttl_sec: float = 90.0,
+    ) -> tuple[list[Order], list[Order]]:
+        """
+        Evaluates all resting Post-Only (`shd_gtx_`) orders for live exchange fills
+        and enforces strict `ttl_sec` auto-cancellation of unfilled sniper entries.
+        Returns `(filled_orders, expired_canceled_orders)`.
+        """
+        ref_now = now or datetime.now(timezone.utc)
+        if ref_now.tzinfo is None:
+            ref_now = ref_now.replace(tzinfo=timezone.utc)
+        now_epoch = ref_now.timestamp()
+
+        filled_out: list[Order] = []
+        expired_out: list[Order] = []
+
+        for order in self.db.get_pending_orders():
+            if order.order_type != OrderType.LIMIT or not order.id.startswith("shd_gtx_"):
+                continue
+
+            d_entry = self._gtx_order_deadlines.get(order.id)
+            if d_entry is not None:
+                deadline_ts, live_ex_id = d_entry
+            else:
+                created_dt = order.created_at
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                deadline_ts = created_dt.timestamp() + max(5.0, float(default_ttl_sec))
+                live_ex_id = getattr(order, "_client_order_id", None)
+                self._gtx_order_deadlines[order.id] = (deadline_ts, live_ex_id)
+
+            is_expired = now_epoch >= deadline_ts
+
+            if self.is_live and live_ex_id:
+                try:
+                    sync_res = self.live_broker.sync_or_cancel_gtx_order(
+                        exchange_order_id=live_ex_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        expire=is_expired,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"GTX order sync note for {order.id} ({order.symbol}): {exc}")
+                    continue
+
+                st = str(sync_res.get("status") or "open")
+                f_qty = float(sync_res.get("filled") or 0.0)
+                f_avg = float(sync_res.get("average") or order.price or 0.0)
+                f_fee = float(sync_res.get("fee_usd") or (f_qty * f_avg * self.maker_fee_pct))
+                if st == "filled" and f_qty > 0 and f_avg > 0:
+                    self._gtx_order_deadlines.pop(order.id, None)
+                    self._finalize_passive_gtx_fill(
+                        order,
+                        filled_qty=f_qty,
+                        fill_price=f_avg,
+                        fee_usd=f_fee,
+                        now=ref_now,
+                    )
+                    filled_out.append(order)
+                elif st == "canceled" or is_expired:
+                    self._gtx_order_deadlines.pop(order.id, None)
+                    order.status = OrderStatus.CANCELED
+                    self.db.update_order_status(order.id, OrderStatus.CANCELED)
+                    expired_out.append(order)
+            elif is_expired:
+                self._gtx_order_deadlines.pop(order.id, None)
+                if self.cancel_order(order.id, order.symbol):
+                    order.status = OrderStatus.CANCELED
+                    expired_out.append(order)
+
+        return filled_out, expired_out
 
     def _fill_market_order(self, order: Order) -> None:
         """Executes an aggressive Taker order with dynamic non-linear slippage and fee."""
@@ -810,6 +1025,9 @@ class ShadowExecutionBroker(IExecutionClient):
         for order in pending_orders:
             if order.id in canceled_order_ids:
                 continue
+            if self.is_live and order.order_type == OrderType.LIMIT and order.id.startswith("shd_gtx_"):
+                # Handled directly by reconcile_pending_gtx_orders against the resting exchange GTX order
+                continue
             symbol = order.symbol
             tick = symbol_ticks.get(symbol) or symbol_ticks.get(symbol.replace("/", ""))
             if not tick or order.price is None:
@@ -872,6 +1090,7 @@ class ShadowExecutionBroker(IExecutionClient):
                         canceled_order_ids.add(order.id)
                     continue
                 if order.status == OrderStatus.FILLED:
+                    self._gtx_order_deadlines.pop(order.id, None)
                     filled_orders.append(order)
 
                     # OCO bracket logic: Cancel opposing bracket order if TP or SL triggered
