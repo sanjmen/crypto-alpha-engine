@@ -66,12 +66,8 @@ jobs:
       - name: Package release bundle
         if: steps.check_secret.outputs.configured == 'true'
         run: |
-          tar --exclude='.git' \
-              --exclude='.github' \
-              --exclude='reports' \
-              --exclude='data' \
-              --exclude='logs' \
-              -czf /tmp/release.tar.gz .
+          git archive --format=tar.gz -o /tmp/release.tar.gz HEAD \
+            .dockerignore Dockerfile docker-compose.yml requirements.txt pyproject.toml README.md src scripts
 
       - name: Upload & Rebuild Docker Containers via IAP Zero-Trust Tunnel
         if: steps.check_secret.outputs.configured == 'true'

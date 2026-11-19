@@ -9,9 +9,9 @@ __pycache__
 .ruff_cache
 .coverage
 htmlcov
-reports/
-data/
-logs/
+/reports/
+/data/
+/logs/
 .env
 *.db
 *.db-wal
