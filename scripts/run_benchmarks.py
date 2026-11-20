@@ -4472,6 +4472,479 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
     return summary
 
 
+def run_maker_wick_catcher_lab_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Análisis 1: Passive `GTX` Maker Limit Wick-Catcher at `1-Millisecond` `aggTrades`
+    & `1-Second` Post-Fill Resolution (`+250ms` latency, strict queue trade-through, `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import time
+
+    if colab_session:
+        from src.cloud.colab_client import ColabClient
+
+        stage_mw = Path("/tmp/maker_wick_bridge")
+        if stage_mw.exists():
+            shutil.rmtree(stage_mw, ignore_errors=True)
+        stage_mw.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Maker Wick bridge.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging P3/P4 solvency-anchored windows via rclone (auto-cleaned on exit)...", flush=True)
+            subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet",
+                    str(stage_mw),
+                ],
+                check=True,
+            )
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            client.exec_inline(
+                "import os; os.makedirs('/content/mw_data', exist_ok=True); os.makedirs('/content/reports', exist_ok=True)",
+                timeout=90,
+            )
+            assert client.upload(stage_mw / "p3_p4_all_trades.parquet", "/content/mw_data/p3_p4_all_trades.parquet")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/mw.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'maker-wick-catcher-lab', '--m16-data-dir', '/content/mw_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/mw.pid', 'w').write(str(p.pid)); "
+                "print(f'MW_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Maker Wick-Catcher 1ms Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(8.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/mw.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}'); "
+                    "lines = open('/content/mw.log').read().splitlines() if os.path.exists('/content/mw.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Maker Wick Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "MAKER_WICK_CATCHER_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Maker Wick-Catcher Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "maker_wick_catcher_leaderboard.csv",
+                "maker_wick_catcher_summary.json",
+                "maker_wick_catcher_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+
+            loc_tr = stage_mw / "maker_wick_all_trades.parquet"
+            if client.download("/content/mw_data/maker_wick_all_trades.parquet", loc_tr) and loc_tr.exists():
+                subprocess.run(["rclone", "copy", str(loc_tr), f"{rb}/p3_p4_cross_venue"], check=False)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_mw.exists():
+                shutil.rmtree(stage_mw, ignore_errors=True)
+                print("[*] Wiped /tmp/maker_wick_bridge -> 0 bytes local residue.", flush=True)
+
+    from src.models.maker_wick_catcher_lab import run_maker_wick_catcher_study
+
+    t0 = time.time()
+    tr_path = m16_data_dir / "p3_p4_all_trades.parquet"
+    if not tr_path.exists():
+        tr_path = m16_data_dir / "p3_p4_cross_venue" / "p3_p4_all_trades.parquet"
+    all_tr = pd.read_parquet(tr_path)
+    p4_m4 = all_tr[all_tr["mech_id"] == "P4_M4_ONCHAIN_ANCHORED_LIQ_SNAP_LONG"].copy()
+    print(
+        f"🎯 Análisis 1: Passive GTX Maker Wick-Catcher 1ms Lab across {len(p4_m4)//3} solvency windows...", flush=True
+    )
+
+    lb_df, mw_trades = run_maker_wick_catcher_study(p4_m4, workers=10)
+    if not mw_trades.empty:
+        mw_trades.to_parquet(m16_data_dir / "maker_wick_all_trades.parquet", index=False, compression="zstd")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_df.to_csv(output_dir / "maker_wick_catcher_leaderboard.csv", index=False)
+    treasures = lb_df[lb_df["is_treasure"]].to_dict(orient="records") if not lb_df.empty else []
+
+    exit_mix: dict[str, dict[str, int]] = {}
+    if not mw_trades.empty:
+        for pid, grp in mw_trades.groupby("mech_id", observed=True):
+            exit_mix[str(pid)] = {str(k): int(v) for k, v in grp["exit_reason"].value_counts().to_dict().items()}
+
+    summary = {
+        "benchmark": "maker_wick_catcher_1ms_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "total_gtx_fills": int(len(mw_trades)),
+        "treasure_count": len(treasures),
+        "treasures": treasures,
+        "exit_mix": exit_mix,
+        "leaderboard": lb_df.to_dict(orient="records") if not lb_df.empty else [],
+    }
+    (output_dir / "maker_wick_catcher_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Análisis 1: Passive `GTX` Maker Limit Wick-Catcher at `1-Millisecond` `aggTrades` Resolution (`2023–2026`)",
+        "",
+        f"- **Queue & Latency Realism:** `+250ms` API latency after `1-ms` forced sell burst, strict `GTX` rejection if crossed, strict trade-through fill (`price < P_limit * 0.9999` or `>= $25k` sell volume), pessimistic `1s` SL-first post-fill resolution (`{len(mw_trades)}` fills, `{summary['elapsed_sec']}s`).",
+        f"- **Strict 4-Gate Universal Treasure Survivors:** **`{len(treasures)}`**",
+        "",
+        "| Profile | `N` | Gross | Fee | **Net Full** | Med | Win`%` | FeeSh`%` | `23-24` | **`2025`** | **`2026`** | **CPCV OOS** | **CPCV`%`** | Treasure |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_df.iterrows():
+        md.append(
+            f"| `{r['mech_id']}` | `{int(r['trades_full'])}` | `{r['mean_gross_bps']:+.1f}` | `{r['mean_fee_bps']:.1f}` | "
+            f"**`{r['mean_net_bps_full']:+.1f}`** | `{r['med_net_bps_full']:+.1f}` | `{r['win_rate_pct']:.1f}%` | "
+            f"`{r['fee_share_of_gross_pct']:.1f}%` | `{r['net_bps_23_24']:+.1f}` | **`{r['net_bps_2025']:+.1f}`** | "
+            f"**`{r['net_bps_2026']:+.1f}`** | `{r['cpcv_infold_oos_bps']:+.1f}` | `{r['cpcv_pos_splits_pct']:.0f}%` | "
+            f"**`{'TREASURE 🏆' if r['is_treasure'] else '—'}`** |"
+        )
+    (output_dir / "maker_wick_catcher_report.md").write_text("\n".join(md) + "\n")
+    print("MAKER_WICK_CATCHER_COMPLETE!", flush=True)
+    return summary
+
+
+def run_core_universe_factor_lab_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Análisis 2: Dynamic Causal Point-in-Time Liquidity Universe (`Rolling 30d ADV Top-15 / Top-20`
+    out of `CANDIDATE_POOL_35`) vs Static `PROD_TOP_15` + Clean `F3_Fast_Swing` IC Gating & `3.5%`
+    Micro-Trim Buffering on the pure Strict `8h` Clock (`intracycle_mode="off"`, `1m` physics `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.core_universe_factor_lab import CANDIDATE_POOL_35
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_cu = Path("/tmp/core_univ_bridge")
+        if stage_cu.exists():
+            shutil.rmtree(stage_cu, ignore_errors=True)
+        raw_cu = stage_cu / "raw"
+        raw_cu.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Core Universe Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_cu / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet",
+                    str(raw_cu / "p2_aggtrades"),
+                ],
+                check=True,
+            )
+
+            keep_syms = set(CANDIDATE_POOL_35) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_cu / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_cu / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_cu = stage_cu / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_cu / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_cu / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_cu / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(
+                raw_cu / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_cu / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+
+            tar_cu = stage_cu / "cu_bundle.tar"
+            with tarfile.open(tar_cu, "w") as tf:
+                for p_it in sorted(slim_cu.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_cu)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_cu, "/content/_cu_bundle.tar"), "Failed uploading Core Universe bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/cu_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_cu_bundle.tar', 'r').extractall('/content/cu_data'); "
+                "os.remove('/content/_cu_bundle.tar'); "
+                "print('CU_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "CU_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Core Universe bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/cu.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'core-universe-factor-lab', '--m16-data-dir', '/content/cu_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/cu.pid', 'w').write(str(p.pid)); "
+                "print(f'CU_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Core Universe & Factor Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/cu.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}'); "
+                    "lines = open('/content/cu.log').read().splitlines() if os.path.exists('/content/cu.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Core Universe Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "CORE_UNIVERSE_FACTOR_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Core Universe & Factor Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "core_universe_factor_leaderboard.csv",
+                "core_universe_factor_summary.json",
+                "core_universe_factor_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_cu.exists():
+                shutil.rmtree(stage_cu, ignore_errors=True)
+                print("[*] Wiped /tmp/core_univ_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.backtest.core_universe_factor_lab import (
+        CANDIDATE_POOL_35,
+        build_pool35_1m_bundle,
+        compute_causal_pit_universe_mask,
+        evaluate_universe_and_factor_experiments,
+    )
+    from src.backtest.p2_portfolio_integration import identify_required_1m_symbols_for_portfolio
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    if not b1h_files:
+        raise FileNotFoundError(f"Missing bars_1h in {m16_data_dir}")
+
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    base_req = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+    )
+    pool_present = [s for s in CANDIDATE_POOL_35 if s in bars_1h_by_sym]
+    needed_1m_syms = sorted(set(base_req) | set(pool_present))
+    print(
+        f"🌐 Análisis 2: Core Universe (`Pool={len(pool_present)}`) & Factor Lab | Streaming {len(needed_1m_syms)} 1m symbols in O(1) float32 RAM...",
+        flush=True,
+    )
+
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+        return df_c
+
+    pool_bundle = build_pool35_1m_bundle(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        eval_start="2023-03-01",
+        loader_workers=6,
+    )
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+    lb_df = evaluate_universe_and_factor_experiments(
+        pool_bundle=pool_bundle,
+        m26_trades_df=m26_df,
+    )
+
+    # Extract concrete Point-in-Time Top-15 membership snapshots across eras for transparency
+    b_pool = pool_bundle["bars_1h_pool"]
+    ev_idx = pool_bundle["eval_idx"]
+    dvol_df = pd.DataFrame({s: b_pool[s]["quote_volume"] for s in pool_bundle["pool_syms"]}).reindex(ev_idx).fillna(0.0)
+    cl_df = pd.DataFrame({s: b_pool[s]["close"] for s in pool_bundle["pool_syms"]}).reindex(ev_idx)
+    pit15 = compute_causal_pit_universe_mask(dvol_df, cl_df, top_k=15, hold_buffer=4, reselect_hours=168)
+    pit_snapshots: dict[str, list[str]] = {}
+    for snap_dt in ("2023-06-01", "2024-06-01", "2025-06-01", "2026-06-01"):
+        sub_m = pit15.loc[pit15.index >= pd.Timestamp(snap_dt, tz="UTC")]
+        if not sub_m.empty:
+            row_m = sub_m.iloc[0]
+            pit_snapshots[snap_dt] = [str(c) for c, v in row_m.items() if bool(v)]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_df.to_csv(output_dir / "core_universe_factor_leaderboard.csv", index=False)
+    summary = {
+        "benchmark": "core_universe_and_factor_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "pool_35_present_count": len(pool_present),
+        "streamed_1m_symbols_count": len(needed_1m_syms),
+        "pit_top15_snapshots": pit_snapshots,
+        "results": lb_df.to_dict(orient="records"),
+    }
+    (output_dir / "core_universe_factor_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Análisis 2: Dynamic Point-in-Time Liquidity Universe (`Top-15 / Top-20`) & Clean Factor / Micro-Trim Lab (`2023–2026`)",
+        "",
+        f"- **Full Stack (`1m` Linear Physics on Strict `8h` Clock `intracycle_mode='off'`):** `Core P1 + Manga P2 + M09/M23/M04 + M26_L2SweepAirPocket` (`{len(needed_1m_syms)}` `1m` symbols, `{summary['elapsed_sec']}s`).",
+        "- **Account Physics:** `$2,700` Two-Phase SafeRamp, `$2,500` Cushion-Safe CPPI Floor, One-Way non-collision.",
+        "",
+        "| Exp ID | Universe | `4Y SR` | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `RebalClose / Part` | `Lock / TP` | `FeeDrag%` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_df.iterrows():
+        fl = "✅" if bool(r["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{r['exp_id']}` | `{r['universe_mode']}` | **`{r['sharpe_4y']:.2f}`** | `{r['cagr_4y_pct']:+.1f}%` | `{r['max_dd_4y_pct']:.2f}%` | "
+            f"`{r['sharpe_23_24']:.2f} / {r['sharpe_2025']:.2f} / {r['sharpe_2026']:.2f}` | "
+            f"`{r['cpcv_mean_sharpe']:.2f}` (`{r['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"`{int(r['rebal_full_closes'])} / {int(r['rebal_partial_adjusts'])}` | "
+            f"`{int(r['profit_lock_exits'])} / {int(r['tp_exits'])}` | `{r['core_fee_drag_pct']:.1f}%` | "
+            f"**`${r['fresh_2026_final_eq']:,.2f}`** (`${r['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    (output_dir / "core_universe_factor_report.md").write_text("\n".join(md) + "\n")
+    print("CORE_UNIVERSE_FACTOR_COMPLETE!", flush=True)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
@@ -4495,6 +4968,8 @@ def build_parser() -> argparse.ArgumentParser:
             "p3-p4-cross-venue-lab",
             "core-rebalance-barrier-lab",
             "p4-m4-liquidation-aggtrades-lab",
+            "maker-wick-catcher-lab",
+            "core-universe-factor-lab",
         ],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
@@ -4689,6 +5164,22 @@ def main() -> None:
                 )
             elif s_name == "p4-m4-liquidation-aggtrades-lab":
                 run_p4_m4_liquidation_aggtrades_lab_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "maker-wick-catcher-lab":
+                run_maker_wick_catcher_lab_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "core-universe-factor-lab":
+                run_core_universe_factor_lab_benchmark(
                     m16_data_dir=Path(args.m16_data_dir),
                     output_dir=out_dir,
                     colab_session=args.colab_session,

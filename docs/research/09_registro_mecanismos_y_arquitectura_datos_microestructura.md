@@ -101,9 +101,12 @@ Cada mecanismo registrado abajo separa **el fenómeno físico observado** (que e
 
 ---
 
-## Parte III — Estado Actual del Ciclo de Descubrimiento y Próximas Fronteras
+## Parte III — Estado Consolidado de Producción y Cierre del Ciclo Forense (`Docs 01..17`)
 
-1. **En Producción Viva (`crypto-mainnet` Tokio):** `M25` apagado (`enable_post_settle_sniper=false`) y **`Sniper:M26_L2SweepAirPocket` (`MEC-06` = `L2 Ask Air-Pocket + 1ms Institutional Sweep + MONO_A Convex Trail`)** desplegado y operando en vivo junto a `Core P1 + Manga P2 + M09/M23/M04` bajo el piso duro de `$2,500.00`.
-2. **Próximas fronteras de alto valor (sin diluir lo que ya funciona):**
-   - **Colector prospectivo `!forceOrder@arr` + `L2/aggTrades` para `MEC-10` (`P4_M4`):** Grabar eventos reales de liquidación forzosa en Binance cruzados con solvencia en Bybit/Hyperliquid y absorción `1-ms` para evaluar si el edge de `+70.9 bps/trade` observado en `2026` se vuelve estructural con datos de liquidación directa.
-   - **Optimización de la Barrera de Rebalanceo del Core P1:** Nuestra auditoría en vivo (`scripts/inspect_production_status.py`) mostró que el `75.8%` de los cierres en producción ocurren en la barrera de rebalanceo de ciclo (`LIMIT/MARKET`) mientras que `Profit-Lock` (`+3.5% -> +1.5%`) y `Take-Profit` (`+5.0%`) son fuertemente ganadores (`+$117` y `+$437` netos). Evaluar amortiguación de rotación (*no-trade buffer* / histéresis de ranking) en `Core P1` es una oportunidad directa para reducir costos de rotación sin agregar riesgo direccional.
+1. **En Producción Viva (`crypto-mainnet` Tokio, Óptimo Pareto Verificado):**
+   - **Pilar 1 (`Core P1`):** `PROD_TOP_15` institucional + **Reloj Estricto de `8h` (`enable_intracycle_rebalance=false`)** (`01_STATIC_TOP15_STRICT_8H`: `4Y Sharpe = 2.19`, `2026 Sharpe = 2.42`, `100%` CPCV splits, `$2,700 -> $5,066.31` en `2026`, `MinEq = $2,550.42` sobre el piso duro CPPI de `$2,500.00`). Ver [14_resultados_barrera_rebalanceo_core_p1.md](./14_resultados_barrera_rebalanceo_core_p1.md) y [17_resultados_universo_dinamico_y_factores_core_p1.md](./17_resultados_universo_dinamico_y_factores_core_p1.md).
+   - **Pilar 2 (`Manga P2`):** `CausalDollarBarTSMOMEngine` (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) activo.
+   - **Pilar 3 (`Event Snipers` sobre `82` monedas con `SL` duro):** `M09 + M23 + M04` + **`Sniper:M26_L2SweepAirPocket` (`MEC-06`: `L2 Ask Air-Pocket + 1ms Institutional Sweep + MONO_A Convex Trail`, `+71.15 bps/trade`, `100%` CPCV)** activos; `M25` apagado definitivamente (`enable_post_settle_sniper=false`).
+2. **Líneas Cerradas con Evidencia Empírica Rigurosa (`0` Capital Expuesto a Sobreajuste):**
+   - **Knife-Catching Direccional en Cascadas de Liquidación (`MEC-03 / MEC-10` — `P4_M4` Taker `1m` y `MW1..MW5` `GTX` Maker `1-ms`):** Archivado definitivamente tras auditar tanto confirmación `Taker 1m + 1ms` ([15_resultados_p4_m4_absorcion_1ms_liquidaciones.md](./15_resultados_p4_m4_absorcion_1ms_liquidaciones.md), `-25.9 bps` en `23–24`) como órdenes pasivas `GTX` `1-ms` con `+250ms` de latencia y prioridad de cola real ([16_resultados_maker_wick_catcher_1ms.md](./16_resultados_maker_wick_catcher_1ms.md), `-72.1` a `-104.1 bps`, `0%` CPCV por *Winner's Curse* de selección adversa).
+   - **Rotación Automática por Volumen Crudo en `Core P1` (`07..10` en Doc `17`):** Archivada (`4Y Sharpe 0.46–1.07` vs `2.19`); las altcoins emergentes/memes (`PEPE, WIF, WLD, TAO`) pertenecen exclusivamente a `Snipers P3` con `Stop-Loss` duro y nunca al libro neutral sin `SL` individual.
