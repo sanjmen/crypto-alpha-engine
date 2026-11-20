@@ -467,6 +467,7 @@ def build_core_1m_tensors_and_base_snipers(
                         "hr_ts": (en_ts // 3600) * 3600,
                         "strat": st_name,
                         "sym": sym,
+                        "side": int(side),
                         "entry_ts": en_ts,
                         "exit_ts": ex_ts,
                         "score": sc_v,

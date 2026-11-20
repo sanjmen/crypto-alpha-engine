@@ -1,0 +1,1995 @@
+{
+  "total_filled_orders": 641,
+  "overall_summary": {
+    "n_orders": 641,
+    "notional_usd": 283024.04,
+    "maker_order_pct": 65.5,
+    "maker_notional_pct": 64.2,
+    "mean_slippage_bps": -0.35,
+    "notional_wtd_slippage_bps": -0.06,
+    "median_slippage_bps": 0.5,
+    "p90_slippage_bps": 12.22,
+    "notional_wtd_fee_bps": 2.78,
+    "notional_wtd_all_in_bps": 2.72,
+    "mean_latency_sec": 664.48,
+    "median_latency_sec": 10.12,
+    "p90_latency_sec": 193.8
+  },
+  "by_execution_path": {
+    "LIMIT_ALL_CHASE": {
+      "n_orders": 551,
+      "notional_usd": 255023.57,
+      "maker_order_pct": 72.6,
+      "maker_notional_pct": 68.3,
+      "mean_slippage_bps": 0.64,
+      "notional_wtd_slippage_bps": 0.73,
+      "median_slippage_bps": 1.0,
+      "p90_slippage_bps": 13.52,
+      "notional_wtd_fee_bps": 2.69,
+      "notional_wtd_all_in_bps": 3.42,
+      "mean_latency_sec": 8.34,
+      "median_latency_sec": 7.22,
+      "p90_latency_sec": 13.75
+    },
+    "LIMIT_FILLED_AS_MAKER": {
+      "n_orders": 400,
+      "notional_usd": 174159.07,
+      "maker_order_pct": 100.0,
+      "maker_notional_pct": 100.0,
+      "mean_slippage_bps": 0.36,
+      "notional_wtd_slippage_bps": 0.51,
+      "median_slippage_bps": 1.0,
+      "p90_slippage_bps": 13.65,
+      "notional_wtd_fee_bps": 2.0,
+      "notional_wtd_all_in_bps": 2.51,
+      "mean_latency_sec": 6.56,
+      "median_latency_sec": 4.98,
+      "p90_latency_sec": 13.48
+    },
+    "LIMIT_FELL_BACK_TO_TAKER_15S": {
+      "n_orders": 151,
+      "notional_usd": 80864.5,
+      "maker_order_pct": 0.0,
+      "maker_notional_pct": 0.0,
+      "mean_slippage_bps": 1.36,
+      "notional_wtd_slippage_bps": 1.2,
+      "median_slippage_bps": 1.89,
+      "p90_slippage_bps": 11.86,
+      "notional_wtd_fee_bps": 4.17,
+      "notional_wtd_all_in_bps": 5.37,
+      "mean_latency_sec": 13.08,
+      "median_latency_sec": 13.73,
+      "p90_latency_sec": 13.9
+    },
+    "DIRECT_MARKET_TAKER": {
+      "n_orders": 2,
+      "notional_usd": 401.81,
+      "maker_order_pct": 0.0,
+      "maker_notional_pct": 0.0,
+      "mean_slippage_bps": 0.0,
+      "notional_wtd_slippage_bps": 0.0,
+      "median_slippage_bps": 0.0,
+      "p90_slippage_bps": 0.0,
+      "notional_wtd_fee_bps": 4.96,
+      "notional_wtd_all_in_bps": 4.96,
+      "mean_latency_sec": 0.16,
+      "median_latency_sec": 0.16,
+      "p90_latency_sec": 0.24
+    }
+  },
+  "funding_settlement_window_collision": {
+    "in_funding_settlement_00_02m": {
+      "n_orders": 73,
+      "notional_usd": 21528.07,
+      "maker_order_pct": 65.8,
+      "maker_notional_pct": 51.7,
+      "mean_slippage_bps": 2.64,
+      "notional_wtd_slippage_bps": 3.46,
+      "median_slippage_bps": 1.33,
+      "p90_slippage_bps": 10.25,
+      "notional_wtd_fee_bps": 3.42,
+      "notional_wtd_all_in_bps": 6.88,
+      "mean_latency_sec": 8.81,
+      "median_latency_sec": 10.06,
+      "p90_latency_sec": 13.8
+    },
+    "off_settlement_minutes": {
+      "n_orders": 478,
+      "notional_usd": 233495.5,
+      "maker_order_pct": 73.6,
+      "maker_notional_pct": 69.8,
+      "mean_slippage_bps": 0.33,
+      "notional_wtd_slippage_bps": 0.48,
+      "median_slippage_bps": 1.0,
+      "p90_slippage_bps": 14.05,
+      "notional_wtd_fee_bps": 2.62,
+      "notional_wtd_all_in_bps": 3.1,
+      "mean_latency_sec": 8.27,
+      "median_latency_sec": 7.18,
+      "p90_latency_sec": 13.74
+    }
+  },
+  "limit_size_buckets": {
+    "small_lt_250": {
+      "n_orders": 194,
+      "notional_usd": 20234.7,
+      "maker_order_pct": 79.9,
+      "maker_notional_pct": 74.0,
+      "mean_slippage_bps": -0.53,
+      "notional_wtd_slippage_bps": 0.51,
+      "median_slippage_bps": 1.0,
+      "p90_slippage_bps": 13.78,
+      "notional_wtd_fee_bps": 2.62,
+      "notional_wtd_all_in_bps": 3.13,
+      "mean_latency_sec": 7.56,
+      "median_latency_sec": 6.77,
+      "p90_latency_sec": 13.74
+    },
+    "mid_250_to_600": {
+      "n_orders": 215,
+      "notional_usd": 88063.59,
+      "maker_order_pct": 71.2,
+      "maker_notional_pct": 71.6,
+      "mean_slippage_bps": 2.27,
+      "notional_wtd_slippage_bps": 2.29,
+      "median_slippage_bps": 1.77,
+      "p90_slippage_bps": 13.5,
+      "notional_wtd_fee_bps": 2.62,
+      "notional_wtd_all_in_bps": 4.91,
+      "mean_latency_sec": 8.7,
+      "median_latency_sec": 7.93,
+      "p90_latency_sec": 13.74
+    },
+    "large_ge_600": {
+      "n_orders": 142,
+      "notional_usd": 146725.27,
+      "maker_order_pct": 64.8,
+      "maker_notional_pct": 65.5,
+      "mean_slippage_bps": -0.24,
+      "notional_wtd_slippage_bps": -0.18,
+      "median_slippage_bps": 1.0,
+      "p90_slippage_bps": 11.78,
+      "notional_wtd_fee_bps": 2.74,
+      "notional_wtd_all_in_bps": 2.56,
+      "mean_latency_sec": 8.87,
+      "median_latency_sec": 10.12,
+      "p90_latency_sec": 13.79
+    }
+  },
+  "order_status_distribution": [
+    {
+      "order_type": "LIMIT",
+      "status": "CANCELED",
+      "role": "MAKER",
+      "cnt": 1
+    },
+    {
+      "order_type": "LIMIT",
+      "status": "FILLED",
+      "role": "MAKER",
+      "cnt": 400
+    },
+    {
+      "order_type": "LIMIT",
+      "status": "FILLED",
+      "role": "TAKER",
+      "cnt": 151
+    },
+    {
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "role": "TAKER",
+      "cnt": 2
+    },
+    {
+      "order_type": "STOP_LOSS",
+      "status": "CANCELED",
+      "role": "TAKER",
+      "cnt": 17
+    },
+    {
+      "order_type": "STOP_LOSS",
+      "status": "FILLED",
+      "role": "TAKER",
+      "cnt": 66
+    },
+    {
+      "order_type": "STOP_LOSS",
+      "status": "PENDING",
+      "role": "TAKER",
+      "cnt": 2
+    },
+    {
+      "order_type": "TAKE_PROFIT",
+      "status": "CANCELED",
+      "role": "MAKER",
+      "cnt": 48
+    },
+    {
+      "order_type": "TAKE_PROFIT",
+      "status": "FILLED",
+      "role": "MAKER",
+      "cnt": 20
+    },
+    {
+      "order_type": "TAKE_PROFIT",
+      "status": "FILLED",
+      "role": "TAKER",
+      "cnt": 2
+    },
+    {
+      "order_type": "TAKE_PROFIT",
+      "status": "PENDING",
+      "role": "MAKER",
+      "cnt": 7
+    }
+  ],
+  "symbol_scorecard": {
+    "BTCUSDT": {
+      "all_orders": {
+        "n_orders": 51,
+        "notional_usd": 27823.83,
+        "maker_order_pct": 76.5,
+        "maker_notional_pct": 71.2,
+        "mean_slippage_bps": 1.76,
+        "notional_wtd_slippage_bps": 0.83,
+        "median_slippage_bps": 1.77,
+        "p90_slippage_bps": 11.42,
+        "notional_wtd_fee_bps": 2.62,
+        "notional_wtd_all_in_bps": 3.45,
+        "mean_latency_sec": 303.82,
+        "median_latency_sec": 6.76,
+        "p90_latency_sec": 13.74
+      },
+      "limit_chase_only": {
+        "n_orders": 47,
+        "notional_usd": 25724.47,
+        "maker_order_pct": 83.0,
+        "maker_notional_pct": 77.0,
+        "mean_slippage_bps": 1.89,
+        "notional_wtd_slippage_bps": 0.89,
+        "median_slippage_bps": 1.98,
+        "p90_slippage_bps": 11.48,
+        "notional_wtd_fee_bps": 2.49,
+        "notional_wtd_all_in_bps": 3.37,
+        "mean_latency_sec": 7.45,
+        "median_latency_sec": 6.75,
+        "p90_latency_sec": 13.73
+      }
+    },
+    "APTUSDT": {
+      "all_orders": {
+        "n_orders": 47,
+        "notional_usd": 27292.64,
+        "maker_order_pct": 61.7,
+        "maker_notional_pct": 56.4,
+        "mean_slippage_bps": -0.27,
+        "notional_wtd_slippage_bps": -2.25,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 11.91,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 0.73,
+        "mean_latency_sec": 339.95,
+        "median_latency_sec": 10.83,
+        "p90_latency_sec": 14.04
+      },
+      "limit_chase_only": {
+        "n_orders": 42,
+        "notional_usd": 24003.87,
+        "maker_order_pct": 66.7,
+        "maker_notional_pct": 62.5,
+        "mean_slippage_bps": -0.3,
+        "notional_wtd_slippage_bps": -2.56,
+        "median_slippage_bps": 2.15,
+        "p90_slippage_bps": 11.99,
+        "notional_wtd_fee_bps": 2.84,
+        "notional_wtd_all_in_bps": 0.28,
+        "mean_latency_sec": 9.42,
+        "median_latency_sec": 10.73,
+        "p90_latency_sec": 13.83
+      }
+    },
+    "ARBUSDT": {
+      "all_orders": {
+        "n_orders": 50,
+        "notional_usd": 26269.34,
+        "maker_order_pct": 74.0,
+        "maker_notional_pct": 69.6,
+        "mean_slippage_bps": 3.74,
+        "notional_wtd_slippage_bps": 3.81,
+        "median_slippage_bps": 2.61,
+        "p90_slippage_bps": 14.73,
+        "notional_wtd_fee_bps": 2.69,
+        "notional_wtd_all_in_bps": 6.5,
+        "mean_latency_sec": 603.01,
+        "median_latency_sec": 7.22,
+        "p90_latency_sec": 51.85
+      },
+      "limit_chase_only": {
+        "n_orders": 43,
+        "notional_usd": 21864.49,
+        "maker_order_pct": 81.4,
+        "maker_notional_pct": 80.1,
+        "mean_slippage_bps": 4.12,
+        "notional_wtd_slippage_bps": 4.43,
+        "median_slippage_bps": 2.71,
+        "p90_slippage_bps": 14.81,
+        "notional_wtd_fee_bps": 2.47,
+        "notional_wtd_all_in_bps": 6.9,
+        "mean_latency_sec": 7.96,
+        "median_latency_sec": 6.87,
+        "p90_latency_sec": 13.67
+      }
+    },
+    "NEARUSDT": {
+      "all_orders": {
+        "n_orders": 49,
+        "notional_usd": 25853.7,
+        "maker_order_pct": 65.3,
+        "maker_notional_pct": 64.3,
+        "mean_slippage_bps": -6.2,
+        "notional_wtd_slippage_bps": -9.96,
+        "median_slippage_bps": -0.46,
+        "p90_slippage_bps": 10.38,
+        "notional_wtd_fee_bps": 2.79,
+        "notional_wtd_all_in_bps": -7.17,
+        "mean_latency_sec": 496.03,
+        "median_latency_sec": 10.12,
+        "p90_latency_sec": 13.91
+      },
+      "limit_chase_only": {
+        "n_orders": 45,
+        "notional_usd": 23118.71,
+        "maker_order_pct": 71.1,
+        "maker_notional_pct": 71.9,
+        "mean_slippage_bps": -4.37,
+        "notional_wtd_slippage_bps": -7.15,
+        "median_slippage_bps": -0.5,
+        "p90_slippage_bps": 10.46,
+        "notional_wtd_fee_bps": 2.63,
+        "notional_wtd_all_in_bps": -4.52,
+        "mean_latency_sec": 8.03,
+        "median_latency_sec": 7.44,
+        "p90_latency_sec": 13.77
+      }
+    },
+    "ETHUSDT": {
+      "all_orders": {
+        "n_orders": 49,
+        "notional_usd": 22457.72,
+        "maker_order_pct": 79.6,
+        "maker_notional_pct": 74.8,
+        "mean_slippage_bps": 0.24,
+        "notional_wtd_slippage_bps": 3.11,
+        "median_slippage_bps": 0.22,
+        "p90_slippage_bps": 7.84,
+        "notional_wtd_fee_bps": 2.58,
+        "notional_wtd_all_in_bps": 5.69,
+        "mean_latency_sec": 1055.85,
+        "median_latency_sec": 6.73,
+        "p90_latency_sec": 20.8
+      },
+      "limit_chase_only": {
+        "n_orders": 43,
+        "notional_usd": 20017.48,
+        "maker_order_pct": 83.7,
+        "maker_notional_pct": 83.1,
+        "mean_slippage_bps": 1.73,
+        "notional_wtd_slippage_bps": 3.89,
+        "median_slippage_bps": 0.97,
+        "p90_slippage_bps": 8.04,
+        "notional_wtd_fee_bps": 2.4,
+        "notional_wtd_all_in_bps": 6.29,
+        "mean_latency_sec": 6.47,
+        "median_latency_sec": 3.98,
+        "p90_latency_sec": 13.63
+      }
+    },
+    "AVAXUSDT": {
+      "all_orders": {
+        "n_orders": 44,
+        "notional_usd": 21603.2,
+        "maker_order_pct": 65.9,
+        "maker_notional_pct": 68.7,
+        "mean_slippage_bps": -4.11,
+        "notional_wtd_slippage_bps": -11.81,
+        "median_slippage_bps": -1.02,
+        "p90_slippage_bps": 8.0,
+        "notional_wtd_fee_bps": 2.73,
+        "notional_wtd_all_in_bps": -9.08,
+        "mean_latency_sec": 246.8,
+        "median_latency_sec": 7.65,
+        "p90_latency_sec": 13.82
+      },
+      "limit_chase_only": {
+        "n_orders": 40,
+        "notional_usd": 19584.34,
+        "maker_order_pct": 72.5,
+        "maker_notional_pct": 75.8,
+        "mean_slippage_bps": -4.62,
+        "notional_wtd_slippage_bps": -13.09,
+        "median_slippage_bps": -1.8,
+        "p90_slippage_bps": 8.41,
+        "notional_wtd_fee_bps": 2.57,
+        "notional_wtd_all_in_bps": -10.53,
+        "mean_latency_sec": 8.33,
+        "median_latency_sec": 6.88,
+        "p90_latency_sec": 13.74
+      }
+    },
+    "RENDERUSDT": {
+      "all_orders": {
+        "n_orders": 45,
+        "notional_usd": 20269.11,
+        "maker_order_pct": 33.3,
+        "maker_notional_pct": 18.8,
+        "mean_slippage_bps": -0.52,
+        "notional_wtd_slippage_bps": -1.75,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": 12.96,
+        "notional_wtd_fee_bps": 3.76,
+        "notional_wtd_all_in_bps": 2.0,
+        "mean_latency_sec": 101.92,
+        "median_latency_sec": 13.73,
+        "p90_latency_sec": 13.89
+      },
+      "limit_chase_only": {
+        "n_orders": 42,
+        "notional_usd": 19127.08,
+        "maker_order_pct": 35.7,
+        "maker_notional_pct": 19.9,
+        "mean_slippage_bps": -0.44,
+        "notional_wtd_slippage_bps": -1.83,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 13.88,
+        "notional_wtd_fee_bps": 3.72,
+        "notional_wtd_all_in_bps": 1.89,
+        "mean_latency_sec": 11.83,
+        "median_latency_sec": 13.73,
+        "p90_latency_sec": 13.85
+      }
+    },
+    "SOLUSDT": {
+      "all_orders": {
+        "n_orders": 40,
+        "notional_usd": 19776.66,
+        "maker_order_pct": 77.5,
+        "maker_notional_pct": 78.4,
+        "mean_slippage_bps": 2.61,
+        "notional_wtd_slippage_bps": 3.8,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 16.73,
+        "notional_wtd_fee_bps": 2.52,
+        "notional_wtd_all_in_bps": 6.32,
+        "mean_latency_sec": 261.48,
+        "median_latency_sec": 7.75,
+        "p90_latency_sec": 13.75
+      },
+      "limit_chase_only": {
+        "n_orders": 38,
+        "notional_usd": 19262.3,
+        "maker_order_pct": 78.9,
+        "maker_notional_pct": 78.3,
+        "mean_slippage_bps": 2.53,
+        "notional_wtd_slippage_bps": 3.72,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 16.84,
+        "notional_wtd_fee_bps": 2.53,
+        "notional_wtd_all_in_bps": 6.24,
+        "mean_latency_sec": 8.2,
+        "median_latency_sec": 7.25,
+        "p90_latency_sec": 13.72
+      }
+    },
+    "XRPUSDT": {
+      "all_orders": {
+        "n_orders": 38,
+        "notional_usd": 19044.83,
+        "maker_order_pct": 89.5,
+        "maker_notional_pct": 84.0,
+        "mean_slippage_bps": 3.2,
+        "notional_wtd_slippage_bps": 2.73,
+        "median_slippage_bps": 1.48,
+        "p90_slippage_bps": 12.43,
+        "notional_wtd_fee_bps": 2.32,
+        "notional_wtd_all_in_bps": 5.05,
+        "mean_latency_sec": 171.99,
+        "median_latency_sec": 6.76,
+        "p90_latency_sec": 13.51
+      },
+      "limit_chase_only": {
+        "n_orders": 37,
+        "notional_usd": 18835.96,
+        "maker_order_pct": 89.2,
+        "maker_notional_pct": 83.8,
+        "mean_slippage_bps": 3.31,
+        "notional_wtd_slippage_bps": 2.77,
+        "median_slippage_bps": 1.97,
+        "p90_slippage_bps": 12.5,
+        "notional_wtd_fee_bps": 2.32,
+        "notional_wtd_all_in_bps": 5.1,
+        "mean_latency_sec": 7.18,
+        "median_latency_sec": 6.76,
+        "p90_latency_sec": 13.48
+      }
+    },
+    "FETUSDT": {
+      "all_orders": {
+        "n_orders": 29,
+        "notional_usd": 18796.6,
+        "maker_order_pct": 37.9,
+        "maker_notional_pct": 44.9,
+        "mean_slippage_bps": 1.62,
+        "notional_wtd_slippage_bps": 0.47,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 8.7,
+        "notional_wtd_fee_bps": 3.1,
+        "notional_wtd_all_in_bps": 3.57,
+        "mean_latency_sec": 1464.96,
+        "median_latency_sec": 13.73,
+        "p90_latency_sec": 6962.48
+      },
+      "limit_chase_only": {
+        "n_orders": 25,
+        "notional_usd": 14851.16,
+        "maker_order_pct": 36.0,
+        "maker_notional_pct": 40.9,
+        "mean_slippage_bps": 4.11,
+        "notional_wtd_slippage_bps": 4.52,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 8.74,
+        "notional_wtd_fee_bps": 3.18,
+        "notional_wtd_all_in_bps": 7.7,
+        "mean_latency_sec": 10.91,
+        "median_latency_sec": 13.73,
+        "p90_latency_sec": 13.93
+      }
+    },
+    "BNBUSDT": {
+      "all_orders": {
+        "n_orders": 28,
+        "notional_usd": 15436.25,
+        "maker_order_pct": 71.4,
+        "maker_notional_pct": 66.5,
+        "mean_slippage_bps": 4.73,
+        "notional_wtd_slippage_bps": 7.95,
+        "median_slippage_bps": 3.19,
+        "p90_slippage_bps": 14.98,
+        "notional_wtd_fee_bps": 2.68,
+        "notional_wtd_all_in_bps": 10.63,
+        "mean_latency_sec": 1408.17,
+        "median_latency_sec": 7.82,
+        "p90_latency_sec": 13.75
+      },
+      "limit_chase_only": {
+        "n_orders": 27,
+        "notional_usd": 14913.48,
+        "maker_order_pct": 70.4,
+        "maker_notional_pct": 65.3,
+        "mean_slippage_bps": 5.81,
+        "notional_wtd_slippage_bps": 9.09,
+        "median_slippage_bps": 3.41,
+        "p90_slippage_bps": 15.21,
+        "notional_wtd_fee_bps": 2.7,
+        "notional_wtd_all_in_bps": 11.79,
+        "mean_latency_sec": 8.63,
+        "median_latency_sec": 7.45,
+        "p90_latency_sec": 13.73
+      }
+    },
+    "LINKUSDT": {
+      "all_orders": {
+        "n_orders": 29,
+        "notional_usd": 13782.87,
+        "maker_order_pct": 82.8,
+        "maker_notional_pct": 78.7,
+        "mean_slippage_bps": 3.91,
+        "notional_wtd_slippage_bps": 2.75,
+        "median_slippage_bps": 3.2,
+        "p90_slippage_bps": 16.04,
+        "notional_wtd_fee_bps": 2.43,
+        "notional_wtd_all_in_bps": 5.18,
+        "mean_latency_sec": 219.8,
+        "median_latency_sec": 4.5,
+        "p90_latency_sec": 13.95
+      },
+      "limit_chase_only": {
+        "n_orders": 27,
+        "notional_usd": 13339.6,
+        "maker_order_pct": 85.2,
+        "maker_notional_pct": 79.4,
+        "mean_slippage_bps": 5.07,
+        "notional_wtd_slippage_bps": 3.3,
+        "median_slippage_bps": 4.23,
+        "p90_slippage_bps": 16.25,
+        "notional_wtd_fee_bps": 2.41,
+        "notional_wtd_all_in_bps": 5.71,
+        "mean_latency_sec": 6.8,
+        "median_latency_sec": 3.7,
+        "p90_latency_sec": 13.73
+      }
+    },
+    "ADAUSDT": {
+      "all_orders": {
+        "n_orders": 23,
+        "notional_usd": 10927.19,
+        "maker_order_pct": 47.8,
+        "maker_notional_pct": 67.1,
+        "mean_slippage_bps": 1.84,
+        "notional_wtd_slippage_bps": 14.44,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 13.57,
+        "notional_wtd_fee_bps": 2.69,
+        "notional_wtd_all_in_bps": 17.13,
+        "mean_latency_sec": 588.23,
+        "median_latency_sec": 13.76,
+        "p90_latency_sec": 1807.26
+      },
+      "limit_chase_only": {
+        "n_orders": 20,
+        "notional_usd": 8776.72,
+        "maker_order_pct": 40.0,
+        "maker_notional_pct": 59.0,
+        "mean_slippage_bps": 3.0,
+        "notional_wtd_slippage_bps": 17.54,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 14.54,
+        "notional_wtd_fee_bps": 2.86,
+        "notional_wtd_all_in_bps": 20.4,
+        "mean_latency_sec": 11.61,
+        "median_latency_sec": 13.74,
+        "p90_latency_sec": 14.11
+      }
+    },
+    "DOGEUSDT": {
+      "all_orders": {
+        "n_orders": 17,
+        "notional_usd": 5399.1,
+        "maker_order_pct": 58.8,
+        "maker_notional_pct": 45.4,
+        "mean_slippage_bps": -2.07,
+        "notional_wtd_slippage_bps": -1.25,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 8.17,
+        "notional_wtd_fee_bps": 3.11,
+        "notional_wtd_all_in_bps": 1.87,
+        "mean_latency_sec": 9.03,
+        "median_latency_sec": 10.46,
+        "p90_latency_sec": 13.72
+      },
+      "limit_chase_only": {
+        "n_orders": 17,
+        "notional_usd": 5399.1,
+        "maker_order_pct": 58.8,
+        "maker_notional_pct": 45.4,
+        "mean_slippage_bps": -2.07,
+        "notional_wtd_slippage_bps": -1.25,
+        "median_slippage_bps": 1.0,
+        "p90_slippage_bps": 8.17,
+        "notional_wtd_fee_bps": 3.11,
+        "notional_wtd_all_in_bps": 1.87,
+        "mean_latency_sec": 9.03,
+        "median_latency_sec": 10.46,
+        "p90_latency_sec": 13.72
+      }
+    },
+    "SUIUSDT": {
+      "all_orders": {
+        "n_orders": 14,
+        "notional_usd": 4126.02,
+        "maker_order_pct": 85.7,
+        "maker_notional_pct": 72.5,
+        "mean_slippage_bps": -5.03,
+        "notional_wtd_slippage_bps": -2.0,
+        "median_slippage_bps": -2.84,
+        "p90_slippage_bps": 8.67,
+        "notional_wtd_fee_bps": 2.55,
+        "notional_wtd_all_in_bps": 0.55,
+        "mean_latency_sec": 7.51,
+        "median_latency_sec": 5.23,
+        "p90_latency_sec": 13.48
+      },
+      "limit_chase_only": {
+        "n_orders": 14,
+        "notional_usd": 4126.02,
+        "maker_order_pct": 85.7,
+        "maker_notional_pct": 72.5,
+        "mean_slippage_bps": -5.03,
+        "notional_wtd_slippage_bps": -2.0,
+        "median_slippage_bps": -2.84,
+        "p90_slippage_bps": 8.67,
+        "notional_wtd_fee_bps": 2.55,
+        "notional_wtd_all_in_bps": 0.55,
+        "mean_latency_sec": 7.51,
+        "median_latency_sec": 5.23,
+        "p90_latency_sec": 13.48
+      }
+    },
+    "IRYSUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 806.81,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 10.94,
+        "notional_wtd_slippage_bps": 11.07,
+        "median_slippage_bps": 10.94,
+        "p90_slippage_bps": 19.7,
+        "notional_wtd_fee_bps": 3.52,
+        "notional_wtd_all_in_bps": 14.59,
+        "mean_latency_sec": 77.03,
+        "median_latency_sec": 77.03,
+        "p90_latency_sec": 128.82
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 398.58,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 2.0,
+        "mean_latency_sec": 12.29,
+        "median_latency_sec": 12.29,
+        "p90_latency_sec": 12.29
+      }
+    },
+    "ZKCUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 767.13,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.7,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 0.0,
+        "notional_wtd_fee_bps": 3.51,
+        "notional_wtd_all_in_bps": 3.51,
+        "mean_latency_sec": 6.13,
+        "median_latency_sec": 6.13,
+        "p90_latency_sec": 10.98
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 381.16,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 2.0,
+        "mean_latency_sec": 12.19,
+        "median_latency_sec": 12.19,
+        "p90_latency_sec": 12.19
+      }
+    },
+    "HUMAUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 756.43,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 50.4,
+        "mean_slippage_bps": -54.05,
+        "notional_wtd_slippage_bps": -53.64,
+        "median_slippage_bps": -54.05,
+        "p90_slippage_bps": -10.81,
+        "notional_wtd_fee_bps": 3.49,
+        "notional_wtd_all_in_bps": -50.15,
+        "mean_latency_sec": 15.59,
+        "median_latency_sec": 15.59,
+        "p90_latency_sec": 19.85
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 381.13,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 2.0,
+        "mean_latency_sec": 20.91,
+        "median_latency_sec": 20.91,
+        "p90_latency_sec": 20.91
+      }
+    },
+    "INITUSDT": {
+      "all_orders": {
+        "n_orders": 6,
+        "notional_usd": 124.48,
+        "maker_order_pct": 66.7,
+        "maker_notional_pct": 68.8,
+        "mean_slippage_bps": -8.69,
+        "notional_wtd_slippage_bps": -12.37,
+        "median_slippage_bps": -2.1,
+        "p90_slippage_bps": 28.8,
+        "notional_wtd_fee_bps": 2.62,
+        "notional_wtd_all_in_bps": -9.74,
+        "mean_latency_sec": 470.81,
+        "median_latency_sec": 58.24,
+        "p90_latency_sec": 1350.69
+      },
+      "limit_chase_only": {
+        "n_orders": 3,
+        "notional_usd": 62.05,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -36.59,
+        "notional_wtd_slippage_bps": -46.74,
+        "median_slippage_bps": -9.2,
+        "p90_slippage_bps": -5.21,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -44.74,
+        "mean_latency_sec": 3.91,
+        "median_latency_sec": 3.54,
+        "p90_latency_sec": 4.47
+      }
+    },
+    "JCTUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 120.33,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.2,
+        "mean_slippage_bps": -28.63,
+        "notional_wtd_slippage_bps": -29.35,
+        "median_slippage_bps": -28.05,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 2.98,
+        "notional_wtd_all_in_bps": -26.38,
+        "mean_latency_sec": 465.85,
+        "median_latency_sec": 406.6,
+        "p90_latency_sec": 975.27
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 61.56,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -57.26,
+        "notional_wtd_slippage_bps": -57.37,
+        "median_slippage_bps": -57.26,
+        "p90_slippage_bps": -56.34,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -55.37,
+        "mean_latency_sec": 3.87,
+        "median_latency_sec": 3.87,
+        "p90_latency_sec": 3.96
+      }
+    },
+    "BULLAUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 114.36,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 1.4,
+        "notional_wtd_slippage_bps": 0.93,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": 8.36,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 3.94,
+        "mean_latency_sec": 31.52,
+        "median_latency_sec": 30.74,
+        "p90_latency_sec": 58.12
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 56.47,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 2.81,
+        "notional_wtd_slippage_bps": 1.87,
+        "median_slippage_bps": 2.81,
+        "p90_slippage_bps": 10.12,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 3.87,
+        "mean_latency_sec": 6.92,
+        "median_latency_sec": 6.92,
+        "p90_latency_sec": 9.67
+      }
+    },
+    "AKEUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 114.29,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.7,
+        "mean_slippage_bps": 9.64,
+        "notional_wtd_slippage_bps": 9.57,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 43.44,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 12.58,
+        "mean_latency_sec": 624.82,
+        "median_latency_sec": 38.0,
+        "p90_latency_sec": 1715.71
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 56.79,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 19.28,
+        "notional_wtd_slippage_bps": 19.26,
+        "median_slippage_bps": 19.28,
+        "p90_slippage_bps": 53.5,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 21.26,
+        "mean_latency_sec": 3.45,
+        "median_latency_sec": 3.45,
+        "p90_latency_sec": 3.55
+      }
+    },
+    "SHELLUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 106.51,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.0,
+        "mean_slippage_bps": -16.5,
+        "notional_wtd_slippage_bps": -17.4,
+        "median_slippage_bps": -1.88,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 3.02,
+        "notional_wtd_all_in_bps": -14.38,
+        "mean_latency_sec": 687.89,
+        "median_latency_sec": 42.4,
+        "p90_latency_sec": 1888.71
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 52.2,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -33.01,
+        "notional_wtd_slippage_bps": -35.5,
+        "median_slippage_bps": -33.01,
+        "p90_slippage_bps": -9.62,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -33.5,
+        "mean_latency_sec": 3.47,
+        "median_latency_sec": 3.47,
+        "p90_latency_sec": 3.47
+      }
+    },
+    "BERAUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 101.01,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.2,
+        "mean_slippage_bps": -14.62,
+        "notional_wtd_slippage_bps": -14.63,
+        "median_slippage_bps": -12.21,
+        "p90_slippage_bps": -0.0,
+        "notional_wtd_fee_bps": 3.02,
+        "notional_wtd_all_in_bps": -11.62,
+        "mean_latency_sec": 309.52,
+        "median_latency_sec": 20.54,
+        "p90_latency_sec": 844.34
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 49.66,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -29.24,
+        "notional_wtd_slippage_bps": -29.77,
+        "median_slippage_bps": -29.24,
+        "p90_slippage_bps": -25.39,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -27.77,
+        "mean_latency_sec": 7.2,
+        "median_latency_sec": 7.2,
+        "p90_latency_sec": 9.81
+      }
+    },
+    "EVAAUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 98.64,
+        "maker_order_pct": 75.0,
+        "maker_notional_pct": 77.0,
+        "mean_slippage_bps": -19.9,
+        "notional_wtd_slippage_bps": -18.48,
+        "median_slippage_bps": -14.25,
+        "p90_slippage_bps": 2.16,
+        "notional_wtd_fee_bps": 2.46,
+        "notional_wtd_all_in_bps": -16.02,
+        "mean_latency_sec": 627.36,
+        "median_latency_sec": 60.22,
+        "p90_latency_sec": 1704.96
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 49.92,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -25.56,
+        "notional_wtd_slippage_bps": -21.65,
+        "median_slippage_bps": -25.56,
+        "p90_slippage_bps": -2.64,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -19.65,
+        "mean_latency_sec": 3.49,
+        "median_latency_sec": 3.49,
+        "p90_latency_sec": 3.5
+      }
+    },
+    "ASTERUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 86.79,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 15.88,
+        "notional_wtd_slippage_bps": 14.18,
+        "median_slippage_bps": 15.88,
+        "p90_slippage_bps": 59.86,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 16.18,
+        "mean_latency_sec": 785.13,
+        "median_latency_sec": 785.13,
+        "p90_latency_sec": 1407.23
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 42.05,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 70.85,
+        "notional_wtd_slippage_bps": 70.85,
+        "median_slippage_bps": 70.85,
+        "p90_slippage_bps": 70.85,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 72.85,
+        "mean_latency_sec": 7.5,
+        "median_latency_sec": 7.5,
+        "p90_latency_sec": 7.5
+      }
+    },
+    "BTWUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 75.2,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": 9.66,
+        "notional_wtd_slippage_bps": 8.72,
+        "median_slippage_bps": 3.49,
+        "p90_slippage_bps": 24.26,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 11.69,
+        "mean_latency_sec": 866.44,
+        "median_latency_sec": 379.34,
+        "p90_latency_sec": 2117.68
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 38.56,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 19.32,
+        "notional_wtd_slippage_bps": 17.0,
+        "median_slippage_bps": 19.32,
+        "p90_slippage_bps": 29.19,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 19.0,
+        "mean_latency_sec": 5.46,
+        "median_latency_sec": 5.46,
+        "p90_latency_sec": 6.62
+      }
+    },
+    "AGTUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 69.11,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 50.0,
+        "mean_slippage_bps": 0.55,
+        "notional_wtd_slippage_bps": 0.36,
+        "median_slippage_bps": -0.0,
+        "p90_slippage_bps": 1.55,
+        "notional_wtd_fee_bps": 3.0,
+        "notional_wtd_all_in_bps": 3.36,
+        "mean_latency_sec": 266.0,
+        "median_latency_sec": 67.67,
+        "p90_latency_sec": 683.2
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 34.54,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 1.11,
+        "notional_wtd_slippage_bps": 0.72,
+        "median_slippage_bps": 1.11,
+        "p90_slippage_bps": 1.99,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 2.72,
+        "mean_latency_sec": 7.6,
+        "median_latency_sec": 7.6,
+        "p90_latency_sec": 7.85
+      }
+    },
+    "MAGMAUSDT": {
+      "all_orders": {
+        "n_orders": 4,
+        "notional_usd": 68.18,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 8.99,
+        "notional_wtd_slippage_bps": 9.66,
+        "median_slippage_bps": 0.79,
+        "p90_slippage_bps": 24.53,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 12.67,
+        "mean_latency_sec": 76.64,
+        "median_latency_sec": 54.65,
+        "p90_latency_sec": 166.32
+      },
+      "limit_chase_only": {
+        "n_orders": 2,
+        "notional_usd": 33.67,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 17.97,
+        "notional_wtd_slippage_bps": 19.55,
+        "median_slippage_bps": 17.97,
+        "p90_slippage_bps": 31.09,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 21.55,
+        "mean_latency_sec": 5.28,
+        "median_latency_sec": 5.28,
+        "p90_latency_sec": 6.73
+      }
+    },
+    "KAVAUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 66.15,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": 11.22,
+        "notional_wtd_slippage_bps": 11.51,
+        "median_slippage_bps": 11.22,
+        "p90_slippage_bps": 20.19,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 14.48,
+        "mean_latency_sec": 27.2,
+        "median_latency_sec": 27.2,
+        "p90_latency_sec": 46.18
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 33.92,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 22.44,
+        "notional_wtd_slippage_bps": 22.44,
+        "median_slippage_bps": 22.44,
+        "p90_slippage_bps": 22.44,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 24.44,
+        "mean_latency_sec": 3.47,
+        "median_latency_sec": 3.47,
+        "p90_latency_sec": 3.47
+      }
+    },
+    "ARIAUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 65.76,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": 3.69,
+        "notional_wtd_slippage_bps": 3.78,
+        "median_slippage_bps": 3.69,
+        "p90_slippage_bps": 6.63,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 6.75,
+        "mean_latency_sec": 371.24,
+        "median_latency_sec": 371.24,
+        "p90_latency_sec": 662.06
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 33.72,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 7.37,
+        "notional_wtd_slippage_bps": 7.37,
+        "median_slippage_bps": 7.37,
+        "p90_slippage_bps": 7.37,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 9.37,
+        "mean_latency_sec": 7.72,
+        "median_latency_sec": 7.72,
+        "p90_latency_sec": 7.72
+      }
+    },
+    "DODOXUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 59.06,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 3.32,
+        "notional_wtd_slippage_bps": 3.28,
+        "median_slippage_bps": 3.32,
+        "p90_slippage_bps": 5.97,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 6.29,
+        "mean_latency_sec": 90.0,
+        "median_latency_sec": 90.0,
+        "p90_latency_sec": 156.39
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 29.17,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 6.63,
+        "notional_wtd_slippage_bps": 6.63,
+        "median_slippage_bps": 6.63,
+        "p90_slippage_bps": 6.63,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 8.63,
+        "mean_latency_sec": 7.01,
+        "median_latency_sec": 7.01,
+        "p90_latency_sec": 7.01
+      }
+    },
+    "PUMPUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 55.42,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 1.76,
+        "notional_wtd_slippage_bps": 1.74,
+        "median_slippage_bps": 1.76,
+        "p90_slippage_bps": 3.17,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 4.75,
+        "mean_latency_sec": 6560.03,
+        "median_latency_sec": 6560.03,
+        "p90_latency_sec": 11805.22
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 27.37,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 3.53,
+        "notional_wtd_slippage_bps": 3.53,
+        "median_slippage_bps": 3.53,
+        "p90_slippage_bps": 3.53,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 5.53,
+        "mean_latency_sec": 3.55,
+        "median_latency_sec": 3.55,
+        "p90_latency_sec": 3.55
+      }
+    },
+    "PENGUUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 52.32,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": -3.02,
+        "notional_wtd_slippage_bps": -3.1,
+        "median_slippage_bps": -3.02,
+        "p90_slippage_bps": -0.6,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": -0.12,
+        "mean_latency_sec": 1808.38,
+        "median_latency_sec": 1808.38,
+        "p90_latency_sec": 3252.31
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 26.83,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -6.04,
+        "notional_wtd_slippage_bps": -6.04,
+        "median_slippage_bps": -6.04,
+        "p90_slippage_bps": -6.04,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -4.04,
+        "mean_latency_sec": 3.47,
+        "median_latency_sec": 3.47,
+        "p90_latency_sec": 3.47
+      }
+    },
+    "AINUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 50.93,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -48.93,
+        "notional_wtd_slippage_bps": -53.25,
+        "median_slippage_bps": -48.93,
+        "p90_slippage_bps": 43.71,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -51.25,
+        "mean_latency_sec": 65.55,
+        "median_latency_sec": 65.55,
+        "p90_latency_sec": 112.35
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 24.51,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 66.87,
+        "notional_wtd_slippage_bps": 66.87,
+        "median_slippage_bps": 66.87,
+        "p90_slippage_bps": 66.87,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 68.87,
+        "mean_latency_sec": 7.06,
+        "median_latency_sec": 7.06,
+        "p90_latency_sec": 7.06
+      }
+    },
+    "SOPHUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 44.88,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": -7.79,
+        "notional_wtd_slippage_bps": -7.99,
+        "median_slippage_bps": -7.79,
+        "p90_slippage_bps": -1.56,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": -5.02,
+        "mean_latency_sec": 261.36,
+        "median_latency_sec": 261.36,
+        "p90_latency_sec": 467.67
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 23.01,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -15.59,
+        "notional_wtd_slippage_bps": -15.59,
+        "median_slippage_bps": -15.59,
+        "p90_slippage_bps": -15.59,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -13.59,
+        "mean_latency_sec": 3.47,
+        "median_latency_sec": 3.47,
+        "p90_latency_sec": 3.47
+      }
+    },
+    "IDOLUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 40.08,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.5,
+        "mean_slippage_bps": -5.36,
+        "notional_wtd_slippage_bps": -5.52,
+        "median_slippage_bps": -5.36,
+        "p90_slippage_bps": -1.07,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": -2.55,
+        "mean_latency_sec": 12380.82,
+        "median_latency_sec": 12380.82,
+        "p90_latency_sec": 22274.26
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 19.45,
+        "maker_order_pct": 0.0,
+        "maker_notional_pct": 0.0,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 0.0,
+        "notional_wtd_fee_bps": 4.0,
+        "notional_wtd_all_in_bps": 4.0,
+        "mean_latency_sec": 14.03,
+        "median_latency_sec": 14.03,
+        "p90_latency_sec": 14.03
+      }
+    },
+    "HUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 37.43,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 49.4,
+        "mean_slippage_bps": 4.64,
+        "notional_wtd_slippage_bps": 4.58,
+        "median_slippage_bps": 4.64,
+        "p90_slippage_bps": 8.35,
+        "notional_wtd_fee_bps": 3.01,
+        "notional_wtd_all_in_bps": 7.6,
+        "mean_latency_sec": 159.65,
+        "median_latency_sec": 159.65,
+        "p90_latency_sec": 276.52
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 18.49,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 9.28,
+        "notional_wtd_slippage_bps": 9.28,
+        "median_slippage_bps": 9.28,
+        "p90_slippage_bps": 9.28,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 11.28,
+        "mean_latency_sec": 13.56,
+        "median_latency_sec": 13.56,
+        "p90_latency_sec": 13.56
+      }
+    },
+    "PIEVERSEUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 36.97,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.0,
+        "mean_slippage_bps": 9.56,
+        "notional_wtd_slippage_bps": 9.76,
+        "median_slippage_bps": 9.56,
+        "p90_slippage_bps": 17.21,
+        "notional_wtd_fee_bps": 2.98,
+        "notional_wtd_all_in_bps": 12.74,
+        "mean_latency_sec": 309.53,
+        "median_latency_sec": 309.53,
+        "p90_latency_sec": 554.38
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 18.87,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 19.12,
+        "notional_wtd_slippage_bps": 19.12,
+        "median_slippage_bps": 19.12,
+        "p90_slippage_bps": 19.12,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 21.12,
+        "mean_latency_sec": 3.48,
+        "median_latency_sec": 3.48,
+        "p90_latency_sec": 3.48
+      }
+    },
+    "BMTUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 36.44,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.0,
+        "mean_slippage_bps": 2.04,
+        "notional_wtd_slippage_bps": 2.08,
+        "median_slippage_bps": 2.04,
+        "p90_slippage_bps": 3.67,
+        "notional_wtd_fee_bps": 2.98,
+        "notional_wtd_all_in_bps": 5.06,
+        "mean_latency_sec": 2957.81,
+        "median_latency_sec": 2957.81,
+        "p90_latency_sec": 5320.31
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 18.59,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 4.08,
+        "notional_wtd_slippage_bps": 4.08,
+        "median_slippage_bps": 4.08,
+        "p90_slippage_bps": 4.08,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 6.08,
+        "mean_latency_sec": 4.69,
+        "median_latency_sec": 4.69,
+        "p90_latency_sec": 4.69
+      }
+    },
+    "TACUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 31.3,
+        "maker_order_pct": 0.0,
+        "maker_notional_pct": 0.0,
+        "mean_slippage_bps": -7.52,
+        "notional_wtd_slippage_bps": -7.43,
+        "median_slippage_bps": -7.52,
+        "p90_slippage_bps": -1.5,
+        "notional_wtd_fee_bps": 4.0,
+        "notional_wtd_all_in_bps": -3.43,
+        "mean_latency_sec": 7.03,
+        "median_latency_sec": 7.03,
+        "p90_latency_sec": 12.44
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 15.46,
+        "maker_order_pct": 0.0,
+        "maker_notional_pct": 0.0,
+        "mean_slippage_bps": -15.05,
+        "notional_wtd_slippage_bps": -15.05,
+        "median_slippage_bps": -15.05,
+        "p90_slippage_bps": -15.05,
+        "notional_wtd_fee_bps": 4.0,
+        "notional_wtd_all_in_bps": -11.05,
+        "mean_latency_sec": 13.8,
+        "median_latency_sec": 13.8,
+        "p90_latency_sec": 13.8
+      }
+    },
+    "\u725b\u6765USDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 30.82,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": -0.96,
+        "notional_wtd_slippage_bps": -0.99,
+        "median_slippage_bps": -0.96,
+        "p90_slippage_bps": -0.19,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 1.98,
+        "mean_latency_sec": 1621.2,
+        "median_latency_sec": 1621.2,
+        "p90_latency_sec": 2912.68
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 15.81,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -1.93,
+        "notional_wtd_slippage_bps": -1.93,
+        "median_slippage_bps": -1.93,
+        "p90_slippage_bps": -1.93,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 0.07,
+        "mean_latency_sec": 6.85,
+        "median_latency_sec": 6.85,
+        "p90_latency_sec": 6.85
+      }
+    },
+    "USELESSUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 28.89,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": -25.45,
+        "notional_wtd_slippage_bps": -26.11,
+        "median_slippage_bps": -25.45,
+        "p90_slippage_bps": -5.09,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": -23.13,
+        "mean_latency_sec": 2770.47,
+        "median_latency_sec": 2770.47,
+        "p90_latency_sec": 4984.07
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 14.82,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -50.91,
+        "notional_wtd_slippage_bps": -50.91,
+        "median_slippage_bps": -50.91,
+        "p90_slippage_bps": -50.91,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -48.91,
+        "mean_latency_sec": 3.47,
+        "median_latency_sec": 3.47,
+        "p90_latency_sec": 3.47
+      }
+    },
+    "BLESSUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 25.42,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.0,
+        "mean_slippage_bps": 8.09,
+        "notional_wtd_slippage_bps": 8.25,
+        "median_slippage_bps": 8.09,
+        "p90_slippage_bps": 14.56,
+        "notional_wtd_fee_bps": 2.98,
+        "notional_wtd_all_in_bps": 11.23,
+        "mean_latency_sec": 2570.47,
+        "median_latency_sec": 2570.47,
+        "p90_latency_sec": 4621.39
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 12.97,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 16.17,
+        "notional_wtd_slippage_bps": 16.17,
+        "median_slippage_bps": 16.17,
+        "p90_slippage_bps": 16.17,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 18.17,
+        "mean_latency_sec": 6.83,
+        "median_latency_sec": 6.83,
+        "p90_latency_sec": 6.83
+      }
+    },
+    "BARDUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 24.19,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 0.0,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": 2.97,
+        "mean_latency_sec": 18434.88,
+        "median_latency_sec": 18434.88,
+        "p90_latency_sec": 33177.33
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 12.4,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 0.0,
+        "notional_wtd_slippage_bps": 0.0,
+        "median_slippage_bps": 0.0,
+        "p90_slippage_bps": 0.0,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 2.0,
+        "mean_latency_sec": 6.82,
+        "median_latency_sec": 6.82,
+        "p90_latency_sec": 6.82
+      }
+    },
+    "UAIUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 23.91,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.0,
+        "mean_slippage_bps": 6.99,
+        "notional_wtd_slippage_bps": 7.14,
+        "median_slippage_bps": 6.99,
+        "p90_slippage_bps": 12.59,
+        "notional_wtd_fee_bps": 2.98,
+        "notional_wtd_all_in_bps": 10.12,
+        "mean_latency_sec": 70.31,
+        "median_latency_sec": 70.31,
+        "p90_latency_sec": 123.71
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 12.2,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": 13.99,
+        "notional_wtd_slippage_bps": 13.99,
+        "median_slippage_bps": 13.99,
+        "p90_slippage_bps": 13.99,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": 15.99,
+        "mean_latency_sec": 3.57,
+        "median_latency_sec": 3.57,
+        "p90_latency_sec": 3.57
+      }
+    },
+    "PONSUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 23.73,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 51.3,
+        "mean_slippage_bps": -3.74,
+        "notional_wtd_slippage_bps": -3.83,
+        "median_slippage_bps": -3.74,
+        "p90_slippage_bps": -0.75,
+        "notional_wtd_fee_bps": 2.97,
+        "notional_wtd_all_in_bps": -0.86,
+        "mean_latency_sec": 9339.96,
+        "median_latency_sec": 9339.96,
+        "p90_latency_sec": 16806.09
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 12.17,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -7.47,
+        "notional_wtd_slippage_bps": -7.47,
+        "median_slippage_bps": -7.47,
+        "p90_slippage_bps": -7.47,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -5.47,
+        "mean_latency_sec": 7.3,
+        "median_latency_sec": 7.3,
+        "p90_latency_sec": 7.3
+      }
+    },
+    "PRLUSDT": {
+      "all_orders": {
+        "n_orders": 2,
+        "notional_usd": 22.02,
+        "maker_order_pct": 50.0,
+        "maker_notional_pct": 48.5,
+        "mean_slippage_bps": -19.67,
+        "notional_wtd_slippage_bps": -19.91,
+        "median_slippage_bps": -19.67,
+        "p90_slippage_bps": -13.4,
+        "notional_wtd_fee_bps": 3.03,
+        "notional_wtd_all_in_bps": -16.88,
+        "mean_latency_sec": 6862.59,
+        "median_latency_sec": 6862.59,
+        "p90_latency_sec": 12349.29
+      },
+      "limit_chase_only": {
+        "n_orders": 1,
+        "notional_usd": 10.67,
+        "maker_order_pct": 100.0,
+        "maker_notional_pct": 100.0,
+        "mean_slippage_bps": -11.83,
+        "notional_wtd_slippage_bps": -11.83,
+        "median_slippage_bps": -11.83,
+        "p90_slippage_bps": -11.83,
+        "notional_wtd_fee_bps": 2.0,
+        "notional_wtd_all_in_bps": -9.83,
+        "mean_latency_sec": 4.2,
+        "median_latency_sec": 4.2,
+        "p90_latency_sec": 4.2
+      }
+    }
+  },
+  "funding_settlements_summary": {
+    "n_events": 246,
+    "net_funding_usd": -0.2785,
+    "pos_funding_usd": 4.3715,
+    "neg_funding_usd": -4.65
+  },
+  "funding_by_symbol_side": [
+    {
+      "symbol": "APT/USDT",
+      "position_side": "SHORT",
+      "n": 10,
+      "net_usd": -1.5649,
+      "avg_fr_bps": -1.76
+    },
+    {
+      "symbol": "SOL/USDT",
+      "position_side": "SHORT",
+      "n": 8,
+      "net_usd": -0.3413,
+      "avg_fr_bps": -0.49
+    },
+    {
+      "symbol": "FET/USDT",
+      "position_side": "LONG",
+      "n": 6,
+      "net_usd": -0.3234,
+      "avg_fr_bps": 0.53
+    },
+    {
+      "symbol": "AVAX/USDT",
+      "position_side": "SHORT",
+      "n": 5,
+      "net_usd": -0.284,
+      "avg_fr_bps": -0.6
+    },
+    {
+      "symbol": "RENDER/USDT",
+      "position_side": "LONG",
+      "n": 10,
+      "net_usd": -0.2215,
+      "avg_fr_bps": 0.4
+    },
+    {
+      "symbol": "NEAR/USDT",
+      "position_side": "LONG",
+      "n": 10,
+      "net_usd": -0.1967,
+      "avg_fr_bps": 0.5
+    },
+    {
+      "symbol": "BTC/USDT",
+      "position_side": "LONG",
+      "n": 7,
+      "net_usd": -0.1346,
+      "avg_fr_bps": 0.33
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "position_side": "SHORT",
+      "n": 3,
+      "net_usd": -0.1026,
+      "avg_fr_bps": -0.49
+    },
+    {
+      "symbol": "SUI/USDT",
+      "position_side": "LONG",
+      "n": 10,
+      "net_usd": -0.0813,
+      "avg_fr_bps": -0.24
+    },
+    {
+      "symbol": "LINK/USDT",
+      "position_side": "LONG",
+      "n": 9,
+      "net_usd": -0.0565,
+      "avg_fr_bps": 0.15
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "position_side": "LONG",
+      "n": 9,
+      "net_usd": -0.0234,
+      "avg_fr_bps": 0.27
+    },
+    {
+      "symbol": "ARB/USDT",
+      "position_side": "LONG",
+      "n": 8,
+      "net_usd": -0.023,
+      "avg_fr_bps": -0.04
+    },
+    {
+      "symbol": "MAGMA/USDT",
+      "position_side": "LONG",
+      "n": 1,
+      "net_usd": -0.0008,
+      "avg_fr_bps": 0.5
+    },
+    {
+      "symbol": "PONS/USDT",
+      "position_side": "LONG",
+      "n": 1,
+      "net_usd": -0.0006,
+      "avg_fr_bps": 0.5
+    },
+    {
+      "symbol": "BNB/USDT",
+      "position_side": "LONG",
+      "n": 3,
+      "net_usd": 0.0,
+      "avg_fr_bps": 0.0
+    },
+    {
+      "symbol": "PUMP/USDT",
+      "position_side": "LONG",
+      "n": 1,
+      "net_usd": 0.0004,
+      "avg_fr_bps": -0.14
+    },
+    {
+      "symbol": "PRL/USDT",
+      "position_side": "LONG",
+      "n": 1,
+      "net_usd": 0.0008,
+      "avg_fr_bps": -0.7
+    },
+    {
+      "symbol": "ETH/USDT",
+      "position_side": "LONG",
+      "n": 9,
+      "net_usd": 0.0102,
+      "avg_fr_bps": 0.06
+    },
+    {
+      "symbol": "LINK/USDT",
+      "position_side": "SHORT",
+      "n": 2,
+      "net_usd": 0.0158,
+      "avg_fr_bps": 0.09
+    },
+    {
+      "symbol": "TAC/USDT",
+      "position_side": "SHORT",
+      "n": 1,
+      "net_usd": 0.0159,
+      "avg_fr_bps": 9.91
+    }
+  ],
+  "live_exposure_snapshot": {
+    "open_positions_count": 7,
+    "gross_long_usd": 563.94,
+    "gross_short_usd": 1070.84,
+    "net_usd": -506.89,
+    "p2_weights": {
+      "BTCUSDT": -0.09329532157917789,
+      "ETHUSDT": -0.09212468745994205
+    },
+    "open_positions": [
+      {
+        "symbol": "ETH/USDT",
+        "side": "SHORT",
+        "quantity": 0.008,
+        "entry_price": 1740.79,
+        "current_price": 1738.495,
+        "notional": 13.90796,
+        "unrealized_pnl": 0.018360000000000584,
+        "strategy": "P2:DollarBar_TSMOM"
+      },
+      {
+        "symbol": "SOL/USDT",
+        "side": "LONG",
+        "quantity": 3.12,
+        "entry_price": 74.38906976744,
+        "current_price": 70.765,
+        "notional": 220.7868,
+        "unrealized_pnl": -11.307097674412818,
+        "strategy": "F7_HighLiq_Size (Quality)"
+      },
+      {
+        "symbol": "XRP/USDT",
+        "side": "LONG",
+        "quantity": 365.7,
+        "entry_price": 0.9595014219305,
+        "current_price": 0.93835,
+        "notional": 343.154595,
+        "unrealized_pnl": -7.735074999983855,
+        "strategy": "F7_HighLiq_Size (Quality)"
+      },
+      {
+        "symbol": "APT/USDT",
+        "side": "SHORT",
+        "quantity": 845.2,
+        "entry_price": 0.4034886180786,
+        "current_price": 0.40025,
+        "notional": 338.29130000000004,
+        "unrealized_pnl": 2.7372800000327087,
+        "strategy": "F7_HighLiq_Size (Quality)"
+      },
+      {
+        "symbol": "ARB/USDT",
+        "side": "SHORT",
+        "quantity": 2851.3,
+        "entry_price": 0.1187982499211,
+        "current_price": 0.116945,
+        "notional": 333.44527850000003,
+        "unrealized_pnl": 5.284171500032439,
+        "strategy": "F7_HighLiq_Size (Quality)"
+      },
+      {
+        "symbol": "RENDER/USDT",
+        "side": "SHORT",
+        "quantity": 166.1,
+        "entry_price": 1.367,
+        "current_price": 1.3215,
+        "notional": 219.50114999999997,
+        "unrealized_pnl": 7.557550000000016,
+        "strategy": "F7_HighLiq_Size (Quality)"
+      },
+      {
+        "symbol": "FET/USDT",
+        "side": "SHORT",
+        "quantity": 1400.0,
+        "entry_price": 0.1228,
+        "current_price": 0.11835000000000001,
+        "notional": 165.69000000000003,
+        "unrealized_pnl": 6.229999999999994,
+        "strategy": "F2_Med_Idio_PB (3d-7d)"
+      }
+    ]
+  }
+}

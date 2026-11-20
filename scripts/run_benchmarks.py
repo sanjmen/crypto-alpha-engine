@@ -4945,6 +4945,941 @@ def run_core_universe_factor_lab_benchmark(
     return summary
 
 
+def run_execution_timing_router_lab_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente A: Sub-Cycle Execution Timing (`Pre-Settlement` vs `:00 Storm` vs `Post-Storm`),
+    Unconditional Stub Suppression & Router Microstructure Physics (`1-Minute` Resolution, `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.p2_portfolio_integration import PROD_TOP_15
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_et = Path("/tmp/exec_timing_bridge")
+        if stage_et.exists():
+            shutil.rmtree(stage_et, ignore_errors=True)
+        raw_et = stage_et / "raw"
+        raw_et.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Execution Timing Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_et / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet",
+                    str(raw_et / "p2_aggtrades"),
+                ],
+                check=True,
+            )
+
+            keep_syms = set(PROD_TOP_15) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_et / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_et / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_et = stage_et / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_et / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_et / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_et / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(
+                raw_et / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_et / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+
+            tar_et = stage_et / "et_bundle.tar"
+            with tarfile.open(tar_et, "w") as tf:
+                for p_it in sorted(slim_et.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_et)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_et, "/content/_et_bundle.tar"), "Failed uploading Execution Timing bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/et_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_et_bundle.tar', 'r').extractall('/content/et_data'); "
+                "os.remove('/content/_et_bundle.tar'); "
+                "print('ET_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "ET_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Execution Timing bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/et.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'execution-timing-router-lab', '--m16-data-dir', '/content/et_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/et.pid', 'w').write(str(p.pid)); "
+                "print(f'ET_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Execution Timing & Router Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/et.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}'); "
+                    "lines = open('/content/et.log').read().splitlines() if os.path.exists('/content/et.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Execution Timing Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "EXECUTION_TIMING_ROUTER_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Execution Timing & Router Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "execution_timing_router_leaderboard.csv",
+                "execution_timing_router_summary.json",
+                "execution_timing_router_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_et.exists():
+                shutil.rmtree(stage_et, ignore_errors=True)
+                print("[*] Wiped /tmp/exec_timing_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.backtest.execution_timing_and_router_lab import evaluate_execution_timing_and_router_specs
+    from src.backtest.p2_portfolio_integration import (
+        build_core_1m_tensors_and_base_snipers,
+        identify_required_1m_symbols_for_portfolio,
+    )
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    if not b1h_files:
+        raise FileNotFoundError(f"Missing bars_1h in {m16_data_dir}")
+
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    needed_1m_syms = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+    )
+    print(
+        f"⏱️ Frente A: Execution Timing & Router Lab | Streaming {len(needed_1m_syms)} 1m symbols in O(1) RAM...",
+        flush=True,
+    )
+
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+        return df_c
+
+    bundle = build_core_1m_tensors_and_base_snipers(
+        core_1m_by_sym=None,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        loader_workers=6,
+    )
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+    lb_df = evaluate_execution_timing_and_router_specs(bundle=bundle, m26_trades_df=m26_df)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_df.to_csv(output_dir / "execution_timing_router_leaderboard.csv", index=False)
+    summary = {
+        "benchmark": "execution_timing_and_router_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "results": lb_df.to_dict(orient="records"),
+    }
+    (output_dir / "execution_timing_router_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente A: Sub-Cycle Execution Timing (`Pre-Settlement` vs `:00 Storm` vs `Post-Storm`) & Router Physics (`2023–2026`)",
+        "",
+        f"- **Grounded in `$283,024` Real Mainnet Fills (`live_trading.db`):** `:00-:02 UTC` storm = `6.88 bps` (`51.7%` Maker) vs off-storm = `3.10 bps` (`69.8%` Maker) vs zero-lag WS top-of-book router = `2.55 bps` (`{summary['elapsed_sec']}s`).",
+        "",
+        "| Exp ID | Offset (`m`) | Fee (`bps`) | `4Y SR` | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `NetFnd%` | `FeeDrag%` | `StubsSup` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_df.iterrows():
+        fl = "✅" if bool(r["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{r['exp_id']}` | `{int(r['offset_minutes']):+d}m` | `{r['rebal_fee_bps']:.2f}` | **`{r['sharpe_4y']:.2f}`** | "
+            f"`{r['cagr_4y_pct']:+.1f}%` | `{r['max_dd_4y_pct']:.2f}%` | "
+            f"`{r['sharpe_23_24']:.2f} / {r['sharpe_2025']:.2f} / {r['sharpe_2026']:.2f}` | "
+            f"`{r['cpcv_mean_sharpe']:.2f}` (`{r['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"`{r['net_funding_earned_pct']:+.1f}%` | `{r['core_fee_drag_pct']:.1f}%` | `{int(r['stubs_suppressed'])}` | "
+            f"**`${r['fresh_2026_final_eq']:,.2f}`** (`${r['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    (output_dir / "execution_timing_router_report.md").write_text("\n".join(md) + "\n")
+    print("EXECUTION_TIMING_ROUTER_COMPLETE!", flush=True)
+    return summary
+
+
+def run_frente_b_sniper_l2_waterfall_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente B:
+      - Part B1: `M09_LONG`, `M09_SHORT`, `M23_BREADTH_LONG`, `M04_NEGFUND_LONG` + `P9_FAILED_BREAKOUT_TRAP_SHORT`
+        & `P10_BTC_FLUSH_IMMUNE_LONG` with causal `L2 bookDepth` (`RAW / L2_NO_WALL / L2_STRICT_IMB`).
+      - Part B2: Inverted Secondary Cascade Breakdown `SHORT` (`P8A..P8D`) at `1-ms` `aggTrades` + `1-s` SL-first.
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_fb = Path("/tmp/frente_b_bridge")
+        if stage_fb.exists():
+            shutil.rmtree(stage_fb, ignore_errors=True)
+        raw_fb = stage_fb / "raw"
+        raw_fb.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Frente B Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + P3/P4 solvency windows via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_fb / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                ["rclone", "copy", f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet", str(raw_fb)],
+                check=True,
+            )
+
+            keep_syms = set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_fb / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_fb / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_fb = stage_fb / "slim"
+            for sub_p in ("bars_1h", "funding"):
+                (slim_fb / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_fb / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_fb / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(raw_fb / "p3_p4_all_trades.parquet", slim_fb / "p3_p4_all_trades.parquet")
+
+            tar_fb = stage_fb / "fb_bundle.tar"
+            with tarfile.open(tar_fb, "w") as tf:
+                for p_it in sorted(slim_fb.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_fb)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_fb, "/content/_fb_bundle.tar"), "Failed uploading Frente B bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/fb_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_fb_bundle.tar', 'r').extractall('/content/fb_data'); "
+                "os.remove('/content/_fb_bundle.tar'); "
+                "print('FB_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "FB_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Frente B bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/fb.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'frente-b-sniper-l2-waterfall', '--m16-data-dir', '/content/fb_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/fb.pid', 'w').write(str(p.pid)); "
+                "print(f'FB_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Frente B Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/fb.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}/stat') and (' Z ' not in open(f'/proc/{pid}/stat').read()); "
+                    "lines = open('/content/fb.log').read().splitlines() if os.path.exists('/content/fb.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Frente B Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "FRENTE_B_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Frente B Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "frente_b_waterfall_short_leaderboard.csv",
+                "frente_b_sniper_l2_leaderboard.csv",
+                "frente_b_summary.json",
+                "frente_b_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_fb.exists():
+                shutil.rmtree(stage_fb, ignore_errors=True)
+                print("[*] Wiped /tmp/frente_b_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+    from src.models.sniper_l2_and_cascade_short_lab import (
+        run_sniper_l2_and_creative_1m_study,
+        run_waterfall_short_1ms_study,
+    )
+
+    t0 = time.time()
+    p34_path = m16_data_dir / "p3_p4_all_trades.parquet"
+    all_p34 = pd.read_parquet(p34_path)
+    p4_m4 = all_p34[all_p34["mech_id"] == "P4_M4_ONCHAIN_ANCHORED_LIQ_SNAP_LONG"].copy()
+    print(f"🌪️ Frente B2: Running P8 Inverted Cascade Waterfall SHORT 1ms Lab ({len(p4_m4)//3} windows)...", flush=True)
+    lb_p8, tr_p8 = run_waterfall_short_1ms_study(p4_m4, workers=6)
+    for _, rp8 in lb_p8.iterrows():
+        print(
+            f"  [P8-1ms] {rp8['mech_id']}: N={int(rp8['trades_full'])} Net={rp8['mean_net_bps_full']:+.1f}bps "
+            f"(23-24={rp8['net_bps_23_24']:+.1f} / 25={rp8['net_bps_2025']:+.1f} / 26={rp8['net_bps_2026']:+.1f}) "
+            f"CPCV={rp8['cpcv_pos_splits_pct']:.0f}%",
+            flush=True,
+        )
+
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+        return df_c
+
+    print("🛡️ Frente B1: Auditing M09_LONG/M09_SHORT/M23/M04 + P9/P10 with causal L2 bookDepth...", flush=True)
+    lb_l2, tr_l2 = run_sniper_l2_and_creative_1m_study(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        symbol_1m_loader=_stream_sym_1m,
+        eval_start="2023-03-01",
+        workers=6,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_p8.to_csv(output_dir / "frente_b_waterfall_short_leaderboard.csv", index=False)
+    lb_l2.to_csv(output_dir / "frente_b_sniper_l2_leaderboard.csv", index=False)
+
+    p8_exit_mix: dict[str, dict[str, int]] = {}
+    if not tr_p8.empty:
+        for pid, grp in tr_p8.groupby("mech_id", observed=True):
+            p8_exit_mix[str(pid)] = {str(k): int(v) for k, v in grp["exit_reason"].value_counts().to_dict().items()}
+
+    summary = {
+        "benchmark": "frente_b_sniper_l2_and_waterfall_short",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "p8_waterfall_short_exit_mix": p8_exit_mix,
+        "p8_waterfall_short_leaderboard": lb_p8.to_dict(orient="records") if not lb_p8.empty else [],
+        "sniper_l2_and_p9_p10_leaderboard": lb_l2.to_dict(orient="records") if not lb_l2.empty else [],
+    }
+    (output_dir / "frente_b_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente B: L2 `bookDepth` Upgrade on Live Snipers (`M09/M23/M04`) + Inverted `1-ms` Waterfall `SHORT` (`P8`) & Structural Traps (`P9/P10`)",
+        "",
+        "## Parte B2 — `P8` Inverted Secondary Cascade Breakdown `SHORT` (`1-ms` `aggTrades` + `1-s` Pessimistic SL-First)",
+        "",
+        "| Mech ID | `N` | Gross | Fee | **Net Full** | Med | Win`%` | `23-24` | **`2025`** | **`2026`** | **CPCV OOS** | **CPCV`%`** | Treasure |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_p8.iterrows():
+        md.append(
+            f"| `{r['mech_id']}` | `{int(r['trades_full'])}` | `{r['mean_gross_bps']:+.1f}` | `{r['mean_fee_bps']:.1f}` | "
+            f"**`{r['mean_net_bps_full']:+.1f}`** | `{r['med_net_bps_full']:+.1f}` | `{r['win_rate_pct']:.1f}%` | "
+            f"`{r['net_bps_23_24']:+.1f}` | **`{r['net_bps_2025']:+.1f}`** | **`{r['net_bps_2026']:+.1f}`** | "
+            f"`{r['cpcv_infold_oos_bps']:+.1f}` | `{r['cpcv_pos_splits_pct']:.0f}%` | **`{'TREASURE 🏆' if r['is_treasure'] else '—'}`** |"
+        )
+    md.extend(
+        [
+            "",
+            "## Parte B1 — Live Snipers (`M09_LONG`, `M09_SHORT`, `M23`, `M04`) & Creative (`P9`, `P10`) x Causal `L2 bookDepth`",
+            "",
+            "| Mech ID | `N` | Gross | Fee | **Net Full** | Med | Win`%` | `23-24` | **`2025`** | **`2026`** | **CPCV OOS** | **CPCV`%`** | Treasure |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for _, r in lb_l2.sort_values(["pillar", "mech_id"]).iterrows():
+        md.append(
+            f"| `{r['mech_id']}` | `{int(r['trades_full'])}` | `{r['mean_gross_bps']:+.1f}` | `{r['mean_fee_bps']:.1f}` | "
+            f"**`{r['mean_net_bps_full']:+.1f}`** | `{r['med_net_bps_full']:+.1f}` | `{r['win_rate_pct']:.1f}%` | "
+            f"`{r['net_bps_23_24']:+.1f}` | **`{r['net_bps_2025']:+.1f}`** | **`{r['net_bps_2026']:+.1f}`** | "
+            f"`{r['cpcv_infold_oos_bps']:+.1f}` | `{r['cpcv_pos_splits_pct']:.0f}%` | **`{'TREASURE 🏆' if r['is_treasure'] else '—'}`** |"
+        )
+    (output_dir / "frente_b_report.md").write_text("\n".join(md) + "\n")
+    print("FRENTE_B_COMPLETE!", flush=True)
+    return summary
+
+
+def run_frente_c_manga_p2_lab_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente C: Reinventing Pillar 2 (`Manga P2: CausalDollarBarTSMOMEngine`) via
+    Inverse-Vol Risk Parity, Asymmetric Fast-Crash Override, Flow-Imbalance Bars (`DIBs`),
+    and `5`-Sovereign Expansion (`BTC, ETH, SOL, BNB, XRP`) (`1m` physics, `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.p2_portfolio_integration import PROD_TOP_15
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_fc = Path("/tmp/frente_c_bridge")
+        if stage_fc.exists():
+            shutil.rmtree(stage_fc, ignore_errors=True)
+        raw_fc = stage_fc / "raw"
+        raw_fc.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Frente C Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_fc / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                ["rclone", "copy", f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet", str(raw_fc / "p2_aggtrades")],
+                check=True,
+            )
+            subprocess.run(
+                ["rclone", "copy", f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet", str(raw_fc)],
+                check=True,
+            )
+
+            keep_syms = set(PROD_TOP_15) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_fc / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_fc / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_fc = stage_fc / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_fc / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_fc / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_fc / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(
+                raw_fc / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_fc / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+            shutil.copy2(
+                raw_fc / "p3_p4_all_trades.parquet",
+                slim_fc / "p3_p4_all_trades.parquet",
+            )
+
+            tar_fc = stage_fc / "fc_bundle.tar"
+            with tarfile.open(tar_fc, "w") as tf:
+                for p_it in sorted(slim_fc.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_fc)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_fc, "/content/_fc_bundle.tar"), "Failed uploading Frente C bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/fc_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_fc_bundle.tar', 'r').extractall('/content/fc_data'); "
+                "os.remove('/content/_fc_bundle.tar'); "
+                "print('FC_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "FC_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Frente C bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/fc.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'frente-c-manga-p2-lab', '--m16-data-dir', '/content/fc_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/fc.pid', 'w').write(str(p.pid)); "
+                "print(f'FC_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Frente C Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/fc.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}/stat') and (' Z ' not in open(f'/proc/{pid}/stat').read()); "
+                    "lines = open('/content/fc.log').read().splitlines() if os.path.exists('/content/fc.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Frente C Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "FRENTE_C_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Frente C Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "frente_c_manga_p2_leaderboard.csv",
+                "frente_c_manga_p2_summary.json",
+                "frente_c_manga_p2_report.md",
+                "execution_timing_router_leaderboard.csv",
+                "execution_timing_router_summary.json",
+                "execution_timing_router_report.md",
+                "frente_b_causal_audit_summary.json",
+                "frente_b_causal_audit_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_fc.exists():
+                shutil.rmtree(stage_fc, ignore_errors=True)
+                print("[*] Wiped /tmp/frente_c_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.backtest.p2_portfolio_integration import (
+        build_core_1m_tensors_and_base_snipers,
+        identify_required_1m_symbols_for_portfolio,
+    )
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+    from src.models.manga_p2_tsmom_lab import evaluate_manga_p2_ablation_suite
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    needed_1m_syms = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+    )
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    sovereign_keep = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
+    sov_1m_cache: dict[str, pd.DataFrame] = {}
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+            if sym_c in sovereign_keep:
+                sov_1m_cache[sym_c] = df_c.copy()
+        return df_c
+
+    print(f"🧭 Frente C: Manga P2 TSMOM Lab | Streaming {len(needed_1m_syms)} 1m symbols...", flush=True)
+    bundle = build_core_1m_tensors_and_base_snipers(
+        core_1m_by_sym=None,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        loader_workers=6,
+    )
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+    lb_df = evaluate_manga_p2_ablation_suite(bundle, sovereign_1m_by_sym=sov_1m_cache, m26_trades_df=m26_df)
+
+    # Also regenerate unconfounded Frente A execution-timing table on the exact same `bundle` (0 extra I/O!)
+    from src.backtest.execution_timing_and_router_lab import evaluate_execution_timing_and_router_specs
+    from src.models.sniper_l2_and_cascade_short_lab import (
+        build_causal_1h_panic_flush_anchors,
+        evaluate_frente_b_sniper_portfolio_ablation,
+        run_waterfall_short_1ms_study,
+    )
+
+    lb_et = evaluate_execution_timing_and_router_specs(bundle=bundle, m26_trades_df=m26_df)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_et.to_csv(output_dir / "execution_timing_router_leaderboard.csv", index=False)
+    (output_dir / "execution_timing_router_summary.json").write_text(
+        json.dumps(
+            {"benchmark": "execution_timing_and_router_1m_lab_clean", "results": lb_et.to_dict(orient="records")},
+            indent=2,
+        )
+        + "\n"
+    )
+    md_et = [
+        "# Frente A (Unconfounded): Sub-Cycle Execution Timing & Router Physics (`2023–2026`)",
+        "",
+        "| Exp ID | Offset (`m`) | Fee (`bps`) | `4Y SR` | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `NetFnd%` | `FeeDrag%` | `StubsSup` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_et.iterrows():
+        fl_e = "✅" if bool(r["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md_et.append(
+            f"| `{r['exp_id']}` | `{int(r['offset_minutes']):+d}m` | `{r['rebal_fee_bps']:.2f}` | **`{r['sharpe_4y']:.2f}`** | "
+            f"`{r['cagr_4y_pct']:+.1f}%` | `{r['max_dd_4y_pct']:.2f}%` | "
+            f"`{r['sharpe_23_24']:.2f} / {r['sharpe_2025']:.2f} / {r['sharpe_2026']:.2f}` | "
+            f"`{r['cpcv_mean_sharpe']:.2f}` (`{r['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"`{r['net_funding_earned_pct']:+.1f}%` | `{r['core_fee_drag_pct']:.1f}%` | `{int(r['stubs_suppressed'])}` | "
+            f"**`${r['fresh_2026_final_eq']:,.2f}`** (`${r['fresh_2026_min_eq']:,.2f}` {fl_e}) |"
+        )
+    (output_dir / "execution_timing_router_report.md").write_text("\n".join(md_et) + "\n")
+
+    print(
+        "🔍 Frente B Forensic Verification: Running Sniper Portfolio Ablation + 0.000ms Post-Anchor P8 Audit...",
+        flush=True,
+    )
+    lb_fb_port = evaluate_frente_b_sniper_portfolio_ablation(bundle=bundle, m26_trades_df=m26_df)
+    p34_p = m16_data_dir / "p3_p4_all_trades.parquet"
+    lb_p8_post_p4 = pd.DataFrame()
+    if p34_p.exists():
+        all_p34_df = pd.read_parquet(p34_p)
+        p4_m4_df = all_p34_df[all_p34_df["mech_id"] == "P4_M4_ONCHAIN_ANCHORED_LIQ_SNAP_LONG"].copy()
+        lb_p8_post_p4, _ = run_waterfall_short_1ms_study(
+            p4_m4_df, workers=6, post_anchor_only=True, post_window_sec=1800
+        )
+    anchors_1h = build_causal_1h_panic_flush_anchors(bars_1h_by_sym=bars_1h_by_sym, eval_start="2023-03-01")
+    print(f"  • Auditing P8 strictly post-1h-panic-bar close across {len(anchors_1h)} causal anchors...", flush=True)
+    lb_p8_post_1h, _ = run_waterfall_short_1ms_study(anchors_1h, workers=6, post_anchor_only=True, post_window_sec=1800)
+    fb_audit_sum = {
+        "sniper_portfolio_ablation": lb_fb_port.to_dict(orient="records"),
+        "p8_post_p4_m4_zero_conditioning": lb_p8_post_p4.to_dict(orient="records") if not lb_p8_post_p4.empty else [],
+        "p8_post_1h_panic_zero_conditioning_n_anchors": int(len(anchors_1h)),
+        "p8_post_1h_panic_zero_conditioning": (
+            lb_p8_post_1h.to_dict(orient="records") if not lb_p8_post_1h.empty else []
+        ),
+    }
+    (output_dir / "frente_b_causal_audit_summary.json").write_text(json.dumps(fb_audit_sum, indent=2) + "\n")
+    md_fba = [
+        "# Frente B — Forensic Verification: Sniper `1m` Portfolio Ablation & `0.000 ms` Post-Anchor `P8` Audit",
+        "",
+        "## 1. Unified `1m` Portfolio Sniper Ablation (`Core P1 + Manga P2 + Snipers`, `2023–2026`)",
+        "",
+        "| Config ID | `4Y SR` | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, rf in lb_fb_port.iterrows():
+        fl_f = "✅" if bool(rf["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md_fba.append(
+            f"| `{rf['config_id']}` | **`{rf['sharpe_4y']:.2f}`** | `{rf['cagr_4y_pct']:+.1f}%` | `{rf['max_dd_4y_pct']:.2f}%` | "
+            f"`{rf['sharpe_23_24']:.2f} / {rf['sharpe_2025']:.2f} / {rf['sharpe_2026']:.2f}` | "
+            f"`{rf['cpcv_mean_sharpe']:.2f}` (`{rf['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"**`${rf['fresh_2026_final_eq']:,.2f}`** (`${rf['fresh_2026_min_eq']:,.2f}` {fl_f}) |"
+        )
+    for title_p8, df_p8_c in (
+        (
+            "2. `P8` Strictly Post-`P4_M4` Anchor (`[T_anchor, T_anchor + 30m]`, `0.000 ms` Window Conditioning)",
+            lb_p8_post_p4,
+        ),
+        (
+            f"3. `P8` Strictly Post-`1h` Panic-Flush Bar Close (`{len(anchors_1h)}` Anchors, `0.000 ms` Window Conditioning)",
+            lb_p8_post_1h,
+        ),
+    ):
+        md_fba.extend(
+            [
+                "",
+                f"## {title_p8}",
+                "",
+                "| Mech ID | `N` | Gross | Fee | **Net Full** | Med | Win`%` | `23-24` | **`2025`** | **`2026`** | **CPCV OOS** | **CPCV`%`** | Treasure |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            ]
+        )
+        for _, rp in df_p8_c.iterrows():
+            md_fba.append(
+                f"| `{rp['mech_id']}` | `{int(rp['trades_full'])}` | `{rp['mean_gross_bps']:+.1f}` | `{rp['mean_fee_bps']:.1f}` | "
+                f"**`{rp['mean_net_bps_full']:+.1f}`** | `{rp['med_net_bps_full']:+.1f}` | `{rp['win_rate_pct']:.1f}%` | "
+                f"`{rp['net_bps_23_24']:+.1f}` | **`{rp['net_bps_2025']:+.1f}`** | **`{rp['net_bps_2026']:+.1f}`** | "
+                f"`{rp['cpcv_infold_oos_bps']:+.1f}` | `{rp['cpcv_pos_splits_pct']:.0f}%` | **`{'TREASURE 🏆' if rp['is_treasure'] else '—'}`** |"
+            )
+    (output_dir / "frente_b_causal_audit_report.md").write_text("\n".join(md_fba) + "\n")
+    lb_df.to_csv(output_dir / "frente_c_manga_p2_leaderboard.csv", index=False)
+    summary = {
+        "benchmark": "frente_c_manga_p2_tsmom_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "results": lb_df.to_dict(orient="records"),
+    }
+    (output_dir / "frente_c_manga_p2_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente C: Reinventing Pillar 2 (`Manga P2: DollarBarTSMOM`) — Standalone & Unified `1m` Portfolio (`2023–2026`)",
+        "",
+        "| Variant ID | `P2 Solo SR` (`23-24/25/26`) | `P2 CPCV%` | `Corr vs P1` | **`Port 4Y SR`** | `Port CAGR` | `Port DD` | `Port 23-24/25/26` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_df.iterrows():
+        fl = "✅" if bool(r["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{r['variant_id']}` | **`{r['p2_solo_sharpe_4y']:.2f}`** (`{r['p2_solo_23_24']:.2f}/{r['p2_solo_2025']:.2f}/{r['p2_solo_2026']:.2f}`) | "
+            f"`{r['p2_solo_cpcv_pos_pct']:.0f}%` | `{r['corr_to_core_p1']:+.3f}` | "
+            f"**`{r['port_sharpe_4y']:.2f}`** | `{r['port_cagr_4y_pct']:+.1f}%` | `{r['port_max_dd_4y_pct']:.2f}%` | "
+            f"`{r['port_23_24']:.2f}/{r['port_2025']:.2f}/{r['port_2026']:.2f}` | "
+            f"**`${r['fresh_2026_final_eq']:,.2f}`** (`${r['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    (output_dir / "frente_c_manga_p2_report.md").write_text("\n".join(md) + "\n")
+    print("FRENTE_C_COMPLETE!", flush=True)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
@@ -4970,6 +5905,9 @@ def build_parser() -> argparse.ArgumentParser:
             "p4-m4-liquidation-aggtrades-lab",
             "maker-wick-catcher-lab",
             "core-universe-factor-lab",
+            "execution-timing-router-lab",
+            "frente-b-sniper-l2-waterfall",
+            "frente-c-manga-p2-lab",
         ],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
@@ -5180,6 +6118,30 @@ def main() -> None:
                 )
             elif s_name == "core-universe-factor-lab":
                 run_core_universe_factor_lab_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "execution-timing-router-lab":
+                run_execution_timing_router_lab_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "frente-b-sniper-l2-waterfall":
+                run_frente_b_sniper_l2_waterfall_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "frente-c-manga-p2-lab":
+                run_frente_c_manga_p2_lab_benchmark(
                     m16_data_dir=Path(args.m16_data_dir),
                     output_dir=out_dir,
                     colab_session=args.colab_session,

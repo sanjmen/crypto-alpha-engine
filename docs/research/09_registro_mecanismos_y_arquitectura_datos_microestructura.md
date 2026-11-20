@@ -101,12 +101,18 @@ Cada mecanismo registrado abajo separa **el fenómeno físico observado** (que e
 
 ---
 
-## Parte III — Estado Consolidado de Producción y Cierre del Ciclo Forense (`Docs 01..17`)
+## Parte III — Estado Consolidado de Producción y Cierre del Ciclo Forense (`Docs 01..20`)
 
-1. **En Producción Viva (`crypto-mainnet` Tokio, Óptimo Pareto Verificado):**
+1. **En Producción Viva (`crypto-mainnet` Tokio, Congelada en Burn-In sobre Óptimo Pareto Verificado):**
    - **Pilar 1 (`Core P1`):** `PROD_TOP_15` institucional + **Reloj Estricto de `8h` (`enable_intracycle_rebalance=false`)** (`01_STATIC_TOP15_STRICT_8H`: `4Y Sharpe = 2.19`, `2026 Sharpe = 2.42`, `100%` CPCV splits, `$2,700 -> $5,066.31` en `2026`, `MinEq = $2,550.42` sobre el piso duro CPPI de `$2,500.00`). Ver [14_resultados_barrera_rebalanceo_core_p1.md](./14_resultados_barrera_rebalanceo_core_p1.md) y [17_resultados_universo_dinamico_y_factores_core_p1.md](./17_resultados_universo_dinamico_y_factores_core_p1.md).
-   - **Pilar 2 (`Manga P2`):** `CausalDollarBarTSMOMEngine` (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) activo.
+   - **Pilar 2 (`Manga P2`):** `CausalDollarBarTSMOMEngine` (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) activo — validado en [20_resultados_frente_c_manga_p2_tsmom.md](./20_resultados_frente_c_manga_p2_tsmom.md) (`Corr = -0.088` vs `Core P1`, suma `+0.27` al `4Y Sharpe` y `+$1,076.90` en `2026`).
    - **Pilar 3 (`Event Snipers` sobre `82` monedas con `SL` duro):** `M09 + M23 + M04` + **`Sniper:M26_L2SweepAirPocket` (`MEC-06`: `L2 Ask Air-Pocket + 1ms Institutional Sweep + MONO_A Convex Trail`, `+71.15 bps/trade`, `100%` CPCV)** activos; `M25` apagado definitivamente (`enable_post_settle_sniper=false`).
-2. **Líneas Cerradas con Evidencia Empírica Rigurosa (`0` Capital Expuesto a Sobreajuste):**
-   - **Knife-Catching Direccional en Cascadas de Liquidación (`MEC-03 / MEC-10` — `P4_M4` Taker `1m` y `MW1..MW5` `GTX` Maker `1-ms`):** Archivado definitivamente tras auditar tanto confirmación `Taker 1m + 1ms` ([15_resultados_p4_m4_absorcion_1ms_liquidaciones.md](./15_resultados_p4_m4_absorcion_1ms_liquidaciones.md), `-25.9 bps` en `23–24`) como órdenes pasivas `GTX` `1-ms` con `+250ms` de latencia y prioridad de cola real ([16_resultados_maker_wick_catcher_1ms.md](./16_resultados_maker_wick_catcher_1ms.md), `-72.1` a `-104.1 bps`, `0%` CPCV por *Winner's Curse* de selección adversa).
-   - **Rotación Automática por Volumen Crudo en `Core P1` (`07..10` en Doc `17`):** Archivada (`4Y Sharpe 0.46–1.07` vs `2.19`); las altcoins emergentes/memes (`PEPE, WIF, WLD, TAO`) pertenecen exclusivamente a `Snipers P3` con `Stop-Loss` duro y nunca al libro neutral sin `SL` individual.
+2. **Backlog Validado para la Próxima Ventana Programada de Despliegue (`Frentes A, B y C` — Docs `18..20`):**
+   - **`M17-1` (Issue `#73`, `P0`):** Zero-Latency WS Top-of-Book + OBI-Aware `GTX` Limit Chase en `BinanceLiveBroker` (corrige el `20%–45%` Maker en `RENDER/FET/ADA/DOGE` y baja `FeeDrag` a `174.3%`).
+   - **`M17-2` (Issue `#74`, `P0`):** Desacople del reloj de `8h` a `T - 5m` (`23:55 / 07:55 / 15:55 UTC`) evitando el impuesto real de `6.88 bps` en `:00:00` (`3.10 bps` fuera de tormenta -> **`4Y SR = 2.49`, `2026 SR = 2.87`, `$2,700 -> $5,141.67`**).
+   - **`M17-3` (Issue `#75`, `P1`):** Supresión proporcional de residuos `P1+P2` bajo `$2,000` gross (`< max($25, 0.05 * gross)` solo cuando `eff_p2 != 0`, sin *CPPI Cash-Lock*).
+   - **`M17-4` (Issue `#76`, `P1`):** Veto quirúrgico causal `L2_NO_WALL` (`|book_imb_1pct| <= 0.15` contra pared opuesta vía `/fapi/v1/depth`) en `M09` y `M23` (`M09_LONG` `+41.1 -> +50.1 bps`, `+78.7 bps` en `2026`; `M09_SHORT` `CPCV% 33% -> 73%`; `M23` `+11.4 -> +13.9 bps`).
+   - **`M17-5` (Issue `#77`, `P2` opcional):** Paridad de riesgo `168h` por volatilidad inversa causal en `Manga P2` (`BTC, ETH, SOL`: `2026 SR = 2.50`, `4Y DD = 34.93%`, `MinEq = $2,555.15`).
+3. **Líneas Cerradas con Evidencia Empírica Rigurosa (`0` Capital Expuesto a Sobreajuste):**
+   - **Cascadas de Liquidación Post-Clímax en Ambas Direcciones (`MEC-03 / MEC-10` — `P4_M4` Taker `1m`, `MW1..MW5` `GTX` Maker `1-ms` `LONG` y `P8` `1-ms` Waterfall `SHORT`):** Archivado definitivamente tras probar que tras el *burst* inicial el mercado entra en equilibrio martingala (`+2.6 bps` bruto): comprar con límite pasivo pierde `-72.1` a `-104.1 bps` por selección adversa ([16_resultados_maker_wick_catcher_1ms.md](./16_resultados_maker_wick_catcher_1ms.md)), y vender Taker post-ancla pierde `-5.4` a `-22.2 bps` neto ([19_resultados_frente_b_snipers_l2_y_cascada_short.md](./19_resultados_frente_b_snipers_l2_y_cascada_short.md)).
+   - **Rotación Automática por Volumen Crudo en `Core P1` (`07..10` en Doc `17`) y Expansión `Manga P2` a `BNB/XRP` (`C05..C07` en Doc `20`):** Archivadas (`4Y Sharpe 0.46–1.07` y `2.03–2.05` vs `2.19`).
