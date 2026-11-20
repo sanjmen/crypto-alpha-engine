@@ -373,8 +373,12 @@ def test_feature_flag_hot_kill_isolates_m25_from_m09_and_cli_parity(tmp_path: Pa
     assert broker.portfolio.positions["ENA/USDT"].side == PositionSide.FLAT
     assert broker.portfolio.positions["LINK/USDT"].side == PositionSide.LONG
 
-    # Verify CLI parity across run_trading.py and run_backtest.py
+    # Verify default `enable_post_settle_sniper` is False (paused) and CLI parity across run_trading.py & run_backtest.py
+    assert FeatureFlags().enable_post_settle_sniper is False
     tp = build_trading_parser()
+    args_on = tp.parse_args(["--shadow", "--enable-m16-post-settle"])
+    ff_on = FeatureFlags.from_env_and_args(args=args_on, mode="shadow", environ={})
+    assert ff_on.enable_post_settle_sniper is True
     args_off = tp.parse_args(["--shadow", "--disable-m16-post-settle"])
     ff_off = FeatureFlags.from_env_and_args(args=args_off, mode="shadow", environ={})
     assert ff_off.enable_post_settle_sniper is False

@@ -299,5 +299,6 @@ def test_walk_forward_atlas_polarity_locking_across_2024_2025_2026() -> None:
         ),
         {"1b": 1},
     )
-    assert pytest.approx(chk["fwd_ret_1b"].iloc[0], rel=1e-9) == np.log(1.05)
+    assert pytest.approx(chk["fwd_ret_1b"].iloc[0], rel=1e-9) == 0.05
+    assert pytest.approx(chk["fwd_ret_1b"].iloc[1], rel=1e-9) == 0.05
     assert np.isnan(chk["fwd_ret_1b"].iloc[-1])

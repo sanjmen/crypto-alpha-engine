@@ -95,10 +95,11 @@ class FeatureFlags:
     chop_profit_lock_trigger_pct: float = 0.024
     chop_profit_lock_level_pct: float = 0.012
     enable_progressive_profit_lock: bool = False
-    enable_post_settle_sniper: bool = True
+    enable_post_settle_sniper: bool = False
     post_settle_max_funding_bps: float = -20.0
     post_settle_gtx_offset_bps: float = 1.5
     post_settle_gtx_ttl_sec: float = 90.0
+    enable_l2_sweep_sniper: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -171,9 +172,9 @@ class FeatureFlags:
         if cli_intracycle is not None:
             enable_intracycle = bool(cli_intracycle)
         elif env_intracycle is not None:
-            enable_intracycle = _parse_bool(env_intracycle, default=True)
+            enable_intracycle = _parse_bool(env_intracycle, default=not is_mainnet)
         else:
-            enable_intracycle = True
+            enable_intracycle = not is_mainnet
 
         enable_invariants = _parse_bool(
             env.get("FF_ENABLE_INVARIANT_AUDIT"),
@@ -308,9 +309,9 @@ class FeatureFlags:
         if cli_post_settle is not None:
             enable_post_settle = bool(cli_post_settle)
         elif env_post_settle is not None:
-            enable_post_settle = _parse_bool(env_post_settle, default=True)
+            enable_post_settle = _parse_bool(env_post_settle, default=False)
         else:
-            enable_post_settle = True
+            enable_post_settle = False
 
         post_settle_max_fr_bps = _parse_float(
             env.get(
@@ -336,6 +337,14 @@ class FeatureFlags:
                 default=90.0,
             ),
         )
+        cli_l2_sweep = getattr(args, "enable_l2_sweep_sniper", None) if args is not None else None
+        env_l2_sweep = env.get("FF_ENABLE_L2_SWEEP_SNIPER")
+        if cli_l2_sweep is not None:
+            enable_l2_sweep = bool(cli_l2_sweep)
+        elif env_l2_sweep is not None:
+            enable_l2_sweep = _parse_bool(env_l2_sweep, default=True)
+        else:
+            enable_l2_sweep = True
 
         return cls(
             enable_anomaly_capsule=enable_anom,
@@ -368,6 +377,7 @@ class FeatureFlags:
             post_settle_max_funding_bps=post_settle_max_fr_bps,
             post_settle_gtx_offset_bps=post_settle_offset_bps,
             post_settle_gtx_ttl_sec=post_settle_ttl_sec,
+            enable_l2_sweep_sniper=enable_l2_sweep,
         )
 
     def apply_override(self, key: str, raw_value: Any) -> tuple[str, Any]:
@@ -430,6 +440,9 @@ class FeatureFlags:
             "post_settle_max_funding_bps": "post_settle_max_funding_bps",
             "post_settle_gtx_offset_bps": "post_settle_gtx_offset_bps",
             "post_settle_gtx_ttl_sec": "post_settle_gtx_ttl_sec",
+            "l2_sweep_sniper": "enable_l2_sweep_sniper",
+            "m26_l2_sweep": "enable_l2_sweep_sniper",
+            "enable_l2_sweep_sniper": "enable_l2_sweep_sniper",
         }
         norm_key = aliases.get(key.strip().lower())
         if not norm_key:

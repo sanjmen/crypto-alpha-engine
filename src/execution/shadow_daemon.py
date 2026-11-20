@@ -8,6 +8,7 @@ triggers 8h multi-strategy rebalancing, and settles real funding cashflows in SQ
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 import threading
@@ -36,6 +37,7 @@ from src.features.volatility import parkinson_volatility
 from src.strategies.event_snipers import (
     SNIPER_BRACKET_PROFILES,
     SNIPER_M25_STRAT,
+    SNIPER_M26_STRAT,
     SNIPER_STRATEGIES,
     SNIPER_UNIVERSE_82,
     EventDrivenSniperEngine,
@@ -292,17 +294,21 @@ class ShadowTradingDaemon:
         self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
         self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
         self.sniper_max_positions = int(getattr(self.feature_flags, "sniper_max_positions", 3))
-        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", True))
+        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", False))
         self.post_settle_max_funding_bps = float(getattr(self.feature_flags, "post_settle_max_funding_bps", -20.0))
         self.post_settle_gtx_offset_bps = float(getattr(self.feature_flags, "post_settle_gtx_offset_bps", 1.5))
         self.post_settle_gtx_ttl_sec = float(getattr(self.feature_flags, "post_settle_gtx_ttl_sec", 90.0))
+        self.enable_l2_sweep_sniper = bool(getattr(self.feature_flags, "enable_l2_sweep_sniper", True))
         self.sniper_engine = EventDrivenSniperEngine(
             m25_max_funding_rate=self.post_settle_max_funding_bps / 10_000.0,
         )
+        self._last_sniper_5m_bucket: int = -1
         self._last_sniper_15m_bucket: int = -1
         self._last_sniper_1h_bucket: int = -1
         self._last_sniper_m25_bucket: int = -1
         self._executed_post_settle_keys: set[tuple[str, int]] = set()
+        self.liquid_perp_tickers: dict[str, dict[str, float]] = {}
+        self._prev_5m_prices: dict[str, tuple[int, float]] = {}
         self.sniper_last_exit: dict[str, tuple[datetime, bool]] = {}
         self._sync_allocator_with_feature_flags()
         self.is_halted: bool = False
@@ -908,6 +914,19 @@ class ShadowTradingDaemon:
             # Apply Volume Filter and extract Top Gainers & Losers across the whole exchange
             filtered = [x for x in parsed_universe if x[1]["volume_24h"] >= self.min_volume_24h_usd]
             filtered.sort(key=lambda x: x[1]["change_24h"], reverse=True)
+
+            # Retain zero-overhead $15M+ liquid perp map for 5m M26 L2-Sweep Air-Pocket pre-screening
+            now_b5 = int(time.time()) // 300
+            liq_15m_map: dict[str, dict[str, float]] = {}
+            for norm_s, d_s in parsed_universe:
+                if d_s["volume_24h"] >= 15_000_000.0:
+                    liq_15m_map[norm_s] = d_s
+                    c_key = norm_s.replace("/", "")
+                    prev_rec = self._prev_5m_prices.get(c_key)
+                    if prev_rec is None or prev_rec[0] < now_b5 - 1:
+                        self._prev_5m_prices[c_key] = (now_b5, float(d_s["price"]))
+            if liq_15m_map:
+                self.liquid_perp_tickers = liq_15m_map
 
             top_gainers = filtered[:10]
             top_losers = filtered[-10:] if len(filtered) >= 10 else []
@@ -2111,9 +2130,11 @@ class ShadowTradingDaemon:
             is_anomaly = pos.strategy in ANOMALY_STRATEGIES
             is_sniper = pos.strategy in SNIPER_BRACKET_PROFILES
 
-            # Auto-close open Sniper positions when `enable_event_snipers` (or `enable_post_settle_sniper` for M25) is disabled at runtime
-            sniper_disabled = (not self.enable_event_snipers) or (
-                pos.strategy == SNIPER_M25_STRAT and not getattr(self, "enable_post_settle_sniper", True)
+            # Auto-close open Sniper positions when `enable_event_snipers` (or individual sniper flag) is disabled at runtime
+            sniper_disabled = (
+                (not self.enable_event_snipers)
+                or (pos.strategy == SNIPER_M25_STRAT and not getattr(self, "enable_post_settle_sniper", False))
+                or (pos.strategy == SNIPER_M26_STRAT and not getattr(self, "enable_l2_sweep_sniper", True))
             )
             if is_sniper and (sniper_disabled and self.auto_close_anomalies_when_disabled):
                 close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
@@ -2273,12 +2294,22 @@ class ShadowTradingDaemon:
             if trail_trig is not None and trail_trig > 0 and peak_ret >= trail_trig:
                 if pos.side == PositionSide.LONG:
                     trail_target = pos.peak_price * (1.0 - trail_dist)
-                    trail_target = round(trail_target, 6 if trail_target < 1.0 else 2)
+                    dec_tr = (
+                        6
+                        if trail_target < 1.0
+                        else ((4 if trail_target < 100.0 else 2) if sniper_spec is not None else 2)
+                    )
+                    trail_target = round(trail_target, dec_tr)
                     if (pos.stop_loss is None or trail_target > pos.stop_loss) and curr_p > trail_target:
                         candidate_sl = trail_target
                 else:  # SHORT
                     trail_target = pos.peak_price * (1.0 + trail_dist)
-                    trail_target = round(trail_target, 6 if trail_target < 1.0 else 2)
+                    dec_tr = (
+                        6
+                        if trail_target < 1.0
+                        else ((4 if trail_target < 100.0 else 2) if sniper_spec is not None else 2)
+                    )
+                    trail_target = round(trail_target, dec_tr)
                     if (pos.stop_loss is None or trail_target < pos.stop_loss) and curr_p < trail_target:
                         candidate_sl = trail_target
 
@@ -2328,13 +2359,23 @@ class ShadowTradingDaemon:
             elif lock_trig is not None and lock_trig > 0 and peak_ret >= lock_trig:
                 if pos.side == PositionSide.LONG:
                     lock_target = entry * (1.0 + lock_lvl)
-                    lock_target = round(lock_target, 6 if lock_target < 1.0 else 2)
+                    dec_lk = (
+                        6
+                        if lock_target < 1.0
+                        else ((4 if lock_target < 100.0 else 2) if sniper_spec is not None else 2)
+                    )
+                    lock_target = round(lock_target, dec_lk)
                     eff_prev = max([x for x in (pos.stop_loss, candidate_sl) if x is not None], default=None)
                     if (eff_prev is None or lock_target > eff_prev) and curr_p > lock_target:
                         candidate_sl = lock_target
                 else:  # SHORT
                     lock_target = entry * (1.0 - lock_lvl)
-                    lock_target = round(lock_target, 6 if lock_target < 1.0 else 2)
+                    dec_lk = (
+                        6
+                        if lock_target < 1.0
+                        else ((4 if lock_target < 100.0 else 2) if sniper_spec is not None else 2)
+                    )
+                    lock_target = round(lock_target, dec_lk)
                     eff_prev = min([x for x in (pos.stop_loss, candidate_sl) if x is not None], default=None)
                     if (eff_prev is None or lock_target < eff_prev) and curr_p < lock_target:
                         candidate_sl = lock_target
@@ -2919,10 +2960,11 @@ class ShadowTradingDaemon:
         self.enable_event_snipers = bool(getattr(self.feature_flags, "enable_event_snipers", True))
         self.sniper_slot_leverage = float(getattr(self.feature_flags, "sniper_slot_leverage", 0.24))
         self.sniper_max_positions = max(1, int(getattr(self.feature_flags, "sniper_max_positions", 3)))
-        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", True))
+        self.enable_post_settle_sniper = bool(getattr(self.feature_flags, "enable_post_settle_sniper", False))
         self.post_settle_max_funding_bps = float(getattr(self.feature_flags, "post_settle_max_funding_bps", -20.0))
         self.post_settle_gtx_offset_bps = float(getattr(self.feature_flags, "post_settle_gtx_offset_bps", 1.5))
         self.post_settle_gtx_ttl_sec = max(10.0, float(getattr(self.feature_flags, "post_settle_gtx_ttl_sec", 90.0)))
+        self.enable_l2_sweep_sniper = bool(getattr(self.feature_flags, "enable_l2_sweep_sniper", True))
         if hasattr(self, "sniper_engine") and self.sniper_engine is not None:
             self.sniper_engine.m25_max_funding_rate = self.post_settle_max_funding_bps / 10_000.0
 
@@ -2972,6 +3014,7 @@ class ShadowTradingDaemon:
                 if raw:
                     prev_anom = self.enable_anomalies
                     prev_floor = self.equity_floor_usd
+                    prev_intra = self.enable_intracycle_rebalance
                     self.feature_flags = FeatureFlags.from_dict(raw, fallback=self.feature_flags)
                     self.enable_anomalies = bool(self.feature_flags.enable_anomaly_capsule)
                     self.auto_close_anomalies_when_disabled = bool(
@@ -2980,11 +3023,17 @@ class ShadowTradingDaemon:
                     self.enable_hard_equity_floor = bool(self.feature_flags.enable_hard_equity_floor)
                     self.equity_floor_usd = float(self.feature_flags.equity_floor_usd)
                     self.enable_intracycle_rebalance = bool(self.feature_flags.enable_intracycle_rebalance)
+                    if not self.enable_intracycle_rebalance:
+                        self.intracycle_rebalance_count = 0
                     self.enable_invariant_audit = bool(self.feature_flags.enable_invariant_audit)
                     self.enable_smart_money = bool(self.feature_flags.enable_smart_money)
                     self.enable_quarterly_basis = bool(self.feature_flags.enable_quarterly_basis)
                     self._sync_allocator_with_feature_flags()
-                    if prev_anom != self.enable_anomalies or abs(prev_floor - self.equity_floor_usd) > 1e-6:
+                    if (
+                        prev_anom != self.enable_anomalies
+                        or abs(prev_floor - self.equity_floor_usd) > 1e-6
+                        or prev_intra != self.enable_intracycle_rebalance
+                    ):
                         logger.info(
                             f"🚩 Runtime Feature Flags updated: enable_anomaly_capsule={self.enable_anomalies}, "
                             f"equity_floor_usd=${self.equity_floor_usd:,.2f}, "
@@ -3603,7 +3652,7 @@ class ShadowTradingDaemon:
         fn = getattr(self.exchange, "fapiPublicGetKlines", None)
         if callable(fn) and not isinstance(fn, MagicMock):
             try:
-                tf_sec = 3600.0 if timeframe == "1h" else 900.0
+                tf_sec = max(60.0, float(self._timeframe_to_timedelta(timeframe).total_seconds()))
                 if not cached_df.empty:
                     gap = int(
                         max(
@@ -3670,8 +3719,13 @@ class ShadowTradingDaemon:
         now: datetime | None = None,
         bars_1h_override: dict[str, pd.DataFrame] | None = None,
         bars_15m_override: dict[str, pd.DataFrame] | None = None,
+        bars_5m_override: dict[str, pd.DataFrame] | None = None,
         funding_override: dict[str, float] | None = None,
         settled_funding_override: list[Any] | None = None,
+        m26_oi_override: dict[str, float] | None = None,
+        m26_l2_override: dict[str, Any] | None = None,
+        m26_sweep_override: dict[str, dict[str, float]] | None = None,
+        m26_spot_tb_override: dict[str, float] | None = None,
     ) -> list[Order]:
         """
         Phase 2 Event-Driven Sniper Orchestrator:
@@ -3726,21 +3780,29 @@ class ShadowTradingDaemon:
                 blocked_clean.add(sym_cd)
 
         now_sec = int(now_dt.timestamp())
+        m5_bucket = now_sec // 300
         q_bucket = now_sec // 900
         h_bucket = now_sec // 3600
+        if bars_5m_override is None and self._last_sniper_5m_bucket < 0 and (now_sec % 300) > 90:
+            self._last_sniper_5m_bucket = m5_bucket
         if bars_15m_override is None and self._last_sniper_15m_bucket < 0 and (now_dt.minute % 15) > 3:
             self._last_sniper_15m_bucket = q_bucket
         if bars_1h_override is None and self._last_sniper_1h_bucket < 0 and now_dt.minute > 3:
             self._last_sniper_1h_bucket = h_bucket
 
+        en_m26 = bool(getattr(self, "enable_l2_sweep_sniper", True))
+        # Wait >= 4s into new 5m bar so previous 5m kline & +60s lagged 5m OI are cleanly settled
+        due_5m_m26 = en_m26 and (
+            (bars_5m_override is not None) or (m5_bucket > self._last_sniper_5m_bucket and (now_sec % 300) >= 4)
+        )
         due_15m = (bars_15m_override is not None) or (q_bucket > self._last_sniper_15m_bucket)
         due_1h = (bars_1h_override is not None) or (h_bucket > self._last_sniper_1h_bucket)
-        en_m25 = bool(getattr(self, "enable_post_settle_sniper", True))
+        en_m25 = bool(getattr(self, "enable_post_settle_sniper", False))
         due_m25 = en_m25 and (
             (settled_funding_override is not None)
             or (1 <= now_dt.minute <= 9 and h_bucket > self._last_sniper_m25_bucket)
         )
-        if not due_15m and not due_1h and not due_m25:
+        if not due_5m_m26 and not due_15m and not due_1h and not due_m25:
             return []
 
         # Rank 82 universe by live 24h quote volume when available (fallback to canonical SNIPER_UNIVERSE_82 order)
@@ -3893,6 +3955,171 @@ class ShadowTradingDaemon:
                     )
                 )
 
+        # 3) 5m Phase-P2 L2-Book Air-Pocket + 1ms Institutional Sweep Scan (`M26`)
+        if due_5m_m26:
+            self._last_sniper_5m_bucket = m5_bucket
+            f_map_m26 = funding_override
+            if f_map_m26 is None:
+                if hasattr(self, "multimodal_feeds") and self.multimodal_feeds is not None:
+                    f_map_m26 = self.multimodal_feeds.fetch_latest_funding_rates_map(now_ts=float(now_sec))
+                if not f_map_m26:
+                    f_map_m26 = self.fetch_universe_funding_rates()
+
+            merged_liq_ticks = {**self.liquid_perp_tickers, **self.latest_tickers}
+            vol24_m26: dict[str, float] = {}
+            for k_s, t_d in merged_liq_ticks.items():
+                c_s = k_s.replace("/", "").split(":")[0].strip().upper()
+                vol24_m26[c_s] = max(vol24_m26.get(c_s, 0.0), float(t_d.get("volume_24h", 0.0) or 0.0))
+
+            if bars_5m_override is not None:
+                b5_map = bars_5m_override
+            else:
+                b5_map = {}
+                if not isinstance(self.exchange, MagicMock):
+                    ranked_movers: list[tuple[float, str]] = []
+                    for k_s, t_d in merged_liq_ticks.items():
+                        c_s = k_s.replace("/", "").split(":")[0].strip().upper()
+                        if c_s in blocked_clean or vol24_m26.get(c_s, 0.0) < 15_000_000.0:
+                            continue
+                        fr_c = float((f_map_m26 or {}).get(c_s, (f_map_m26 or {}).get(f"{c_s[:-4]}/USDT", 0.0)) or 0.0)
+                        if fr_c > 0.0003:
+                            continue
+                        px_now = float(t_d.get("price", 0.0) or 0.0)
+                        if px_now <= 0.0:
+                            continue
+                        prev_p5 = self._prev_5m_prices.get(c_s)
+                        if prev_p5 is not None and prev_p5[1] > 0.0:
+                            r5_est = (px_now - prev_p5[1]) / prev_p5[1]
+                        else:
+                            r5_est = float(t_d.get("change_24h", 0.0) or 0.0) / 100.0
+                        ranked_movers.append((r5_est, c_s))
+
+                    ranked_movers.sort(key=lambda x: x[0], reverse=True)
+                    top_5m_syms = [s_c for _r, s_c in ranked_movers[:24]]
+
+                    def _load_5m(s_c: str) -> tuple[str, pd.DataFrame]:
+                        return s_c, self.fetch_sniper_taker_klines(s_c, timeframe="5m", target_bars=80)
+
+                    if top_5m_syms:
+                        with ThreadPoolExecutor(max_workers=6) as pool:
+                            for sym_5, df_5 in pool.map(_load_5m, top_5m_syms):
+                                if not df_5.empty:
+                                    b5_map[sym_5] = df_5
+
+            pre_m26 = self.sniper_engine.pre_screen_5m_breakout_candidates(
+                bars_5m_map=b5_map,
+                funding_rates=f_map_m26,
+                ticker_volumes_24h=vol24_m26 if vol24_m26 else None,
+                blocked_symbols=blocked_clean,
+            )
+            if pre_m26:
+                oi_m26: dict[str, float] = dict(m26_oi_override or {})
+                l2_m26: dict[str, Any] = dict(m26_l2_override or {})
+                sw_m26: dict[str, dict[str, float]] = dict(m26_sweep_override or {})
+                sp_tb_m26: dict[str, float] = dict(m26_spot_tb_override or {})
+
+                mm_adapter = getattr(self, "multimodal_feeds", None)
+                for cand_5 in pre_m26[:4]:
+                    c_sym = str(cand_5["symbol"])
+                    if mm_adapter is not None:
+                        if c_sym not in oi_m26:
+                            oi_res = mm_adapter.fetch_contract_oi_expansion_24h(c_sym, now_ts=float(now_sec))
+                            if oi_res is not None:
+                                oi_m26[c_sym] = float(oi_res[0])
+                        if oi_m26.get(c_sym, 0.0) < 1.16:
+                            continue
+                        if c_sym not in l2_m26:
+                            bk_res = mm_adapter.fetch_l2_book_depth_imbalance(c_sym, limit=1000, now_ts=float(now_sec))
+                            if bk_res is not None:
+                                l2_m26[c_sym] = bk_res
+                        bk_obj = l2_m26.get(c_sym)
+                        if bk_obj is None:
+                            continue
+                        b_i1 = float(
+                            bk_obj.get("book_imb_1pct", 0.0)
+                            if isinstance(bk_obj, dict)
+                            else getattr(bk_obj, "book_imb_1pct", 0.0)
+                        )
+                        b_i2 = float(
+                            bk_obj.get("book_imb_2pct", 0.0)
+                            if isinstance(bk_obj, dict)
+                            else getattr(bk_obj, "book_imb_2pct", 0.0)
+                        )
+                        if b_i1 < 0.24 or b_i2 < 0.20:
+                            continue
+                        if c_sym not in sp_tb_m26:
+                            sp_tb_m26[c_sym] = mm_adapter.fetch_spot_taker_buy_share_3m(
+                                perp_symbol=c_sym,
+                                perp_fallback_tb_5m=float(cand_5["perp_tb_5m"]),
+                                now_ts=float(now_sec),
+                            )
+                        if sp_tb_m26[c_sym] < 0.53:
+                            continue
+                        if c_sym not in sw_m26:
+                            sw_m26[c_sym] = mm_adapter.fetch_live_1ms_aggtrades_sweep(
+                                symbol=c_sym,
+                                signal_ts_sec=int(cand_5["bar_close_ts"]),
+                            )
+
+                m26_sigs = self.sniper_engine.evaluate_5m_l2_sweep_air_pocket_snipers(
+                    pre_screened=pre_m26,
+                    oi_ratios_24h=oi_m26,
+                    l2_book_snapshots=l2_m26,
+                    sweep_metrics_by_sym=sw_m26,
+                    spot_tb_3m_by_sym=sp_tb_m26,
+                    adv_ranks=adv_ranks,
+                    blocked_symbols=blocked_clean,
+                )
+                candidates.extend(m26_sigs)
+
+                # Prospective L2 + 1ms Sweep telemetry archive for continuous forensic audit
+                with contextlib.suppress(Exception):
+                    tel_dir = Path("logs")
+                    tel_dir.mkdir(parents=True, exist_ok=True)
+                    matched_m26 = {sg.symbol for sg in m26_sigs}
+                    with (tel_dir / "m26_l2_sweep_telemetry.jsonl").open("a", encoding="utf-8") as tf_out:
+                        for cand_5 in pre_m26[:4]:
+                            cs = str(cand_5["symbol"])
+                            bk_o = l2_m26.get(cs)
+                            tf_out.write(
+                                json.dumps(
+                                    {
+                                        "ts": now_dt.isoformat(),
+                                        "symbol": cs,
+                                        "close": round(float(cand_5["close"]), 6),
+                                        "rvol_5m": round(float(cand_5["rvol_5m"]), 3),
+                                        "oi_ratio_24h": round(float(oi_m26.get(cs, 0.0)), 4),
+                                        "book_imb_1pct": (
+                                            round(
+                                                float(
+                                                    bk_o.get("book_imb_1pct", 0.0)
+                                                    if isinstance(bk_o, dict)
+                                                    else getattr(bk_o, "book_imb_1pct", 0.0)
+                                                ),
+                                                4,
+                                            )
+                                            if bk_o is not None
+                                            else None
+                                        ),
+                                        "book_imb_2pct": (
+                                            round(
+                                                float(
+                                                    bk_o.get("book_imb_2pct", 0.0)
+                                                    if isinstance(bk_o, dict)
+                                                    else getattr(bk_o, "book_imb_2pct", 0.0)
+                                                ),
+                                                4,
+                                            )
+                                            if bk_o is not None
+                                            else None
+                                        ),
+                                        "sweep": sw_m26.get(cs),
+                                        "triggered_m26": cs in matched_m26,
+                                    }
+                                )
+                                + "\n"
+                            )
+
         if not candidates:
             return []
 
@@ -3907,7 +4134,13 @@ class ShadowTradingDaemon:
                 continue
 
             slash_sym = f"{sig.symbol[:-4]}/USDT" if sig.symbol.endswith("USDT") else sig.symbol
-            t_q = self.latest_tickers.get(slash_sym) or self.latest_tickers.get(sig.symbol) or {}
+            t_q = (
+                self.latest_tickers.get(slash_sym)
+                or self.latest_tickers.get(sig.symbol)
+                or self.liquid_perp_tickers.get(slash_sym)
+                or self.liquid_perp_tickers.get(sig.symbol)
+                or {}
+            )
             exec_px = float(t_q.get("price") or sig.reference_price)
             if exec_px <= 0:
                 continue

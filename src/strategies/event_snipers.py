@@ -33,6 +33,7 @@ SNIPER_M09_STRAT = "Sniper:M09_CoilBreakout"
 SNIPER_M23_STRAT = "Sniper:M23_BreadthThrust"
 SNIPER_M04_STRAT = "Sniper:M04_NegFundSqueeze"
 SNIPER_M25_STRAT = "Sniper:M25_PostSettleUnwind"
+SNIPER_M26_STRAT = "Sniper:M26_L2SweepAirPocket"
 
 SNIPER_STRATEGIES: frozenset[str] = frozenset(
     {
@@ -40,6 +41,7 @@ SNIPER_STRATEGIES: frozenset[str] = frozenset(
         SNIPER_M23_STRAT,
         SNIPER_M04_STRAT,
         SNIPER_M25_STRAT,
+        SNIPER_M26_STRAT,
     }
 )
 
@@ -192,6 +194,16 @@ SNIPER_BRACKET_PROFILES: dict[str, SniperBracketSpec] = {
         trail_trigger_pct=0.016,
         trail_distance_pct=0.0075,
         max_hold_hours=0.90,
+    ),
+    SNIPER_M26_STRAT: SniperBracketSpec(
+        strategy=SNIPER_M26_STRAT,
+        stop_loss_pct=0.019,
+        take_profit_pct=0.085,
+        lock_trigger_pct=0.024,
+        lock_level_pct=0.0015,
+        trail_trigger_pct=0.032,
+        trail_distance_pct=0.016,
+        max_hold_hours=2.50,
     ),
 }
 
@@ -528,6 +540,166 @@ class EventDrivenSniperEngine:
                         ),
                     )
                 )
+
+        signals.sort(key=lambda s: s.score, reverse=True)
+        return signals
+
+    def pre_screen_5m_breakout_candidates(
+        self,
+        bars_5m_map: dict[str, pd.DataFrame],
+        funding_rates: dict[str, float] | None = None,
+        ticker_volumes_24h: dict[str, float] | None = None,
+        blocked_symbols: set[str] | None = None,
+        min_volume_24h_usd: float = 15_000_000.0,
+        max_funding_rate: float = 0.0003,
+        min_rvol_5m: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        """
+        Stage 1 (`5m` kline pre-screen, `0` L2/aggTrades API calls):
+        Identifies closed `5m` bars across liquid USDS-M perps (`volume_24h >= $15M`, `FR <= +3.0 bps`)
+        that just broke above their prior `4h` (`48 × 5m`) High on `RVOL_5m >= 2.0` (`6h` lagged mean).
+        """
+        if not bars_5m_map:
+            return []
+        blocked = {s.replace("/", "").split(":")[0].strip().upper() for s in (blocked_symbols or set())}
+        f_map = funding_rates or {}
+        v_map = ticker_volumes_24h or {}
+        out: list[dict[str, Any]] = []
+
+        for raw_sym, df_raw in bars_5m_map.items():
+            clean_s = raw_sym.replace("/", "").split(":")[0].strip().upper()
+            if not is_valid_crypto_usdt_perp(clean_s) or clean_s in blocked:
+                continue
+            slash_s = f"{clean_s[:-4]}/USDT"
+            v24 = float(v_map.get(clean_s, v_map.get(slash_s, min_volume_24h_usd)) or 0.0)
+            if v24 < min_volume_24h_usd:
+                continue
+            fr_val = float(f_map.get(clean_s, f_map.get(slash_s, 0.0)) or 0.0)
+            if fr_val > max_funding_rate:
+                continue
+
+            d5 = _prep_kline_frame(df_raw)
+            if len(d5) < 30:
+                continue
+            c_last = float(d5["close"].iloc[-1])
+            qv_last = float(d5["quote_volume"].iloc[-1])
+            tb_last = float(d5["taker_buy_quote_volume"].iloc[-1])
+            if c_last <= 0.0 or qv_last <= 0.0:
+                continue
+
+            prev_48 = d5.iloc[:-1].tail(48)
+            if len(prev_48) < 24:
+                continue
+            h_4h = float(prev_48["high"].max())
+            if c_last <= h_4h:
+                continue
+
+            prev_72 = d5["quote_volume"].iloc[:-1].tail(72)
+            mean_qv_6h = float(prev_72.mean()) if len(prev_72) > 0 else 0.0
+            if mean_qv_6h <= 0.0:
+                continue
+            rvol_5m = qv_last / mean_qv_6h
+            if rvol_5m < min_rvol_5m:
+                continue
+
+            perp_tb_5m = float(tb_last / max(qv_last, 1.0))
+            bar_close_sec = int(d5.index[-1].timestamp()) + 300
+            out.append(
+                {
+                    "symbol": clean_s,
+                    "close": c_last,
+                    "rvol_5m": rvol_5m,
+                    "perp_tb_5m": perp_tb_5m,
+                    "funding_rate": fr_val,
+                    "volume_24h": v24,
+                    "bar_close_ts": bar_close_sec,
+                }
+            )
+        return out
+
+    def evaluate_5m_l2_sweep_air_pocket_snipers(
+        self,
+        pre_screened: list[dict[str, Any]],
+        oi_ratios_24h: dict[str, float],
+        l2_book_snapshots: dict[str, Any],
+        sweep_metrics_by_sym: dict[str, dict[str, float]],
+        spot_tb_3m_by_sym: dict[str, float] | None = None,
+        adv_ranks: dict[str, int] | None = None,
+        blocked_symbols: set[str] | None = None,
+        min_oi_ratio_24h: float = 1.16,
+        min_book_imb_1pct: float = 0.24,
+        min_book_imb_2pct: float = 0.20,
+        min_spot_tb_3m: float = 0.53,
+        min_sweep_conc_5m: float = 0.32,
+        min_whale_buy_share_15m: float = 0.53,
+        min_smart_vs_retail_div: float = -0.03,
+    ) -> list[SniperCandidateSignal]:
+        """
+        Evaluates Phase-P2 `Sniper:M26_L2SweepAirPocket` (`P6A_L2_3_INST_SWEEP_CONC` + `MONO_A_CONVEX_TRAIL`):
+          - `+71.15 bps/trade` net full (`2023–2026`), positive in ALL 3 eras (`+74.0 / +10.2 / +236.6 bps`),
+            `100%` (`15/15`) True In-Fold CPCV splits positive (`+85.83 bps` OOS), `Fee Share = 7.5%`.
+          - Enforces exact 7-gate parity with `microstructure_monetization_lab.py` & `tick_sweep_physics.py`.
+        """
+        if not pre_screened:
+            return []
+        blocked = {s.replace("/", "").split(":")[0].strip().upper() for s in (blocked_symbols or set())}
+        rk_map = adv_ranks or {}
+        sp_tb_map = spot_tb_3m_by_sym or {}
+        signals: list[SniperCandidateSignal] = []
+
+        for cand in pre_screened:
+            sym = str(cand.get("symbol") or "").strip().upper()
+            if not sym or sym in blocked:
+                continue
+            oir = float(oi_ratios_24h.get(sym, 0.0) or 0.0)
+            if oir < min_oi_ratio_24h:
+                continue
+
+            tb_3m = float(sp_tb_map.get(sym, cand.get("perp_tb_5m", 0.0)))
+            if tb_3m < min_spot_tb_3m:
+                continue
+
+            bk = l2_book_snapshots.get(sym)
+            if bk is None:
+                continue
+            imb1 = float(bk.get("book_imb_1pct", 0.0) if isinstance(bk, dict) else getattr(bk, "book_imb_1pct", 0.0))
+            imb2 = float(bk.get("book_imb_2pct", 0.0) if isinstance(bk, dict) else getattr(bk, "book_imb_2pct", 0.0))
+            if imb1 < min_book_imb_1pct or imb2 < min_book_imb_2pct:
+                continue
+
+            sw = sweep_metrics_by_sym.get(sym) or {}
+            has_agg = float(sw.get("has_agg", 0.0)) > 0.5
+            sw_conc = float(sw.get("sweep_conc_share_5m", 0.0))
+            wh_sh15 = float(sw.get("whale_sweep_buy_share_15m", 0.50))
+            sr_div = float(sw.get("smart_vs_retail_div_15m", 0.0))
+            if not has_agg:
+                continue
+            if sw_conc < min_sweep_conc_5m or wh_sh15 < min_whale_buy_share_15m or sr_div < min_smart_vs_retail_div:
+                continue
+
+            ref_px = float(cand["close"])
+            rv5 = float(cand["rvol_5m"])
+            fr_bps = float(cand["funding_rate"]) * 10_000.0
+            raw_st = (imb1 + imb2) * 100.0 * oir
+            score = float(raw_st * (0.5 + sw_conc))
+            rk_s = int(rk_map.get(sym, 30))
+
+            signals.append(
+                SniperCandidateSignal(
+                    symbol=sym,
+                    side=1,
+                    strategy=SNIPER_M26_STRAT,
+                    score=score,
+                    reference_price=ref_px,
+                    adv_rank=rk_s,
+                    bracket=SNIPER_BRACKET_PROFILES[SNIPER_M26_STRAT],
+                    reason=(
+                        f"L2SweepAirPocket 4hBrk OI={oir:.2f}x RVOL5m={rv5:.1f}x FR={fr_bps:+.1f}bps "
+                        f"BookImb1/2={imb1:+.2f}/{imb2:+.2f} SweepConc5m={sw_conc * 100:.0f}% "
+                        f"WhaleBuy15m={wh_sh15 * 100:.0f}%"
+                    ),
+                )
+            )
 
         signals.sort(key=lambda s: s.score, reverse=True)
         return signals

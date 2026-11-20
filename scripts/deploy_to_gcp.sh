@@ -551,6 +551,39 @@ if [[ "$MODE" == "--deploy" ]]; then
     exit 0
 fi
 
+if [[ "$MODE" == "--deploy-worktree" ]]; then
+    echo "=== [1/3] Empaquetando árbol de trabajo verificado (src/ + scripts/ + Docker) hacia Tokio ==="
+    COPYFILE_DISABLE=1 tar \
+        --exclude='__pycache__' \
+        --exclude='*.pyc' \
+        --exclude='.DS_Store' \
+        -czf /tmp/crypto-alpha-worktree.tar.gz \
+        Dockerfile docker-compose.yml requirements.txt README.md src scripts
+    gcloud compute scp /tmp/crypto-alpha-worktree.tar.gz "$INSTANCE:/tmp/crypto-alpha-worktree.tar.gz" \
+        --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet
+    rm -f /tmp/crypto-alpha-worktree.tar.gz
+
+    echo "=== [2/3] Reconstruyendo imagen Docker y actualizando contenedor Mainnet en Tokio ==="
+    gcloud compute ssh "$INSTANCE" --zone="$ZONE" --project="$PROJECT_ID" --tunnel-through-iap --quiet \
+        --command='
+            set -euo pipefail
+            mkdir -p ~/crypto-alpha-engine/data ~/crypto-alpha-engine/logs
+            tar -xzf /tmp/crypto-alpha-worktree.tar.gz -C ~/crypto-alpha-engine/
+            rm -f /tmp/crypto-alpha-worktree.tar.gz
+            cd ~/crypto-alpha-engine
+            chmod 600 .env
+            docker build -t crypto-alpha-engine:latest .
+            docker compose up -d --no-build --remove-orphans
+            sleep 6
+            docker exec crypto-mainnet python scripts/run_trading.py --mainnet --set-flag enable_l2_sweep_sniper=true --set-flag enable_post_settle_sniper=false
+            sleep 4
+            docker compose ps
+            echo ""
+            docker compose logs --tail=30
+        '
+    exit 0
+fi
+
 # Default: --status
 echo "=== Reglas de Firewall activas en $PROJECT_ID ==="
 gcloud compute firewall-rules list --project="$PROJECT_ID" --format="table(name,direction,sourceRanges.list():label=SOURCE_RANGES,allowed[].map().firewall_rule().list():label=ALLOW)"

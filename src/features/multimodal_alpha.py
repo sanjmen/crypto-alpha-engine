@@ -692,14 +692,17 @@ def attach_forward_returns_for_audit(
     forward_bars_map: dict[str, int],
 ) -> pd.DataFrame:
     """
-    Attaches strictly post-`decision_ts` forward log returns (`log(close_{t+h} / close_t)`)
+    Attaches strictly post-`decision_ts` linear forward returns (`(close_{t+h} - close_t) / close_t`)
     per symbol ONLY for offline IC & Conditional Payoff evaluation (never passed into live inference).
+    Uses exact linear simple returns (never `np.log`) so Short payoffs do not suffer `+0.5 * sigma^2`
+    Jensen convexity inflation.
     """
     out = panel.sort_values(["symbol", "decision_ts"]).copy()
+    denom = out["close"].clip(lower=1e-12)
     for lbl, h_bars in forward_bars_map.items():
         h = max(1, int(h_bars))
         fwd_close = out.groupby("symbol")["close"].shift(-h)
-        out[f"fwd_ret_{lbl}"] = np.log(fwd_close / out["close"].clip(lower=1e-12))
+        out[f"fwd_ret_{lbl}"] = (fwd_close - denom) / denom
     return out
 
 

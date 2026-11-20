@@ -24,6 +24,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 import requests
 
 from src.data.multimodal_vision_ingestor import (
@@ -32,6 +33,7 @@ from src.data.multimodal_vision_ingestor import (
     verify_spot_price_parity,
 )
 from src.execution.rate_limiter import ExchangeRateLimiter
+from src.features.tick_sweep_physics import compute_event_tick_sweep_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,21 @@ class DerivativesPositioningSnapshot:
     taker_ls_vol_ratio: float
 
 
+@dataclass(frozen=True)
+class L2BookDepthSnapshot:
+    """Symmetric real-time L2 Order-Book Depth (`±1%` and `±2%` USD notional & imbalance) snapshot."""
+
+    symbol: str
+    mid_price: float
+    bid_1_usd: float
+    ask_1_usd: float
+    bid_2_usd: float
+    ask_2_usd: float
+    book_imb_1pct: float
+    book_imb_2pct: float
+    timestamp_sec: float
+
+
 class LiveMultiModalFeedAdapter:
     """
     Thread-safe, TTL-cached multi-modal live data adapter with strict API weight budgeting.
@@ -116,6 +133,8 @@ class LiveMultiModalFeedAdapter:
         self._last_premium_index_ts: float = 0.0
         self._cached_spot_books: dict[str, tuple[float, float, float]] = {}
         self._positioning_cache: dict[str, tuple[float, DerivativesPositioningSnapshot]] = {}
+        self._contract_oi_24h_cache: dict[str, tuple[float, float, int]] = {}
+        self._l2_depth_cache: dict[str, tuple[float, L2BookDepthSnapshot]] = {}
 
     def _record_weight(self, weight: int, now_mono: float | None = None) -> None:
         now_m = time.monotonic() if now_mono is None else float(now_mono)
@@ -530,3 +549,268 @@ class LiveMultiModalFeedAdapter:
         )
         self._positioning_cache[clean_sym] = (now_mono, snap)
         return snap
+
+    def fetch_latest_funding_rates_map(self, now_ts: float | None = None) -> dict[str, float]:
+        """Returns `{CLEAN_SYM: last_funding_rate}` from the TTL-cached `/fapi/v1/premiumIndex` map."""
+        _ = now_ts
+        p_map = self._fetch_premium_index_map(now_mono=time.monotonic())
+        return {sym: float(info.get("last_funding_rate", 0.0)) for sym, info in p_map.items()}
+
+    def fetch_contract_oi_expansion_24h(
+        self,
+        symbol: str,
+        now_ts: float | None = None,
+    ) -> tuple[float, int] | None:
+        """
+        Computes exact contract-unit `24h` Open Interest expansion (`oi_ratio_24h = latest_oi / mean_288(oi)`)
+        with mandatory `+60s` causal safety lag (`sumOpenInterest`), matching `microstructure_monetization_lab.py`.
+        Returns `(oi_ratio_24h, latest_bar_ts_sec)` or `None`.
+        """
+        clean_sym = symbol.replace("/", "").split(":")[0].strip().upper()
+        now_mono = time.monotonic()
+        now_sec = float(time.time() if now_ts is None else now_ts)
+
+        cached = self._contract_oi_24h_cache.get(clean_sym)
+        if cached is not None and (now_mono - cached[0]) < 180.0:
+            return cached[1], cached[2]
+
+        if self.exchange is not None and isinstance(self.exchange, MagicMock):
+            return None
+
+        cutoff_ts_sec = int(now_sec) - self.metrics_safety_lag_sec
+        try:
+            oi_rows = self._get_json(
+                f"{FAPI_BASE_URL}/futures/data/openInterestHist",
+                params={"symbol": clean_sym, "period": "5m", "limit": 300},
+                weight=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"LiveMultiModalFeedAdapter 24h contract OI fetch note ({clean_sym}): {exc}")
+            return None
+
+        pts: list[tuple[int, float]] = []
+        if isinstance(oi_rows, list):
+            for r in oi_rows:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    ts_s = int(round(float(r.get("timestamp") or 0.0) / 1000.0))
+                    oi_c = float(r.get("sumOpenInterest") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < ts_s <= cutoff_ts_sec and oi_c > 0.0:
+                    pts.append((ts_s, oi_c))
+
+        if len(pts) < 36:
+            return None
+        pts.sort(key=lambda x: x[0])
+        tail_288 = [v for _, v in pts[-288:]]
+        mean_24h = float(np.mean(tail_288))
+        if mean_24h <= 0.0:
+            return None
+        ratio_24h = float(pts[-1][1] / mean_24h)
+        self._contract_oi_24h_cache[clean_sym] = (now_mono, ratio_24h, int(pts[-1][0]))
+        return ratio_24h, int(pts[-1][0])
+
+    def fetch_l2_book_depth_imbalance(
+        self,
+        symbol: str,
+        limit: int = 1000,
+        now_ts: float | None = None,
+    ) -> L2BookDepthSnapshot | None:
+        """
+        Fetches real-time L2 Order Book (`/fapi/v1/depth?limit=1000`) and integrates symmetric
+        Bid vs Ask resting USD notional within `±1.0%` and `±2.0%` of mid-price (truncation-safe:
+        always integrates over `min(target_band, bid_span, ask_span)` so fine-tick books never bias Bid vs Ask).
+        """
+        clean_sym = symbol.replace("/", "").split(":")[0].strip().upper()
+        now_mono = time.monotonic()
+        now_sec = float(time.time() if now_ts is None else now_ts)
+
+        cached = self._l2_depth_cache.get(clean_sym)
+        if cached is not None and (now_mono - cached[0]) < 10.0:
+            return cached[1]
+
+        if self.exchange is not None and isinstance(self.exchange, MagicMock):
+            return None
+
+        eff_lim = 1000 if limit >= 1000 else (500 if limit >= 500 else 100)
+        w_cost = 20 if eff_lim == 1000 else (10 if eff_lim == 500 else 5)
+        try:
+            book = self._get_json(
+                f"{FAPI_BASE_URL}/fapi/v1/depth",
+                params={"symbol": clean_sym, "limit": eff_lim},
+                weight=w_cost,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"LiveMultiModalFeedAdapter L2 depth fetch note ({clean_sym}): {exc}")
+            return None
+
+        if not isinstance(book, dict):
+            return None
+        raw_bids = book.get("bids") or []
+        raw_asks = book.get("asks") or []
+        if not raw_bids or not raw_asks:
+            return None
+
+        try:
+            b_arr = np.array([[float(p), float(q)] for p, q in raw_bids if float(p) > 0 and float(q) > 0], dtype=float)
+            a_arr = np.array([[float(p), float(q)] for p, q in raw_asks if float(p) > 0 and float(q) > 0], dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if b_arr.ndim != 2 or a_arr.ndim != 2 or len(b_arr) == 0 or len(a_arr) == 0:
+            return None
+
+        best_bid = float(np.max(b_arr[:, 0]))
+        best_ask = float(np.min(a_arr[:, 0]))
+        if best_bid <= 0.0 or best_ask < best_bid:
+            return None
+        mid = 0.5 * (best_bid + best_ask)
+
+        bid_span = (mid - float(np.min(b_arr[:, 0]))) / mid
+        ask_span = (float(np.max(a_arr[:, 0])) - mid) / mid
+        sym_span = min(bid_span, ask_span)
+        if sym_span < 0.004:
+            return None
+
+        band_1 = min(0.01, sym_span)
+        band_2 = min(0.02, sym_span)
+        b_notional = b_arr[:, 0] * b_arr[:, 1]
+        a_notional = a_arr[:, 0] * a_arr[:, 1]
+
+        b1_usd = float(b_notional[b_arr[:, 0] >= mid * (1.0 - band_1)].sum())
+        a1_usd = float(a_notional[a_arr[:, 0] <= mid * (1.0 + band_1)].sum())
+        b2_usd = float(b_notional[b_arr[:, 0] >= mid * (1.0 - band_2)].sum())
+        a2_usd = float(a_notional[a_arr[:, 0] <= mid * (1.0 + band_2)].sum())
+
+        if (b1_usd + a1_usd) <= 1000.0:
+            return None
+
+        imb1 = (b1_usd - a1_usd) / max(b1_usd + a1_usd, 1.0)
+        imb2 = (b2_usd - a2_usd) / max(b2_usd + a2_usd, 1.0)
+        snap = L2BookDepthSnapshot(
+            symbol=clean_sym,
+            mid_price=mid,
+            bid_1_usd=b1_usd,
+            ask_1_usd=a1_usd,
+            bid_2_usd=b2_usd,
+            ask_2_usd=a2_usd,
+            book_imb_1pct=float(imb1),
+            book_imb_2pct=float(imb2),
+            timestamp_sec=now_sec,
+        )
+        self._l2_depth_cache[clean_sym] = (now_mono, snap)
+        return snap
+
+    def fetch_spot_taker_buy_share_3m(
+        self,
+        perp_symbol: str,
+        perp_fallback_tb_5m: float,
+        now_ts: float | None = None,
+    ) -> float:
+        """
+        Fetches the latest 3 completed `1m` Spot klines (`api.binance.com/api/v3/klines`) for `perp_symbol`
+        to compute `spot_tb_3m = sum(taker_buy_qvol_3m) / sum(qvol_3m)`, falling back to `perp_fallback_tb_5m`
+        when no Binance Spot pair exists (100% parity with `microstructure_monetization_lab.py`).
+        """
+        if self.exchange is not None and isinstance(self.exchange, MagicMock):
+            return float(perp_fallback_tb_5m)
+
+        clean_perp = perp_symbol.replace("/", "").split(":")[0].strip().upper()
+        now_ms = int((time.time() if now_ts is None else float(now_ts)) * 1000)
+
+        for spot_sym, _mult in self.resolve_spot_candidates_static(clean_perp):
+            try:
+                rows = self._get_json(
+                    f"{SPOT_API_BASE_URL}/api/v3/klines",
+                    params={"symbol": spot_sym, "interval": "1m", "limit": 5},
+                    weight=2,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(rows, list) or len(rows) < 3:
+                continue
+            closed = [
+                r for r in rows if isinstance(r, (list, tuple)) and len(r) >= 11 and (int(r[0]) + 60_000) <= now_ms
+            ]
+            tail3 = closed[-3:]
+            if not tail3:
+                continue
+            qv_sum = sum(float(r[7]) for r in tail3)
+            tb_sum = sum(float(r[10]) for r in tail3)
+            if qv_sum > 0.0:
+                return float(np.clip(tb_sum / qv_sum, 0.0, 1.0))
+        return float(perp_fallback_tb_5m)
+
+    def fetch_live_1ms_aggtrades_sweep(
+        self,
+        symbol: str,
+        signal_ts_sec: int,
+        max_pages_5m: int = 8,
+        max_pages_prev10m: int = 4,
+    ) -> dict[str, float]:
+        """
+        Streams strictly causal (`transact_time_ms <= signal_ts_sec * 1000 - 1`) `/fapi/v1/aggTrades`
+        over `[T - 15m, T - 1ms]`, prioritizing `[T - 5m, T - 1ms]` first so `5m` institutional sweep
+        concentration is 100% complete even during high-velocity breakouts, and computes exact `1-ms`
+        sweep physics via `src.features.tick_sweep_physics.compute_event_tick_sweep_metrics`.
+        """
+        clean_sym = symbol.replace("/", "").split(":")[0].strip().upper()
+        if self.exchange is not None and isinstance(self.exchange, MagicMock):
+            return compute_event_tick_sweep_metrics(None, signal_ts_sec)
+
+        end_ms = int(signal_ts_sec) * 1000 - 1
+        start_5m = end_ms - 300_000 + 1
+        start_15m = end_ms - 900_000 + 1
+
+        seen_ids: set[int] = set()
+        recs: list[tuple[int, float, float, int, bool]] = []
+
+        def _paginate_window(w_start: int, w_end: int, max_p: int) -> None:
+            cur_s = int(w_start)
+            for _ in range(max(1, int(max_p))):
+                if cur_s > w_end:
+                    break
+                try:
+                    batch = self._get_json(
+                        f"{FAPI_BASE_URL}/fapi/v1/aggTrades",
+                        params={"symbol": clean_sym, "startTime": cur_s, "endTime": w_end, "limit": 1000},
+                        weight=20,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"LiveMultiModalFeedAdapter aggTrades page note ({clean_sym}): {exc}")
+                    break
+                if not isinstance(batch, list) or not batch:
+                    break
+                max_t = cur_s
+                for item in batch:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        aid = int(item["a"])
+                        t_ms = int(item["T"])
+                        px = float(item["p"])
+                        qty = float(item["q"])
+                        f_id = int(item["f"])
+                        l_id = int(item["l"])
+                        ibm = bool(item["m"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if t_ms > max_t:
+                        max_t = t_ms
+                    if aid in seen_ids or t_ms < start_15m or t_ms > end_ms:
+                        continue
+                    seen_ids.add(aid)
+                    recs.append((t_ms, px, px * qty, max(1, l_id - f_id + 1), not ibm))
+                if len(batch) < 1000 or max_t >= w_end:
+                    break
+                cur_s = max_t + 1
+
+        _paginate_window(start_5m, end_ms, max_pages_5m)
+        _paginate_window(start_15m, start_5m - 1, max_pages_prev10m)
+
+        if len(recs) < 10:
+            return compute_event_tick_sweep_metrics(None, signal_ts_sec)
+
+        ticks_df = pd.DataFrame(recs, columns=["ts_ms", "price", "usd", "makers", "is_buy"])
+        return compute_event_tick_sweep_metrics(ticks_df, signal_ts_sec)

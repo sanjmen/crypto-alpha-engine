@@ -521,13 +521,16 @@ def test_progressive_profit_lock_ws_peak_and_ranging_barriers():
     inv = daemon.evaluate_shield_invariants()
     assert inv["inv4_dollar_neutrality"] is True
 
-    # 5. Verify 15-minute post-bracket intracycle rebalance fires when Short side collapsed (+$500 Long vs $0 Short)
+    # 5. Verify Mainnet defaults to Strict 8h Clock (intracycle OFF), and still supports opt-in intracycle check
     from datetime import timedelta
 
-    assert daemon.enable_intracycle_rebalance is True
+    assert daemon.enable_intracycle_rebalance is False
     now_fill = daemon.last_core_bracket_fill_time
     assert now_fill is not None
     daemon.last_rebalance_time = now_fill - timedelta(hours=1)
+    assert daemon.is_intracycle_rebalance_needed(now_fill + timedelta(minutes=16)) is False
+
+    daemon.enable_intracycle_rebalance = True
     assert daemon.is_intracycle_rebalance_needed(now_fill + timedelta(minutes=10)) is False
     assert daemon.is_intracycle_rebalance_needed(now_fill + timedelta(minutes=16)) is True
     assert daemon.evaluate_shield_invariants()["inv3_no_spurious_intracycle"] is True
