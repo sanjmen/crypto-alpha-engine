@@ -209,7 +209,10 @@ def _fetch_or_synthesize_book_depth() -> pd.DataFrame:
     url = "https://data.binance.vision/data/futures/um/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2024-05-01.zip"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CryptoAlphaEngine/1.0)"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp, zipfile.ZipFile(io.BytesIO(resp.read())) as zf:
+        with (
+            urllib.request.urlopen(req, timeout=10) as resp,
+            zipfile.ZipFile(io.BytesIO(resp.read())) as zf,
+        ):
             return pd.read_csv(zf.open(zf.namelist()[0]))
     except Exception:
         base_notionals = {
@@ -363,11 +366,20 @@ def run_pure_anomalies_benchmark(cache_dir: Path) -> pd.DataFrame:
         for strat_name, sigs, horizon_h, is_short in [
             ("OversoldBounce", strat_bounce.generate_signals(sub_market), 24, False),
             ("EarlyBreakout", strat_breakout.generate_signals(sub_market), 12, False),
-            ("PumpFundingFade", strat_fade.generate_signals(sub_market, funding_data=sub_funding), 24, True),
+            (
+                "PumpFundingFade",
+                strat_fade.generate_signals(sub_market, funding_data=sub_funding),
+                24,
+                True,
+            ),
         ]:
             for sig in sigs:
                 meta = sig.metadata
-                entry_p, sl_p, tp_p = meta["entry_price"], meta["stop_loss"], meta["take_profit"]
+                entry_p, sl_p, tp_p = (
+                    meta["entry_price"],
+                    meta["stop_loss"],
+                    meta["take_profit"],
+                )
                 sym_df = bars[sig.symbol]
                 future_bars = sym_df.loc[(sym_df.index > ts) & (sym_df.index <= ts + pd.Timedelta(hours=horizon_h))]
                 if future_bars.empty:
@@ -491,14 +503,25 @@ def _build_existing_sleeves_daily_proxy(panel: pd.DataFrame) -> pd.Series:
     (Core 7-Factor Cross-Sectional Momentum/Carry + P2 BTC/ETH/SOL TSMOM + Phase 2 Breakout/Pullback Snipers)
     to measure true out-of-sample orthogonality (`corr_to_existing_sleeves`) for every candidate feature.
     """
-    df = panel[["decision_ts", "symbol", "ret_24h", "funding_rate_bps", "rvol_shock_1h_vs_24h", "fwd_ret_4h"]].dropna(
-        subset=["fwd_ret_4h"]
-    )
+    df = panel[
+        [
+            "decision_ts",
+            "symbol",
+            "ret_24h",
+            "funding_rate_bps",
+            "rvol_shock_1h_vs_24h",
+            "fwd_ret_4h",
+        ]
+    ].dropna(subset=["fwd_ret_4h"])
     if df.empty:
         return pd.Series(dtype=np.float64)
     from src.features.multimodal_alpha import _vectorized_cs_zscore
 
-    day = pd.to_datetime((df["decision_ts"].to_numpy(dtype=np.int64) // 86400) * 86400, unit="s", utc=True)
+    day = pd.to_datetime(
+        (df["decision_ts"].to_numpy(dtype=np.int64) // 86400) * 86400,
+        unit="s",
+        utc=True,
+    )
     # Pillar 1 proxy: Cross-sectional 24h momentum minus funding carry
     p1_score = pd.Series(_vectorized_cs_zscore(df, "decision_ts", "ret_24h"), index=df.index) - 0.35 * np.sign(
         df["funding_rate_bps"]
@@ -548,7 +571,10 @@ def run_m16_feature_atlas_benchmark(
         from src.cloud.colab_client import ColabClient
 
         client = ColabClient(session_name=colab_session)
-        print(f"[*] Provisioning Colab CPU session '{colab_session}' for M16-2 Feature Atlas...", flush=True)
+        print(
+            f"[*] Provisioning Colab CPU session '{colab_session}' for M16-2 Feature Atlas...",
+            flush=True,
+        )
         if not client.ensure_session(gpu=None):
             raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
         try:
@@ -571,7 +597,10 @@ def run_m16_feature_atlas_benchmark(
                 "print(f'ATLAS_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=60)
-            print(f"[+] Launched remote M16-2 Atlas ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote M16-2 Atlas ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             import time
 
@@ -621,7 +650,10 @@ def run_m16_feature_atlas_benchmark(
                 client.stop()
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             else:
-                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+                print(
+                    f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).",
+                    flush=True,
+                )
 
     # In-VM / Local Shard-Streaming Execution
     from concurrent.futures import ThreadPoolExecutor
@@ -641,7 +673,12 @@ def run_m16_feature_atlas_benchmark(
         stage_dir.mkdir(parents=True, exist_ok=True)
         m16_data_dir = stage_dir
         subprocess.run(
-            ["rclone", "copy", f"{rclone_stream.rstrip('/')}/universe_catalog.parquet", str(stage_dir)],
+            [
+                "rclone",
+                "copy",
+                f"{rclone_stream.rstrip('/')}/universe_catalog.parquet",
+                str(stage_dir),
+            ],
             check=True,
         )
 
@@ -650,7 +687,13 @@ def run_m16_feature_atlas_benchmark(
         onboard_map: dict[str, int] = {}
         if cat_path.exists():
             cat_df = pd.read_parquet(cat_path)
-            onboard_map = dict(zip(cat_df["symbol"].astype(str), cat_df["onboard_timestamp"].astype(int), strict=False))
+            onboard_map = dict(
+                zip(
+                    cat_df["symbol"].astype(str),
+                    cat_df["onboard_timestamp"].astype(int),
+                    strict=False,
+                )
+            )
 
         cfg = MultiModalFeatureConfig(decision_freq="15min", metrics_safety_lag_sec=60, min_adv_usd=15_000_000.0)
         if rclone_stream:
@@ -688,7 +731,13 @@ def run_m16_feature_atlas_benchmark(
                 )
 
         def _proc_sym_task(
-            item: tuple[str, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None],
+            item: tuple[
+                str,
+                pd.DataFrame,
+                pd.DataFrame | None,
+                pd.DataFrame | None,
+                pd.DataFrame | None,
+            ],
         ) -> pd.DataFrame | None:
             sym_k, p_bars, s_bars, m_bars, f_bars = item
             f_df = compute_symbol_multimodal_features(
@@ -728,7 +777,13 @@ def run_m16_feature_atlas_benchmark(
             "quote_volume",
             "taker_buy_quote_volume",
         ]
-        spot_cols = ["symbol", "timestamp", "close", "quote_volume", "taker_buy_quote_volume"]
+        spot_cols = [
+            "symbol",
+            "timestamp",
+            "close",
+            "quote_volume",
+            "taker_buy_quote_volume",
+        ]
         worker_cnt = min(2, max(1, os.cpu_count() or 2))
 
         def _rss_mb() -> float:
@@ -817,7 +872,10 @@ def run_m16_feature_atlas_benchmark(
 
             shutil.rmtree(stage_dir, ignore_errors=True)
 
-    print("[*] Assembling 220-symbol cross-sectional panel & Family D orthogonal ranks...", flush=True)
+    print(
+        "[*] Assembling 220-symbol cross-sectional panel & Family D orthogonal ranks...",
+        flush=True,
+    )
     raw_panel = pd.concat(panel_chunks, ignore_index=True)
     del panel_chunks
     gc.collect()
@@ -827,7 +885,10 @@ def run_m16_feature_atlas_benchmark(
     gc.collect()
 
     all_feat_cols = list_multimodal_feature_columns(full_panel)
-    print(f"[*] Total Panel Rows: {len(full_panel):,} | Total Multi-Modal Features: {len(all_feat_cols)}", flush=True)
+    print(
+        f"[*] Total Panel Rows: {len(full_panel):,} | Total Multi-Modal Features: {len(all_feat_cols)}",
+        flush=True,
+    )
 
     bench_daily = _build_existing_sleeves_daily_proxy(full_panel)
     print(
@@ -927,8 +988,15 @@ def run_m16_feature_atlas_benchmark(
             shutil.copy2(output_dir / fname, drive_reports / fname)
         panel_dir = drive_root / "data" / "m16_multimodal" / "features_panel"
         panel_dir.mkdir(parents=True, exist_ok=True)
-        full_panel.to_parquet(panel_dir / "m16_2_causal_panel.parquet", compression="zstd", compression_level=9)
-        print(f"[+] Persisted Atlas reports & causal panel to Google Drive ({drive_root})", flush=True)
+        full_panel.to_parquet(
+            panel_dir / "m16_2_causal_panel.parquet",
+            compression="zstd",
+            compression_level=9,
+        )
+        print(
+            f"[+] Persisted Atlas reports & causal panel to Google Drive ({drive_root})",
+            flush=True,
+        )
     elif rclone_stream:
         import subprocess
 
@@ -936,7 +1004,12 @@ def run_m16_feature_atlas_benchmark(
         try:
             full_panel.to_parquet(tmp_panel, compression="zstd", compression_level=9)
             subprocess.run(
-                ["rclone", "copy", str(tmp_panel), f"{rclone_stream.rstrip('/')}/features_panel/"],
+                [
+                    "rclone",
+                    "copy",
+                    str(tmp_panel),
+                    f"{rclone_stream.rstrip('/')}/features_panel/",
+                ],
                 check=False,
             )
         finally:
@@ -965,7 +1038,10 @@ def run_m16_gtx_matrix_benchmark(
         from src.cloud.colab_client import ColabClient
 
         client = ColabClient(session_name=colab_session)
-        print(f"[*] Connecting to Colab session '{colab_session}' for M16-3 Passive GTX Matrix...", flush=True)
+        print(
+            f"[*] Connecting to Colab session '{colab_session}' for M16-3 Passive GTX Matrix...",
+            flush=True,
+        )
         if not client.ensure_session(gpu=None):
             raise RuntimeError(f"Failed to connect/provision Colab session '{colab_session}'")
         try:
@@ -988,7 +1064,10 @@ def run_m16_gtx_matrix_benchmark(
                 "print(f'GTX_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=120)
-            print(f"[+] Launched remote M16-3 GTX Matrix ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote M16-3 GTX Matrix ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             while True:
@@ -1035,7 +1114,10 @@ def run_m16_gtx_matrix_benchmark(
                 client.stop()
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             else:
-                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+                print(
+                    f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).",
+                    flush=True,
+                )
 
     import gc
     import json
@@ -1063,7 +1145,10 @@ def run_m16_gtx_matrix_benchmark(
         "quad_long_liq_flush_1h",
         "spot_vs_perp_cvd_div_1h",
     ]
-    print(f"🔬 M16-3 Passive GTX Matrix | Loading causal trigger panel from {panel_path}...", flush=True)
+    print(
+        f"🔬 M16-3 Passive GTX Matrix | Loading causal trigger panel from {panel_path}...",
+        flush=True,
+    )
     panel = pd.read_parquet(panel_path, columns=req_cols)
     panel = panel[panel["tradable_adv_15m_gate"] > 0.5].reset_index(drop=True)
 
@@ -1132,7 +1217,10 @@ def run_m16_gtx_matrix_benchmark(
         sub = panel.loc[spec["mask"], ["symbol", "decision_ts"]]
         grouped = {str(k): v["decision_ts"].to_numpy(dtype=np.int64) for k, v in sub.groupby("symbol", observed=True)}
         cand_ts_by_sym[c_name] = grouped
-        print(f"  • {c_name}: {len(sub):,} raw causal triggers across {len(grouped)} liquid perps", flush=True)
+        print(
+            f"  • {c_name}: {len(sub):,} raw causal triggers across {len(grouped)} liquid perps",
+            flush=True,
+        )
 
     del panel
     gc.collect()
@@ -1267,7 +1355,10 @@ def run_m16_gtx_matrix_benchmark(
 
         del by_sym
         gc.collect()
-        print(f"  ✓ Simulated 1m GTX & Taker fills on {sh_name} in {time.time() - t_sh:.1f}s", flush=True)
+        print(
+            f"  ✓ Simulated 1m GTX & Taker fills on {sh_name} in {time.time() - t_sh:.1f}s",
+            flush=True,
+        )
 
     matrix_rows: list[dict] = []
     for (c_name, mode_key), parts in trade_buckets.items():
@@ -1388,7 +1479,10 @@ def run_m16_discovery_and_synthesis_benchmark(
         from src.cloud.colab_client import ColabClient
 
         client = ColabClient(session_name=colab_session)
-        print(f"[*] Connecting to Colab session '{colab_session}' for M16-4 + M16-5...", flush=True)
+        print(
+            f"[*] Connecting to Colab session '{colab_session}' for M16-4 + M16-5...",
+            flush=True,
+        )
         if not client.ensure_session(gpu=None):
             raise RuntimeError(f"Failed to connect/provision Colab session '{colab_session}'")
         try:
@@ -1411,7 +1505,10 @@ def run_m16_discovery_and_synthesis_benchmark(
                 "print(f'DISC_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=120)
-            print(f"[+] Launched remote M16-4/M16-5 ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote M16-4/M16-5 ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             while True:
@@ -1461,7 +1558,10 @@ def run_m16_discovery_and_synthesis_benchmark(
                 client.stop()
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             else:
-                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+                print(
+                    f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).",
+                    flush=True,
+                )
 
     import gc
     import json
@@ -1518,7 +1618,10 @@ def run_m16_discovery_and_synthesis_benchmark(
         "vol_of_vol_24h",
         "rvol_shock_1h_vs_24h",
     ]
-    print(f"🔬 M16-4/M16-5 | Loading causal panel ({len(disc_cols)} cols) from {panel_path}...", flush=True)
+    print(
+        f"🔬 M16-4/M16-5 | Loading causal panel ({len(disc_cols)} cols) from {panel_path}...",
+        flush=True,
+    )
     panel = pd.read_parquet(panel_path, columns=disc_cols)
     panel = panel[panel["tradable_adv_15m_gate"] > 0.5].reset_index(drop=True)
 
@@ -1537,7 +1640,13 @@ def run_m16_discovery_and_synthesis_benchmark(
         + 0.30 * _vectorized_cs_zscore(p8_maj, "decision_ts", "smart_money_div_z_24h")
     )
     p1_daily, _ = simulate_cross_sectional_sleeve_daily(
-        p8_maj, p1_raw, "fwd_ret_8h", horizon_hours=8, one_way_cost_bps=2.1, ema_alpha=0.15, top_k=4
+        p8_maj,
+        p1_raw,
+        "fwd_ret_8h",
+        horizon_hours=8,
+        one_way_cost_bps=2.1,
+        ema_alpha=0.15,
+        top_k=4,
     )
 
     maj_3 = (
@@ -1565,11 +1674,25 @@ def run_m16_discovery_and_synthesis_benchmark(
         0.0,
     )
     p3_daily, _ = simulate_event_sniper_sleeve_daily(
-        p4_all, sn_sig, "fwd_ret_4h", horizon_hours=4, roundtrip_cost_bps=4.2, slot_weight=0.35, max_concurrent_slots=3
+        p4_all,
+        sn_sig,
+        "fwd_ret_4h",
+        horizon_hours=4,
+        roundtrip_cost_bps=4.2,
+        slot_weight=0.35,
+        max_concurrent_slots=3,
     )
     prod_daily = causal_inverse_vol_combine(
-        {"p1_core_bhs": p1_daily, "p2_manga_tsmom": p2_daily, "p3_event_snipers": p3_daily},
-        base_risk_shares={"p1_core_bhs": 0.48, "p2_manga_tsmom": 0.32, "p3_event_snipers": 0.20},
+        {
+            "p1_core_bhs": p1_daily,
+            "p2_manga_tsmom": p2_daily,
+            "p3_event_snipers": p3_daily,
+        },
+        base_risk_shares={
+            "p1_core_bhs": 0.48,
+            "p2_manga_tsmom": 0.32,
+            "p3_event_snipers": 0.20,
+        },
         vol_lookback_days=45,
         target_daily_vol=0.0110,
         max_leverage_cap=2.40,
@@ -1642,7 +1765,10 @@ def run_m16_discovery_and_synthesis_benchmark(
     # ------------------------------------------------------------------
     # M16-5: Grand 4-Year Multi-Engine Portfolio Synthesis & Stress-Test
     # ------------------------------------------------------------------
-    print("[*] Running M16-5 Grand Portfolio Synthesis & $2,700 SafeRamp / $2,500 Floor Stress-Test...", flush=True)
+    print(
+        "[*] Running M16-5 Grand Portfolio Synthesis & $2,700 SafeRamp / $2,500 Floor Stress-Test...",
+        flush=True,
+    )
     surv_series = {m_id: series_map[m_id] for m_id in survivors if m_id in series_map}
     port_cfg = GrandPortfolioConfig(
         initial_equity_usd=2700.0,
@@ -1747,13 +1873,28 @@ def run_m16_portfolio_synthesis_benchmark(
             shutil.rmtree(stage_dir, ignore_errors=True)
         (stage_dir / "bars_1h").mkdir(parents=True, exist_ok=True)
         (stage_dir / "funding").mkdir(parents=True, exist_ok=True)
-        print("[*] Streaming compact 220-perp bars_1h + funding shards via rclone (auto-wiped on exit)...", flush=True)
+        print(
+            "[*] Streaming compact 220-perp bars_1h + funding shards via rclone (auto-wiped on exit)...",
+            flush=True,
+        )
         subprocess.run(
-            ["rclone", "copy", "--transfers=8", f"{rclone_stream.rstrip('/')}/bars_1h", str(stage_dir / "bars_1h")],
+            [
+                "rclone",
+                "copy",
+                "--transfers=8",
+                f"{rclone_stream.rstrip('/')}/bars_1h",
+                str(stage_dir / "bars_1h"),
+            ],
             check=True,
         )
         subprocess.run(
-            ["rclone", "copy", "--transfers=8", f"{rclone_stream.rstrip('/')}/funding", str(stage_dir / "funding")],
+            [
+                "rclone",
+                "copy",
+                "--transfers=8",
+                f"{rclone_stream.rstrip('/')}/funding",
+                str(stage_dir / "funding"),
+            ],
             check=True,
         )
         m16_data_dir = stage_dir
@@ -1848,14 +1989,22 @@ def run_m16_portfolio_synthesis_benchmark(
         - 0.15 * _vectorized_cs_zscore(p8_top15, "decision_ts", "funding_rate_bps")
     )
     p1_daily, _ = simulate_cross_sectional_sleeve_daily(
-        p8_top15, p1_score, "fwd_ret_8h", horizon_hours=8, one_way_cost_bps=2.1, ema_alpha=0.18, top_k=4
+        p8_top15,
+        p1_score,
+        "fwd_ret_8h",
+        horizon_hours=8,
+        one_way_cost_bps=2.1,
+        ema_alpha=0.18,
+        top_k=4,
     )
 
     # 2) P2 Manga Multi-Horizon TSMOM + Taker-CVD (`BTC/ETH/SOL`)
     p8_maj3 = p8_top15[p8_top15["symbol"].isin(["BTCUSDT", "ETHUSDT", "SOLUSDT"])].reset_index(drop=True)
     tsmom_raw = 0.50 * np.sign(p8_maj3["ret_168h"].to_numpy()) + 0.50 * np.sign(p8_maj3["ret_72h"].to_numpy())
     tsmom_sig = np.where(
-        (np.abs(tsmom_raw) > 0.4) & (tsmom_raw * p8_maj3["taker_ofi_4h"].to_numpy() >= -0.01), np.sign(tsmom_raw), 0.0
+        (np.abs(tsmom_raw) > 0.4) & (tsmom_raw * p8_maj3["taker_ofi_4h"].to_numpy() >= -0.01),
+        np.sign(tsmom_raw),
+        0.0,
     )
     p2_daily, _ = simulate_event_sniper_sleeve_daily(
         p8_maj3,
@@ -1913,13 +2062,26 @@ def run_m16_portfolio_synthesis_benchmark(
     )
 
     prod_daily = causal_inverse_vol_combine(
-        {"p1_core7f": p1_daily, "p2_tsmom": p2_daily, "m09_coil": m09_daily, "m04_squeeze": m04_daily},
-        base_risk_shares={"p1_core7f": 0.42, "p2_tsmom": 0.24, "m09_coil": 0.20, "m04_squeeze": 0.14},
+        {
+            "p1_core7f": p1_daily,
+            "p2_tsmom": p2_daily,
+            "m09_coil": m09_daily,
+            "m04_squeeze": m04_daily,
+        },
+        base_risk_shares={
+            "p1_core7f": 0.42,
+            "p2_tsmom": 0.24,
+            "m09_coil": 0.20,
+            "m04_squeeze": 0.14,
+        },
         vol_lookback_days=45,
         target_daily_vol=0.0110,
         max_leverage_cap=2.50,
     )
-    print(f"[*] 00_CURRENT_PROD standalone unit metrics: {compute_daily_series_metrics(prod_daily)}", flush=True)
+    print(
+        f"[*] 00_CURRENT_PROD standalone unit metrics: {compute_daily_series_metrics(prod_daily)}",
+        flush=True,
+    )
 
     # 5) M16-4 All-4-Gate Winner: `A1_FAST_1H_POST_SETTLE_UNWIND_20BPS` (`adv_7d >= $15M`, `0 <= mins_since <= 60` on 1h bars -> exact `:00` bar open right AT settlement `mins_since == 60` at bar close means bar opened AT settlement!)
     # Wait: `decision_ts` is `timestamp + 3600`. If settlement was at `timestamp` (`08:00`), then at `08:00` (`timestamp`) the settlement JUST happened!
@@ -1960,10 +2122,22 @@ def run_m16_portfolio_synthesis_benchmark(
         mid8, "decision_ts", "funding_rate_bps"
     )
     a3_daily, _ = simulate_cross_sectional_sleeve_daily(
-        mid8, a3_sc, "fwd_ret_8h", horizon_hours=8, one_way_cost_bps=2.4, ema_alpha=0.14, top_k=12
+        mid8,
+        a3_sc,
+        "fwd_ret_8h",
+        horizon_hours=8,
+        one_way_cost_bps=2.4,
+        ema_alpha=0.14,
+        top_k=12,
     )
-    print(f"[*] A1_POST_SETTLE_20BPS standalone metrics: {compute_daily_series_metrics(a1_20_daily)}", flush=True)
-    print(f"[*] A3_MIDCAP_LOW_VOL_QUALITY_8H metrics: {compute_daily_series_metrics(a3_daily)}", flush=True)
+    print(
+        f"[*] A1_POST_SETTLE_20BPS standalone metrics: {compute_daily_series_metrics(a1_20_daily)}",
+        flush=True,
+    )
+    print(
+        f"[*] A3_MIDCAP_LOW_VOL_QUALITY_8H metrics: {compute_daily_series_metrics(a3_daily)}",
+        flush=True,
+    )
 
     port_cfg = GrandPortfolioConfig(
         initial_equity_usd=2700.0,
@@ -2062,7 +2236,10 @@ def run_counterparty_mechanics_lab_benchmark(
                 "print(f'LAB_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=120)
-            print(f"[+] Launched remote 1m Counterparty-Mechanics Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote 1m Counterparty-Mechanics Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             while True:
@@ -2103,14 +2280,20 @@ def run_counterparty_mechanics_lab_benchmark(
                 "counterparty_mechanics_1m_report.md",
             ):
                 client.download(f"/content/reports/{fname}", output_dir / fname)
-            print(f"[+] Downloaded 1m Counterparty-Mechanics Lab artifacts into {output_dir}", flush=True)
+            print(
+                f"[+] Downloaded 1m Counterparty-Mechanics Lab artifacts into {output_dir}",
+                flush=True,
+            )
             return {}
         finally:
             if not keep_colab:
                 client.stop()
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             else:
-                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+                print(
+                    f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).",
+                    flush=True,
+                )
 
     import gc
     import json
@@ -2132,8 +2315,23 @@ def run_counterparty_mechanics_lab_benchmark(
     if not shard_files:
         raise FileNotFoundError(f"No 1m shards found in {bars_dir}")
 
-    perp_cols = ["symbol", "timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
-    spot_cols = ["symbol", "timestamp", "close", "quote_volume", "taker_buy_quote_volume"]
+    perp_cols = [
+        "symbol",
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
+    spot_cols = [
+        "symbol",
+        "timestamp",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
     met_cols = [
         "symbol",
         "timestamp",
@@ -2145,7 +2343,10 @@ def run_counterparty_mechanics_lab_benchmark(
     fnd_cols = ["symbol", "timestamp", "funding_rate", "interval_hours"]
 
     # Step 1: Locate & extract Sovereign 1m BTC shocks (`C5`) + BTC daily benchmark via Parquet predicate pushdown
-    print(f"🔬 1m Linear Counterparty-Mechanics Lab | Scanning {len(shard_files)} shards for BTCUSDT...", flush=True)
+    print(
+        f"🔬 1m Linear Counterparty-Mechanics Lab | Scanning {len(shard_files)} shards for BTCUSDT...",
+        flush=True,
+    )
     btc_perp_parts: list[pd.DataFrame] = []
     btc_spot_parts: list[pd.DataFrame] = []
     for sh_p in shard_files:
@@ -2164,7 +2365,8 @@ def run_counterparty_mechanics_lab_benchmark(
     btc_shocks = extract_sovereign_btc_shocks(btc_perp_df, btc_spot_df)
     n_btc_shocks = int(np.sum(btc_shocks["shock_dir"] != 0)) if len(btc_shocks["shock_dir"]) else 0
     print(
-        f"  • Extracted {n_btc_shocks:,} discrete 3m BTC Cash+Perp shock impulses ({time.time() - t0:.1f}s)", flush=True
+        f"  • Extracted {n_btc_shocks:,} discrete 3m BTC Cash+Perp shock impulses ({time.time() - t0:.1f}s)",
+        flush=True,
     )
 
     btc_daily_ret = pd.Series(dtype=float)
@@ -2244,7 +2446,10 @@ def run_counterparty_mechanics_lab_benchmark(
     del all_trade_records
     gc.collect()
 
-    print(f"[*] Evaluating In-Fold Refit CPCV & Treasure Metrics across {len(trades_df):,} trades...", flush=True)
+    print(
+        f"[*] Evaluating In-Fold Refit CPCV & Treasure Metrics across {len(trades_df):,} trades...",
+        flush=True,
+    )
     lb_df = evaluate_infold_cpcv_and_treasure_metrics(trades_df, total_trials=30)
 
     # Attach daily correlation vs BTCUSDT linear returns + exit reason shares
@@ -2358,7 +2563,10 @@ def run_p1_microstructure_lab_benchmark(
                 "print(f'P1_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=120)
-            print(f"[+] Launched remote Phase-P1 Microstructure Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Phase-P1 Microstructure Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -2376,7 +2584,10 @@ def run_p1_microstructure_lab_benchmark(
                 rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=120)
                 if rc_p != 0:
                     consec_err += 1
-                    print(f"[!] Poll warning ({consec_err}/4): {(err_p or out_p).strip()[:160]}", flush=True)
+                    print(
+                        f"[!] Poll warning ({consec_err}/4): {(err_p or out_p).strip()[:160]}",
+                        flush=True,
+                    )
                     if consec_err >= 4:
                         raise RuntimeError("Colab session disconnected or reclaimed during polling.")
                     continue
@@ -2405,14 +2616,20 @@ def run_p1_microstructure_lab_benchmark(
                 "p1_microstructure_1m_report.md",
             ):
                 client.download(f"/content/reports/{fname}", output_dir / fname)
-            print(f"[+] Downloaded Phase-P1 Microstructure Lab artifacts into {output_dir}", flush=True)
+            print(
+                f"[+] Downloaded Phase-P1 Microstructure Lab artifacts into {output_dir}",
+                flush=True,
+            )
             return {}
         finally:
             if not keep_colab:
                 client.stop()
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             else:
-                print(f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).", flush=True)
+                print(
+                    f"[*] Kept Colab session '{colab_session}' mounted & alive (--keep-colab).",
+                    flush=True,
+                )
 
     import gc
     import json
@@ -2451,16 +2668,36 @@ def run_p1_microstructure_lab_benchmark(
             "bars_1h",
         ):
             (rclone_stage_dir / sub_d).mkdir(parents=True, exist_ok=True)
-        print("[*] Syncing P1 checkpoints + HL cross-venue funding via rclone (0 permanent local bytes)...", flush=True)
+        print(
+            "[*] Syncing P1 checkpoints + HL cross-venue funding via rclone (0 permanent local bytes)...",
+            flush=True,
+        )
         subprocess.run(
-            ["rclone", "copy", f"{rclone_base}/p1_trades_ckpt_v1", str(rclone_stage_dir / "p1_trades_ckpt_v1")],
+            [
+                "rclone",
+                "copy",
+                f"{rclone_base}/p1_trades_ckpt_v1",
+                str(rclone_stage_dir / "p1_trades_ckpt_v1"),
+            ],
             check=False,
         )
         subprocess.run(
-            ["rclone", "copy", f"{rclone_base}/cross_venue", str(rclone_stage_dir / "cross_venue")], check=False
+            [
+                "rclone",
+                "copy",
+                f"{rclone_base}/cross_venue",
+                str(rclone_stage_dir / "cross_venue"),
+            ],
+            check=False,
         )
         subprocess.run(
-            ["rclone", "copy", "--transfers=8", f"{rclone_base}/bars_1h", str(rclone_stage_dir / "bars_1h")],
+            [
+                "rclone",
+                "copy",
+                "--transfers=8",
+                f"{rclone_base}/bars_1h",
+                str(rclone_stage_dir / "bars_1h"),
+            ],
             check=False,
         )
         m16_data_dir = rclone_stage_dir
@@ -2488,9 +2725,29 @@ def run_p1_microstructure_lab_benchmark(
             prem_stats = ensure_premium_index_1m_shards(m16_data_dir, max_shards=max_shards, workers=48)
             print(f"  • Premium1m ready: {prem_stats}", flush=True)
 
-        perp_cols = ["symbol", "timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
-        spot_cols = ["symbol", "timestamp", "close", "quote_volume", "taker_buy_quote_volume"]
-        met_cols = ["symbol", "timestamp", "sum_open_interest", "sum_open_interest_value"]
+        perp_cols = [
+            "symbol",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "quote_volume",
+            "taker_buy_quote_volume",
+        ]
+        spot_cols = [
+            "symbol",
+            "timestamp",
+            "close",
+            "quote_volume",
+            "taker_buy_quote_volume",
+        ]
+        met_cols = [
+            "symbol",
+            "timestamp",
+            "sum_open_interest",
+            "sum_open_interest_value",
+        ]
         fnd_cols = ["symbol", "timestamp", "funding_rate", "interval_hours"]
 
         all_syms: list[str] = []
@@ -2506,7 +2763,11 @@ def run_p1_microstructure_lab_benchmark(
             syms_here = [str(x) for x in s_col]
             all_syms.extend(syms_here)
             if "BTCUSDT" in syms_here and btc_daily_ret.empty:
-                bp = pd.read_parquet(sh_p, columns=["timestamp", "close"], filters=[("symbol", "==", "BTCUSDT")])
+                bp = pd.read_parquet(
+                    sh_p,
+                    columns=["timestamp", "close"],
+                    filters=[("symbol", "==", "BTCUSDT")],
+                )
                 if not bp.empty:
                     b_s = bp.sort_values("timestamp")
                     b_dt = pd.to_datetime(b_s["timestamp"], unit="s", utc=True)
@@ -2531,7 +2792,10 @@ def run_p1_microstructure_lab_benchmark(
         del hl_all_df
         gc.collect()
 
-        print("🔬 Step 3/3: Streaming 20 shards with causal L2 bookDepth + 3 Monetization Geometries...", flush=True)
+        print(
+            "🔬 Step 3/3: Streaming 20 shards with causal L2 bookDepth + 3 Monetization Geometries...",
+            flush=True,
+        )
         shard_trade_dfs: list[pd.DataFrame] = []
         symbols_scanned = 0
         total_book_days = 0
@@ -2552,7 +2816,14 @@ def run_p1_microstructure_lab_benchmark(
 
             if rclone_stream:
                 rclone_base = rclone_stream.rstrip("/")
-                for mod_d in ("bars_1m", "spot_bars_1m", "premium_1m", "metrics_5m", "funding", "book_depth_events"):
+                for mod_d in (
+                    "bars_1m",
+                    "spot_bars_1m",
+                    "premium_1m",
+                    "metrics_5m",
+                    "funding",
+                    "book_depth_events",
+                ):
                     subprocess.run(
                         [
                             "rclone",
@@ -2642,11 +2913,34 @@ def run_p1_microstructure_lab_benchmark(
             if rclone_stream:
                 rclone_base = rclone_stream.rstrip("/")
                 if sh_ckpt.exists():
-                    subprocess.run(["rclone", "copy", str(sh_ckpt), f"{rclone_base}/p1_trades_ckpt_v1"], check=False)
+                    subprocess.run(
+                        [
+                            "rclone",
+                            "copy",
+                            str(sh_ckpt),
+                            f"{rclone_base}/p1_trades_ckpt_v1",
+                        ],
+                        check=False,
+                    )
                 bd_f = m16_data_dir / "book_depth_events" / sh_name
                 if bd_f.exists():
-                    subprocess.run(["rclone", "copy", str(bd_f), f"{rclone_base}/book_depth_events"], check=False)
-                for mod_d in ("bars_1m", "spot_bars_1m", "premium_1m", "metrics_5m", "funding", "book_depth_events"):
+                    subprocess.run(
+                        [
+                            "rclone",
+                            "copy",
+                            str(bd_f),
+                            f"{rclone_base}/book_depth_events",
+                        ],
+                        check=False,
+                    )
+                for mod_d in (
+                    "bars_1m",
+                    "spot_bars_1m",
+                    "premium_1m",
+                    "metrics_5m",
+                    "funding",
+                    "book_depth_events",
+                ):
                     (m16_data_dir / mod_d / sh_name).unlink(missing_ok=True)
 
             cum_n = sum(len(x) for x in shard_trade_dfs)
@@ -2662,7 +2956,8 @@ def run_p1_microstructure_lab_benchmark(
         gc.collect()
 
         print(
-            f"[*] Evaluating In-Fold Refit CPCV & Treasure Metrics across {len(trades_df):,} P1 trades...", flush=True
+            f"[*] Evaluating In-Fold Refit CPCV & Treasure Metrics across {len(trades_df):,} P1 trades...",
+            flush=True,
         )
         lb_df = summarize_p1_lab_results(trades_df)
 
@@ -2768,13 +3063,26 @@ def run_p2_aggtrades_sweep_lab_benchmark(
         try:
             if rclone_stream:
                 rb = rclone_stream.rstrip("/")
-                print("[*] Pulling compact P1 trade checkpoints (~300 KB) via rclone...", flush=True)
+                print(
+                    "[*] Pulling compact P1 trade checkpoints (~300 KB) via rclone...",
+                    flush=True,
+                )
                 subprocess.run(
-                    ["rclone", "copy", f"{rb}/p1_trades_ckpt_v1", str(stage_p2 / "p1_trades_ckpt_v1")],
+                    [
+                        "rclone",
+                        "copy",
+                        f"{rb}/p1_trades_ckpt_v1",
+                        str(stage_p2 / "p1_trades_ckpt_v1"),
+                    ],
                     check=True,
                 )
                 subprocess.run(
-                    ["rclone", "copy", f"{rb}/p2_aggtrades", str(stage_p2 / "p2_aggtrades")],
+                    [
+                        "rclone",
+                        "copy",
+                        f"{rb}/p2_aggtrades",
+                        str(stage_p2 / "p2_aggtrades"),
+                    ],
                     check=False,
                 )
             else:
@@ -2806,7 +3114,10 @@ def run_p2_aggtrades_sweep_lab_benchmark(
             assert client.upload(merged_p1_path, "/content/p2_data/p1_trades_ckpt_v1/shard_00.parquet")
             cached_feat = stage_p2 / "p2_aggtrades" / "p2_aggtrades_event_features.parquet"
             if cached_feat.exists():
-                client.upload(cached_feat, "/content/p2_data/p2_aggtrades/p2_aggtrades_event_features.parquet")
+                client.upload(
+                    cached_feat,
+                    "/content/p2_data/p2_aggtrades/p2_aggtrades_event_features.parquet",
+                )
 
             launch_py = (
                 "import subprocess, sys; "
@@ -2819,7 +3130,10 @@ def run_p2_aggtrades_sweep_lab_benchmark(
                 "print(f'P2_SWEEP_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Phase-P2 aggTrades Sweep Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Phase-P2 aggTrades Sweep Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -2868,11 +3182,20 @@ def run_p2_aggtrades_sweep_lab_benchmark(
 
             if rclone_stream:
                 rb = rclone_stream.rstrip("/")
-                for p2_f in ("p2_aggtrades_event_features.parquet", "p2_all_variants_trades.parquet"):
+                for p2_f in (
+                    "p2_aggtrades_event_features.parquet",
+                    "p2_all_variants_trades.parquet",
+                ):
                     loc_f = stage_p2 / "p2_aggtrades" / p2_f
                     if client.download(f"/content/p2_data/p2_aggtrades/{p2_f}", loc_f) and loc_f.exists():
-                        subprocess.run(["rclone", "copy", str(loc_f), f"{rb}/p2_aggtrades"], check=False)
-                print("[+] Synced Phase-P2 aggTrades sweep features & survivor trades to Google Drive!", flush=True)
+                        subprocess.run(
+                            ["rclone", "copy", str(loc_f), f"{rb}/p2_aggtrades"],
+                            check=False,
+                        )
+                print(
+                    "[+] Synced Phase-P2 aggTrades sweep features & survivor trades to Google Drive!",
+                    flush=True,
+                )
             return {}
         finally:
             if not keep_colab:
@@ -2880,7 +3203,10 @@ def run_p2_aggtrades_sweep_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_p2.exists():
                 shutil.rmtree(stage_p2, ignore_errors=True)
-                print("[*] Wiped /tmp/p2_colab_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/p2_colab_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from src.features.tick_sweep_physics import (
         enrich_events_with_aggtrades_sweeps,
@@ -2894,7 +3220,11 @@ def run_p2_aggtrades_sweep_lab_benchmark(
         raise FileNotFoundError(f"No P1 trade checkpoints in {ck_dir}")
 
     p1_df = pd.concat([pd.read_parquet(f) for f in ck_files], ignore_index=True)
-    target_mechs = ("P6A_L2_ASK_AIR_POCKET_LONG", "P2_C2A_BOOK_VACUUM_PAIN_LONG", "B2_C2A_BASE_UNCHOKED_LONG")
+    target_mechs = (
+        "P6A_L2_ASK_AIR_POCKET_LONG",
+        "P2_C2A_BOOK_VACUUM_PAIN_LONG",
+        "B2_C2A_BASE_UNCHOKED_LONG",
+    )
     cand_sub = p1_df[p1_df["mech_id"].isin(target_mechs)]
     print(
         f"🔬 Phase-P2 aggTrades 1ms Sweep Lab | {len(cand_sub):,} candidate trade rows "
@@ -2909,7 +3239,11 @@ def run_p2_aggtrades_sweep_lab_benchmark(
     if feat_cache.exists() and feat_cache.stat().st_size > 512:
         existing_feats = pd.read_parquet(feat_cache)
         done_keys = set(
-            zip(existing_feats["symbol"].astype(str), existing_feats["signal_ts"].astype(int), strict=False)
+            zip(
+                existing_feats["symbol"].astype(str),
+                existing_feats["signal_ts"].astype(int),
+                strict=False,
+            )
         )
         missing_mask = [
             (str(s), int(ts_v)) not in done_keys
@@ -3015,7 +3349,10 @@ def run_p2_unified_portfolio_1m_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab portfolio bridge.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging compact 1h + funding + P2 trades via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging compact 1h + funding + P2 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
                     [
@@ -3113,7 +3450,10 @@ def run_p2_unified_portfolio_1m_benchmark(
                 "print(f'P2_PORT_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Unified 1m Portfolio Sim ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Unified 1m Portfolio Sim ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -3166,7 +3506,10 @@ def run_p2_unified_portfolio_1m_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_port.exists():
                 shutil.rmtree(stage_port, ignore_errors=True)
-                print("[*] Wiped /tmp/p2_port_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/p2_port_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
@@ -3214,7 +3557,15 @@ def run_p2_unified_portfolio_1m_benchmark(
     )
 
     b1m_files = sorted((m16_data_dir / "bars_1m").glob("shard_*.parquet"))
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
     if b1m_files:
 
         def _load_sym_1m_from_shards(sym_c: str) -> pd.DataFrame | None:
@@ -3248,7 +3599,10 @@ def run_p2_unified_portfolio_1m_benchmark(
         sym_loader = _stream_sym_1m_vision
         n_workers_1m = 2
 
-    print("  • Streaming Core P1 7-Factor + Manga P2 Dollar-Bar + M09/M23/M04 1m bundle (O(1) RAM)...", flush=True)
+    print(
+        "  • Streaming Core P1 7-Factor + Manga P2 Dollar-Bar + M09/M23/M04 1m bundle (O(1) RAM)...",
+        flush=True,
+    )
     bundle = build_core_1m_tensors_and_base_snipers(
         core_1m_by_sym=None,
         bars_1h_by_sym=bars_1h_by_sym,
@@ -3364,10 +3718,19 @@ def run_p3_p4_cross_venue_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab P3/P4 bridge.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging compact 1h + funding + metrics_5m + cross_venue via rclone...", flush=True)
+            print(
+                "[*] Staging compact 1h + funding + metrics_5m + cross_venue via rclone...",
+                flush=True,
+            )
             for sub_d in ("bars_1h", "funding", "metrics_5m", "cross_venue"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_d}", str(raw_p3 / sub_d)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_d}",
+                        str(raw_p3 / sub_d),
+                    ],
                     check=(sub_d in ("bars_1h", "funding")),
                 )
 
@@ -3406,7 +3769,10 @@ def run_p3_p4_cross_venue_lab_benchmark(
             peer_pre = _ensure_peer(slim_p3, sorted(liq_syms), workers=12)
             for cv_sync_p in (hl_pre, peer_pre):
                 if cv_sync_p.exists() and cv_sync_p.stat().st_size > 1024:
-                    subprocess.run(["rclone", "copy", str(cv_sync_p), f"{rb}/cross_venue"], check=False)
+                    subprocess.run(
+                        ["rclone", "copy", str(cv_sync_p), f"{rb}/cross_venue"],
+                        check=False,
+                    )
 
             f_parts = [
                 pd.read_parquet(fp)[lambda d: d["symbol"].isin(liq_syms)]
@@ -3414,7 +3780,11 @@ def run_p3_p4_cross_venue_lab_benchmark(
             ]
             f_all = pd.concat([x for x in f_parts if not x.empty], ignore_index=True)
             for sym_f, grp_f in f_all.groupby("symbol", observed=True):
-                grp_f.to_parquet(slim_p3 / "funding_by_sym" / f"{sym_f}.parquet", index=False, compression="zstd")
+                grp_f.to_parquet(
+                    slim_p3 / "funding_by_sym" / f"{sym_f}.parquet",
+                    index=False,
+                    compression="zstd",
+                )
             del f_all, f_parts
 
             m_parts = [
@@ -3475,7 +3845,10 @@ def run_p3_p4_cross_venue_lab_benchmark(
                 "print(f'P3_P4_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Phase P3/P4 Cross-Venue Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Phase P3/P4 Cross-Venue Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -3525,11 +3898,20 @@ def run_p3_p4_cross_venue_lab_benchmark(
             for cv_sync in ("hl_funding_all_v2.parquet", "cex_peer_funding_1h.parquet"):
                 loc_cv = stage_p3 / cv_sync
                 if client.download(f"/content/p3_data/cross_venue/{cv_sync}", loc_cv) and loc_cv.exists():
-                    subprocess.run(["rclone", "copy", str(loc_cv), f"{rb}/cross_venue"], check=False)
+                    subprocess.run(
+                        ["rclone", "copy", str(loc_cv), f"{rb}/cross_venue"],
+                        check=False,
+                    )
             loc_tr = stage_p3 / "p3_p4_all_trades.parquet"
             if client.download("/content/p3_data/p3_p4_out/p3_p4_all_trades.parquet", loc_tr) and loc_tr.exists():
-                subprocess.run(["rclone", "copy", str(loc_tr), f"{rb}/p3_p4_cross_venue"], check=False)
-            print("[+] Synced Phase P3/P4 cross-venue datasets & simulated trades to Google Drive!", flush=True)
+                subprocess.run(
+                    ["rclone", "copy", str(loc_tr), f"{rb}/p3_p4_cross_venue"],
+                    check=False,
+                )
+            print(
+                "[+] Synced Phase P3/P4 cross-venue datasets & simulated trades to Google Drive!",
+                flush=True,
+            )
             return {}
         finally:
             if not keep_colab:
@@ -3586,7 +3968,13 @@ def run_p3_p4_cross_venue_lab_benchmark(
             )
             for sync_sub in ("cross_venue", "p3_p4_trades_ckpt_v1", "bars_1h"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sync_sub}", str(stream_dir / sync_sub)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sync_sub}",
+                        str(stream_dir / sync_sub),
+                    ],
                     check=(sync_sub == "bars_1h"),
                 )
 
@@ -3658,7 +4046,13 @@ def run_p3_p4_cross_venue_lab_benchmark(
                     )
                     continue
 
-                for mod_d in ("bars_1m", "premium_1m", "metrics_5m", "funding", "book_depth_events"):
+                for mod_d in (
+                    "bars_1m",
+                    "premium_1m",
+                    "metrics_5m",
+                    "funding",
+                    "book_depth_events",
+                ):
                     subprocess.run(
                         [
                             "rclone",
@@ -3705,7 +4099,13 @@ def run_p3_p4_cross_venue_lab_benchmark(
                     else {}
                 )
 
-                for mod_d in ("bars_1m", "premium_1m", "metrics_5m", "funding", "book_depth_events"):
+                for mod_d in (
+                    "bars_1m",
+                    "premium_1m",
+                    "metrics_5m",
+                    "funding",
+                    "book_depth_events",
+                ):
                     (stream_dir / mod_d / sh_name).unlink(missing_ok=True)
 
                 sh_recs: list[dict[str, object]] = []
@@ -3744,7 +4144,10 @@ def run_p3_p4_cross_venue_lab_benchmark(
                 del perp_map, pr_map, mt_map, fn_map, bk_map
                 sh_tdf = pd.DataFrame(sh_recs) if sh_recs else pd.DataFrame({"_empty": pd.Series([1], dtype=np.int8)})
                 sh_tdf.to_parquet(sh_ckpt, index=False, compression="zstd")
-                subprocess.run(["rclone", "copy", str(sh_ckpt), f"{rb}/p3_p4_trades_ckpt_v1"], check=False)
+                subprocess.run(
+                    ["rclone", "copy", str(sh_ckpt), f"{rb}/p3_p4_trades_ckpt_v1"],
+                    check=False,
+                )
                 if sh_recs:
                     shard_dfs.append(sh_tdf)
                 gc.collect()
@@ -3758,7 +4161,10 @@ def run_p3_p4_cross_venue_lab_benchmark(
             if not trades_df.empty:
                 all_tr_p = stream_dir / "p3_p4_all_trades.parquet"
                 trades_df.to_parquet(all_tr_p, index=False, compression="zstd")
-                subprocess.run(["rclone", "copy", str(all_tr_p), f"{rb}/p3_p4_cross_venue"], check=False)
+                subprocess.run(
+                    ["rclone", "copy", str(all_tr_p), f"{rb}/p3_p4_cross_venue"],
+                    check=False,
+                )
 
             lb_df = evaluate_p3_p4_leaderboard(trades_df)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -3773,7 +4179,7 @@ def run_p3_p4_cross_venue_lab_benchmark(
                 "total_simulated_trades": int(len(trades_df)),
                 "treasure_count": len(treasures),
                 "treasures": treasures,
-                "leaderboard": lb_df.to_dict(orient="records") if not lb_df.empty else [],
+                "leaderboard": (lb_df.to_dict(orient="records") if not lb_df.empty else []),
             }
             (output_dir / "p3_p4_cross_venue_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             md = [
@@ -3800,7 +4206,10 @@ def run_p3_p4_cross_venue_lab_benchmark(
         finally:
             if stream_dir.exists():
                 shutil.rmtree(stream_dir, ignore_errors=True)
-                print("[*] Wiped /tmp/p3_p4_rclone_stream -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/p3_p4_rclone_stream -> 0 bytes local residue.",
+                    flush=True,
+                )
     meta_p = m16_data_dir / "meta.json"
     if meta_p.exists():
         meta_j = json.loads(meta_p.read_text())
@@ -3876,7 +4285,15 @@ def run_p3_p4_cross_venue_lab_benchmark(
         if p1m is None or p1m.empty:
             return sym_c, None, None
         p1m = p1m[(p1m["timestamp"] >= min_needed_ts) & (p1m["timestamp"] <= max_ts + 3600)][
-            ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+            [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
         ].reset_index(drop=True)
 
         pr_parts: list[pd.DataFrame] = []
@@ -3935,7 +4352,9 @@ def run_p3_p4_cross_venue_lab_benchmark(
             gc.collect()
             if all_trades:
                 pd.DataFrame(all_trades).to_parquet(
-                    out_p3_dir / "p3_p4_all_trades.parquet", index=False, compression="zstd"
+                    out_p3_dir / "p3_p4_all_trades.parquet",
+                    index=False,
+                    compression="zstd",
                 )
             print(
                 f"  • Evaluated {done_s}/{len(eval_syms)} cross-venue perps | trades={len(all_trades):,} ({time.time() - t0:.1f}s)...",
@@ -4025,10 +4444,19 @@ def run_core_rebalance_barrier_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Core Barrier bridge.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging compact 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging compact 1h + funding + M26 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_cb / sub_p)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_cb / sub_p),
+                    ],
                     check=True,
                 )
             subprocess.run(
@@ -4070,8 +4498,16 @@ def run_core_rebalance_barrier_lab_benchmark(
             slim_cb = stage_cb / "slim"
             for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
                 (slim_cb / sub_p).mkdir(parents=True, exist_ok=True)
-            b1h_all.to_parquet(slim_cb / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
-            fnd_all.to_parquet(slim_cb / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            b1h_all.to_parquet(
+                slim_cb / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_cb / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
             shutil.copy2(
                 raw_cb / "p2_aggtrades" / "p2_all_variants_trades.parquet",
                 slim_cb / "p2_aggtrades" / "p2_all_variants_trades.parquet",
@@ -4083,7 +4519,10 @@ def run_core_rebalance_barrier_lab_benchmark(
                     if p_it.is_file():
                         tf.add(p_it, arcname=str(p_it.relative_to(slim_cb)))
 
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -4111,7 +4550,10 @@ def run_core_rebalance_barrier_lab_benchmark(
                 "print(f'CB_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Core Rebalance Barrier Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Core Rebalance Barrier Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -4163,11 +4605,16 @@ def run_core_rebalance_barrier_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_cb.exists():
                 shutil.rmtree(stage_cb, ignore_errors=True)
-                print("[*] Wiped /tmp/core_barrier_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/core_barrier_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
-    from src.backtest.core_rebalance_barrier_lab import run_core_rebalance_barrier_ablation
+    from src.backtest.core_rebalance_barrier_lab import (
+        run_core_rebalance_barrier_ablation,
+    )
     from src.backtest.p2_portfolio_integration import (
         PROD_TOP_15,
         build_core_1m_tensors_and_base_snipers,
@@ -4212,7 +4659,11 @@ def run_core_rebalance_barrier_lab_benchmark(
         if s_c in funding_by_sym and not funding_by_sym[s_c].empty:
             f = funding_by_sym[s_c].sort_values("timestamp").drop_duplicates("timestamp", keep="last")
             f_idx = pd.DatetimeIndex(
-                pd.to_datetime(((f["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600, unit="s", utc=True)
+                pd.to_datetime(
+                    ((f["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600,
+                    unit="s",
+                    utc=True,
+                )
             )
             f_s = pd.Series(f["funding_rate"].to_numpy(dtype=np.float64), index=f_idx)
             fnd_1h_top15[s_c] = f_s[~f_s.index.duplicated(keep="last")]
@@ -4234,7 +4685,15 @@ def run_core_rebalance_barrier_lab_benchmark(
     ]
     recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
     sess = _make_pooled_session(64)
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
 
     def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
         tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
@@ -4322,7 +4781,10 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab P4-M4 aggTrades bridge.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging P3/P4 trade events via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging P3/P4 trade events via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             subprocess.run(
                 [
                     "rclone",
@@ -4333,7 +4795,10 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
                 check=True,
             )
             tr_loc = stage_p4 / "p3_p4_all_trades.parquet"
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -4354,7 +4819,10 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
                 "print(f'P4_AGG_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote P4-M4 1ms aggTrades Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote P4-M4 1ms aggTrades Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -4402,7 +4870,10 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
 
             loc_enr = stage_p4 / "p4_m4_all_variants_trades.parquet"
             if client.download("/content/p4_data/p4_m4_all_variants_trades.parquet", loc_enr) and loc_enr.exists():
-                subprocess.run(["rclone", "copy", str(loc_enr), f"{rb}/p3_p4_cross_venue"], check=False)
+                subprocess.run(
+                    ["rclone", "copy", str(loc_enr), f"{rb}/p3_p4_cross_venue"],
+                    check=False,
+                )
             return {}
         finally:
             if not keep_colab:
@@ -4410,7 +4881,10 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_p4.exists():
                 shutil.rmtree(stage_p4, ignore_errors=True)
-                print("[*] Wiped /tmp/p4_m4_agg_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/p4_m4_agg_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from src.models.liquidation_absorption_p4_lab import (
         enrich_p4_m4_events_with_1ms_aggtrades,
@@ -4433,7 +4907,11 @@ def run_p4_m4_liquidation_aggtrades_lab_benchmark(
     cov_pct = round(100.0 * float((met_df["has_agg"] > 0.5).mean()), 1) if not met_df.empty else 0.0
     lb_df, all_v_df = evaluate_p4_m4_absorption_variants(p4_m4, met_df)
     if not all_v_df.empty:
-        all_v_df.to_parquet(m16_data_dir / "p4_m4_all_variants_trades.parquet", index=False, compression="zstd")
+        all_v_df.to_parquet(
+            m16_data_dir / "p4_m4_all_variants_trades.parquet",
+            index=False,
+            compression="zstd",
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     lb_df.to_csv(output_dir / "p4_m4_liquidation_aggtrades_leaderboard.csv", index=False)
@@ -4500,7 +4978,10 @@ def run_maker_wick_catcher_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Maker Wick bridge.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging P3/P4 solvency-anchored windows via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging P3/P4 solvency-anchored windows via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             subprocess.run(
                 [
                     "rclone",
@@ -4510,7 +4991,10 @@ def run_maker_wick_catcher_lab_benchmark(
                 ],
                 check=True,
             )
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -4518,7 +5002,10 @@ def run_maker_wick_catcher_lab_benchmark(
                 "import os; os.makedirs('/content/mw_data', exist_ok=True); os.makedirs('/content/reports', exist_ok=True)",
                 timeout=90,
             )
-            assert client.upload(stage_mw / "p3_p4_all_trades.parquet", "/content/mw_data/p3_p4_all_trades.parquet")
+            assert client.upload(
+                stage_mw / "p3_p4_all_trades.parquet",
+                "/content/mw_data/p3_p4_all_trades.parquet",
+            )
 
             launch_py = (
                 "import subprocess, sys; "
@@ -4531,7 +5018,10 @@ def run_maker_wick_catcher_lab_benchmark(
                 "print(f'MW_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Maker Wick-Catcher 1ms Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Maker Wick-Catcher 1ms Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -4579,7 +5069,10 @@ def run_maker_wick_catcher_lab_benchmark(
 
             loc_tr = stage_mw / "maker_wick_all_trades.parquet"
             if client.download("/content/mw_data/maker_wick_all_trades.parquet", loc_tr) and loc_tr.exists():
-                subprocess.run(["rclone", "copy", str(loc_tr), f"{rb}/p3_p4_cross_venue"], check=False)
+                subprocess.run(
+                    ["rclone", "copy", str(loc_tr), f"{rb}/p3_p4_cross_venue"],
+                    check=False,
+                )
             return {}
         finally:
             if not keep_colab:
@@ -4587,7 +5080,10 @@ def run_maker_wick_catcher_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_mw.exists():
                 shutil.rmtree(stage_mw, ignore_errors=True)
-                print("[*] Wiped /tmp/maker_wick_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/maker_wick_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from src.models.maker_wick_catcher_lab import run_maker_wick_catcher_study
 
@@ -4598,12 +5094,17 @@ def run_maker_wick_catcher_lab_benchmark(
     all_tr = pd.read_parquet(tr_path)
     p4_m4 = all_tr[all_tr["mech_id"] == "P4_M4_ONCHAIN_ANCHORED_LIQ_SNAP_LONG"].copy()
     print(
-        f"🎯 Análisis 1: Passive GTX Maker Wick-Catcher 1ms Lab across {len(p4_m4)//3} solvency windows...", flush=True
+        f"🎯 Análisis 1: Passive GTX Maker Wick-Catcher 1ms Lab across {len(p4_m4)//3} solvency windows...",
+        flush=True,
     )
 
     lb_df, mw_trades = run_maker_wick_catcher_study(p4_m4, workers=10)
     if not mw_trades.empty:
-        mw_trades.to_parquet(m16_data_dir / "maker_wick_all_trades.parquet", index=False, compression="zstd")
+        mw_trades.to_parquet(
+            m16_data_dir / "maker_wick_all_trades.parquet",
+            index=False,
+            compression="zstd",
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     lb_df.to_csv(output_dir / "maker_wick_catcher_leaderboard.csv", index=False)
@@ -4680,10 +5181,19 @@ def run_core_universe_factor_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Core Universe Lab.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_cu / sub_p)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_cu / sub_p),
+                    ],
                     check=True,
                 )
             subprocess.run(
@@ -4725,8 +5235,16 @@ def run_core_universe_factor_lab_benchmark(
             slim_cu = stage_cu / "slim"
             for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
                 (slim_cu / sub_p).mkdir(parents=True, exist_ok=True)
-            b1h_all.to_parquet(slim_cu / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
-            fnd_all.to_parquet(slim_cu / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            b1h_all.to_parquet(
+                slim_cu / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_cu / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
             shutil.copy2(
                 raw_cu / "p2_aggtrades" / "p2_all_variants_trades.parquet",
                 slim_cu / "p2_aggtrades" / "p2_all_variants_trades.parquet",
@@ -4738,7 +5256,10 @@ def run_core_universe_factor_lab_benchmark(
                     if p_it.is_file():
                         tf.add(p_it, arcname=str(p_it.relative_to(slim_cu)))
 
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -4766,7 +5287,10 @@ def run_core_universe_factor_lab_benchmark(
                 "print(f'CU_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Core Universe & Factor Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Core Universe & Factor Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -4818,7 +5342,10 @@ def run_core_universe_factor_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_cu.exists():
                 shutil.rmtree(stage_cu, ignore_errors=True)
-                print("[*] Wiped /tmp/core_univ_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/core_univ_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
@@ -4828,7 +5355,9 @@ def run_core_universe_factor_lab_benchmark(
         compute_causal_pit_universe_mask,
         evaluate_universe_and_factor_experiments,
     )
-    from src.backtest.p2_portfolio_integration import identify_required_1m_symbols_for_portfolio
+    from src.backtest.p2_portfolio_integration import (
+        identify_required_1m_symbols_for_portfolio,
+    )
     from src.data.multimodal_vision_ingestor import (
         PERP_TICKER_ALIASES,
         _make_pooled_session,
@@ -4873,7 +5402,15 @@ def run_core_universe_factor_lab_benchmark(
     ]
     recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
     sess = _make_pooled_session(64)
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
 
     def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
         tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
@@ -4977,10 +5514,19 @@ def run_execution_timing_router_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Execution Timing Lab.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_et / sub_p)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_et / sub_p),
+                    ],
                     check=True,
                 )
             subprocess.run(
@@ -5022,8 +5568,16 @@ def run_execution_timing_router_lab_benchmark(
             slim_et = stage_et / "slim"
             for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
                 (slim_et / sub_p).mkdir(parents=True, exist_ok=True)
-            b1h_all.to_parquet(slim_et / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
-            fnd_all.to_parquet(slim_et / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            b1h_all.to_parquet(
+                slim_et / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_et / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
             shutil.copy2(
                 raw_et / "p2_aggtrades" / "p2_all_variants_trades.parquet",
                 slim_et / "p2_aggtrades" / "p2_all_variants_trades.parquet",
@@ -5035,7 +5589,10 @@ def run_execution_timing_router_lab_benchmark(
                     if p_it.is_file():
                         tf.add(p_it, arcname=str(p_it.relative_to(slim_et)))
 
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -5063,7 +5620,10 @@ def run_execution_timing_router_lab_benchmark(
                 "print(f'ET_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Execution Timing & Router Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Execution Timing & Router Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -5115,11 +5675,16 @@ def run_execution_timing_router_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_et.exists():
                 shutil.rmtree(stage_et, ignore_errors=True)
-                print("[*] Wiped /tmp/exec_timing_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/exec_timing_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
-    from src.backtest.execution_timing_and_router_lab import evaluate_execution_timing_and_router_specs
+    from src.backtest.execution_timing_and_router_lab import (
+        evaluate_execution_timing_and_router_specs,
+    )
     from src.backtest.p2_portfolio_integration import (
         build_core_1m_tensors_and_base_snipers,
         identify_required_1m_symbols_for_portfolio,
@@ -5166,7 +5731,15 @@ def run_execution_timing_router_lab_benchmark(
     ]
     recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
     sess = _make_pooled_session(64)
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
 
     def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
         tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
@@ -5252,14 +5825,28 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Frente B Lab.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging 1h + funding + P3/P4 solvency windows via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging 1h + funding + P3/P4 solvency windows via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_fb / sub_p)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_fb / sub_p),
+                    ],
                     check=True,
                 )
             subprocess.run(
-                ["rclone", "copy", f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet", str(raw_fb)],
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet",
+                    str(raw_fb),
+                ],
                 check=True,
             )
 
@@ -5291,9 +5878,20 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
             slim_fb = stage_fb / "slim"
             for sub_p in ("bars_1h", "funding"):
                 (slim_fb / sub_p).mkdir(parents=True, exist_ok=True)
-            b1h_all.to_parquet(slim_fb / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
-            fnd_all.to_parquet(slim_fb / "funding" / "shard_00.parquet", index=False, compression="zstd")
-            shutil.copy2(raw_fb / "p3_p4_all_trades.parquet", slim_fb / "p3_p4_all_trades.parquet")
+            b1h_all.to_parquet(
+                slim_fb / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_fb / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            shutil.copy2(
+                raw_fb / "p3_p4_all_trades.parquet",
+                slim_fb / "p3_p4_all_trades.parquet",
+            )
 
             tar_fb = stage_fb / "fb_bundle.tar"
             with tarfile.open(tar_fb, "w") as tf:
@@ -5301,7 +5899,10 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
                     if p_it.is_file():
                         tf.add(p_it, arcname=str(p_it.relative_to(slim_fb)))
 
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -5329,7 +5930,10 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
                 "print(f'FB_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Frente B Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Frente B Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -5382,7 +5986,10 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_fb.exists():
                 shutil.rmtree(stage_fb, ignore_errors=True)
-                print("[*] Wiped /tmp/frente_b_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/frente_b_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
@@ -5400,7 +6007,10 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
     p34_path = m16_data_dir / "p3_p4_all_trades.parquet"
     all_p34 = pd.read_parquet(p34_path)
     p4_m4 = all_p34[all_p34["mech_id"] == "P4_M4_ONCHAIN_ANCHORED_LIQ_SNAP_LONG"].copy()
-    print(f"🌪️ Frente B2: Running P8 Inverted Cascade Waterfall SHORT 1ms Lab ({len(p4_m4)//3} windows)...", flush=True)
+    print(
+        f"🌪️ Frente B2: Running P8 Inverted Cascade Waterfall SHORT 1ms Lab ({len(p4_m4)//3} windows)...",
+        flush=True,
+    )
     lb_p8, tr_p8 = run_waterfall_short_1ms_study(p4_m4, workers=6)
     for _, rp8 in lb_p8.iterrows():
         print(
@@ -5430,7 +6040,15 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
     ]
     recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
     sess = _make_pooled_session(64)
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
 
     def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
         tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
@@ -5439,7 +6057,10 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
             df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
         return df_c
 
-    print("🛡️ Frente B1: Auditing M09_LONG/M09_SHORT/M23/M04 + P9/P10 with causal L2 bookDepth...", flush=True)
+    print(
+        "🛡️ Frente B1: Auditing M09_LONG/M09_SHORT/M23/M04 + P9/P10 with causal L2 bookDepth...",
+        flush=True,
+    )
     lb_l2, tr_l2 = run_sniper_l2_and_creative_1m_study(
         bars_1h_by_sym=bars_1h_by_sym,
         funding_by_sym=funding_by_sym,
@@ -5461,8 +6082,8 @@ def run_frente_b_sniper_l2_waterfall_benchmark(
         "benchmark": "frente_b_sniper_l2_and_waterfall_short",
         "elapsed_sec": round(time.time() - t0, 1),
         "p8_waterfall_short_exit_mix": p8_exit_mix,
-        "p8_waterfall_short_leaderboard": lb_p8.to_dict(orient="records") if not lb_p8.empty else [],
-        "sniper_l2_and_p9_p10_leaderboard": lb_l2.to_dict(orient="records") if not lb_l2.empty else [],
+        "p8_waterfall_short_leaderboard": (lb_p8.to_dict(orient="records") if not lb_p8.empty else []),
+        "sniper_l2_and_p9_p10_leaderboard": (lb_l2.to_dict(orient="records") if not lb_l2.empty else []),
     }
     (output_dir / "frente_b_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
@@ -5535,18 +6156,37 @@ def run_frente_c_manga_p2_lab_benchmark(
             if not rclone_stream:
                 raise ValueError("--rclone-stream is required for zero-click Colab Frente C Lab.")
             rb = rclone_stream.rstrip("/")
-            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            print(
+                "[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
             for sub_p in ("bars_1h", "funding"):
                 subprocess.run(
-                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_fc / sub_p)],
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_fc / sub_p),
+                    ],
                     check=True,
                 )
             subprocess.run(
-                ["rclone", "copy", f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet", str(raw_fc / "p2_aggtrades")],
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet",
+                    str(raw_fc / "p2_aggtrades"),
+                ],
                 check=True,
             )
             subprocess.run(
-                ["rclone", "copy", f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet", str(raw_fc)],
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p3_p4_cross_venue/p3_p4_all_trades.parquet",
+                    str(raw_fc),
+                ],
                 check=True,
             )
 
@@ -5578,8 +6218,16 @@ def run_frente_c_manga_p2_lab_benchmark(
             slim_fc = stage_fc / "slim"
             for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
                 (slim_fc / sub_p).mkdir(parents=True, exist_ok=True)
-            b1h_all.to_parquet(slim_fc / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
-            fnd_all.to_parquet(slim_fc / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            b1h_all.to_parquet(
+                slim_fc / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_fc / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
             shutil.copy2(
                 raw_fc / "p2_aggtrades" / "p2_all_variants_trades.parquet",
                 slim_fc / "p2_aggtrades" / "p2_all_variants_trades.parquet",
@@ -5595,7 +6243,10 @@ def run_frente_c_manga_p2_lab_benchmark(
                     if p_it.is_file():
                         tf.add(p_it, arcname=str(p_it.relative_to(slim_fc)))
 
-            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
             if not client.ensure_session(gpu=None):
                 raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
             assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
@@ -5623,7 +6274,10 @@ def run_frente_c_manga_p2_lab_benchmark(
                 "print(f'FC_PID={p.pid}')"
             )
             rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
-            print(f"[+] Launched remote Frente C Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+            print(
+                f"[+] Launched remote Frente C Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
 
             seen = 0
             consec_err = 0
@@ -5680,7 +6334,10 @@ def run_frente_c_manga_p2_lab_benchmark(
                 print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
             if stage_fc.exists():
                 shutil.rmtree(stage_fc, ignore_errors=True)
-                print("[*] Wiped /tmp/frente_c_bridge -> 0 bytes local residue.", flush=True)
+                print(
+                    "[*] Wiped /tmp/frente_c_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
 
     from datetime import date, timedelta
 
@@ -5722,7 +6379,15 @@ def run_frente_c_manga_p2_lab_benchmark(
     ]
     recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
     sess = _make_pooled_session(64)
-    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
     sovereign_keep = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
     sov_1m_cache: dict[str, pd.DataFrame] = {}
 
@@ -5735,7 +6400,10 @@ def run_frente_c_manga_p2_lab_benchmark(
                 sov_1m_cache[sym_c] = df_c.copy()
         return df_c
 
-    print(f"🧭 Frente C: Manga P2 TSMOM Lab | Streaming {len(needed_1m_syms)} 1m symbols...", flush=True)
+    print(
+        f"🧭 Frente C: Manga P2 TSMOM Lab | Streaming {len(needed_1m_syms)} 1m symbols...",
+        flush=True,
+    )
     bundle = build_core_1m_tensors_and_base_snipers(
         core_1m_by_sym=None,
         bars_1h_by_sym=bars_1h_by_sym,
@@ -5749,7 +6417,9 @@ def run_frente_c_manga_p2_lab_benchmark(
     lb_df = evaluate_manga_p2_ablation_suite(bundle, sovereign_1m_by_sym=sov_1m_cache, m26_trades_df=m26_df)
 
     # Also regenerate unconfounded Frente A execution-timing table on the exact same `bundle` (0 extra I/O!)
-    from src.backtest.execution_timing_and_router_lab import evaluate_execution_timing_and_router_specs
+    from src.backtest.execution_timing_and_router_lab import (
+        evaluate_execution_timing_and_router_specs,
+    )
     from src.models.sniper_l2_and_cascade_short_lab import (
         build_causal_1h_panic_flush_anchors,
         evaluate_frente_b_sniper_portfolio_ablation,
@@ -5761,7 +6431,10 @@ def run_frente_c_manga_p2_lab_benchmark(
     lb_et.to_csv(output_dir / "execution_timing_router_leaderboard.csv", index=False)
     (output_dir / "execution_timing_router_summary.json").write_text(
         json.dumps(
-            {"benchmark": "execution_timing_and_router_1m_lab_clean", "results": lb_et.to_dict(orient="records")},
+            {
+                "benchmark": "execution_timing_and_router_1m_lab_clean",
+                "results": lb_et.to_dict(orient="records"),
+            },
             indent=2,
         )
         + "\n"
@@ -5798,11 +6471,14 @@ def run_frente_c_manga_p2_lab_benchmark(
             p4_m4_df, workers=6, post_anchor_only=True, post_window_sec=1800
         )
     anchors_1h = build_causal_1h_panic_flush_anchors(bars_1h_by_sym=bars_1h_by_sym, eval_start="2023-03-01")
-    print(f"  • Auditing P8 strictly post-1h-panic-bar close across {len(anchors_1h)} causal anchors...", flush=True)
+    print(
+        f"  • Auditing P8 strictly post-1h-panic-bar close across {len(anchors_1h)} causal anchors...",
+        flush=True,
+    )
     lb_p8_post_1h, _ = run_waterfall_short_1ms_study(anchors_1h, workers=6, post_anchor_only=True, post_window_sec=1800)
     fb_audit_sum = {
         "sniper_portfolio_ablation": lb_fb_port.to_dict(orient="records"),
-        "p8_post_p4_m4_zero_conditioning": lb_p8_post_p4.to_dict(orient="records") if not lb_p8_post_p4.empty else [],
+        "p8_post_p4_m4_zero_conditioning": (lb_p8_post_p4.to_dict(orient="records") if not lb_p8_post_p4.empty else []),
         "p8_post_1h_panic_zero_conditioning_n_anchors": int(len(anchors_1h)),
         "p8_post_1h_panic_zero_conditioning": (
             lb_p8_post_1h.to_dict(orient="records") if not lb_p8_post_1h.empty else []
@@ -5880,6 +6556,347 @@ def run_frente_c_manga_p2_lab_benchmark(
     return summary
 
 
+def run_frente_d_architecture_synthesis_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente D: Core Intrabar Exit Physics (`Disposition Effect`), Causal `Beta_72h`
+    Neutralization, Conviction-Tiered `Kelly` Sniper Sizing & One-Way Preemption, `M04` Squeeze
+    Threshold Forensics, and the Cumulative `M17` Synthesis Stack (`1m` physics, `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.p2_portfolio_integration import PROD_TOP_15
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_fd = Path("/tmp/frente_d_bridge")
+        if stage_fd.exists():
+            shutil.rmtree(stage_fd, ignore_errors=True)
+        raw_fd = stage_fd / "raw"
+        raw_fd.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Frente D Lab.")
+            rb = rclone_stream.rstrip("/")
+            print(
+                "[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...",
+                flush=True,
+            )
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    [
+                        "rclone",
+                        "copy",
+                        "--multi-thread-streams=8",
+                        f"{rb}/{sub_p}",
+                        str(raw_fd / sub_p),
+                    ],
+                    check=True,
+                )
+            subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet",
+                    str(raw_fd / "p2_aggtrades"),
+                ],
+                check=True,
+            )
+
+            keep_syms = set(PROD_TOP_15) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_fd / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_fd / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_fd = stage_fd / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_fd / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(
+                slim_fd / "bars_1h" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            fnd_all.to_parquet(
+                slim_fd / "funding" / "shard_00.parquet",
+                index=False,
+                compression="zstd",
+            )
+            shutil.copy2(
+                raw_fd / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_fd / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+
+            tar_fd = stage_fd / "fd_bundle.tar"
+            with tarfile.open(tar_fd, "w") as tf:
+                for p_it in sorted(slim_fd.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_fd)))
+
+            print(
+                f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...",
+                flush=True,
+            )
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_fd, "/content/_fd_bundle.tar"), "Failed uploading Frente D bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/fd_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_fd_bundle.tar', 'r').extractall('/content/fd_data'); "
+                "os.remove('/content/_fd_bundle.tar'); "
+                "print('FD_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "FD_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Frente D bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/fd.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'frente-d-architecture-synthesis-lab', '--m16-data-dir', '/content/fd_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/fd.pid', 'w').write(str(p.pid)); "
+                "print(f'FD_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(
+                f"[+] Launched remote Frente D Lab ({rc_l}): {(out_l or err_l).strip()}",
+                flush=True,
+            )
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/fd.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}/stat') and (' Z ' not in open(f'/proc/{pid}/stat').read()); "
+                    "lines = open('/content/fd.log').read().splitlines() if os.path.exists('/content/fd.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Frente D Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "FRENTE_D_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Frente D Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "frente_d_leaderboard.csv",
+                "frente_d_summary.json",
+                "frente_d_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_fd.exists():
+                shutil.rmtree(stage_fd, ignore_errors=True)
+                print(
+                    "[*] Wiped /tmp/frente_d_bridge -> 0 bytes local residue.",
+                    flush=True,
+                )
+
+    from datetime import date, timedelta
+
+    from src.backtest.frente_d_architecture_synthesis_lab import evaluate_frente_d_suite
+    from src.backtest.p2_portfolio_integration import (
+        build_core_1m_tensors_and_base_snipers,
+        identify_required_1m_symbols_for_portfolio,
+    )
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+    from src.models.manga_p2_tsmom_lab import (
+        MANGA_P2_SPECS,
+        build_p2_weight_matrix_for_spec,
+        compute_manga_p2_asset_hourly_signal,
+    )
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    needed_1m_syms = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+    )
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+    sess = _make_pooled_session(64)
+    req_cols_1m = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "quote_volume",
+        "taker_buy_quote_volume",
+    ]
+    sov3_cache: dict[str, pd.DataFrame] = {}
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+            if sym_c in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
+                sov3_cache[sym_c] = df_c.copy()
+        return df_c
+
+    print(
+        f"🔬 Frente D: Architecture & Synthesis Lab | Streaming {len(needed_1m_syms)} 1m symbols...",
+        flush=True,
+    )
+    bundle = build_core_1m_tensors_and_base_snipers(
+        core_1m_by_sym=None,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        loader_workers=6,
+    )
+    eval_idx = bundle["eval_idx"]
+    core_cols = list(bundle["mats"]["close"].columns)
+    sig_iv = {
+        (s_m, "dollar", False): compute_manga_p2_asset_hourly_signal(
+            sov3_cache.get(s_m, pd.DataFrame()),
+            eval_idx=eval_idx,
+            clock_mode="dollar",
+            asym_crash_accel=False,
+        )
+        for s_m in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+        if s_m in core_cols
+    }
+    p2_iv_mat = build_p2_weight_matrix_for_spec(sig_iv, core_cols, eval_idx, MANGA_P2_SPECS[2])
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+
+    lb_df, m04_diag = evaluate_frente_d_suite(bundle, p2_inv_vol_mat=p2_iv_mat, m26_trades_df=m26_df)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_df.to_csv(output_dir / "frente_d_leaderboard.csv", index=False)
+    summary = {
+        "benchmark": "frente_d_architecture_and_m17_synthesis_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "m04_funding_bucket_forensics": m04_diag,
+        "results": lb_df.to_dict(orient="records"),
+    }
+    (output_dir / "frente_d_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente D: Salidas Intrabarra en `Core P1`, Neutralización de `Beta_72h`, Asignación `Kelly` + Preemption en Snipers, Diagnóstico de `M04` y Escalera de Síntesis `M17` (`2023–2026`)",
+        "",
+        "## 1. Matriz de Experimentos sobre Física `1-Minuto` (`2023–2026` + `$2,700` en `2026`)",
+        "",
+        "| Exp ID | **`4Y SR`** | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `FeeDrag%` | `Lock/TP` | `|Beta|` | `Preempt` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, r in lb_df.iterrows():
+        fl = "✅" if bool(r["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{r['exp_id']}` | **`{r['sharpe_4y']:.2f}`** | `{r['cagr_4y_pct']:+.1f}%` | `{r['max_dd_4y_pct']:.2f}%` | "
+            f"`{r['sharpe_23_24']:.2f} / {r['sharpe_2025']:.2f} / {r['sharpe_2026']:.2f}` | "
+            f"`{r['cpcv_mean_sharpe']:.2f}` (`{r['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"`{r['core_fee_drag_pct']:.1f}%` | `{int(r['lock_exits'])}/{int(r['tp_exits'])}` | "
+            f"`{r['mean_abs_beta_ratio']:.3f}` | `{int(r['sniper_preemptions'])}` | "
+            f"**`${r['fresh_2026_final_eq']:,.2f}`** (`${r['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    if m04_diag:
+        md.extend(
+            [
+                "",
+                "## 2. Radiografía Forense de `M04_NegFundSqueeze` por Profundidad de Funding Causal (`2023–2026`)",
+                "",
+                "| Bucket de Funding en Entrada | `N Full` | `N 2026` | **Net Full (`bps`)** | Med (`bps`) | Win`%` | `23-24` | **`2025`** | **`2026`** |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            ]
+        )
+        for mb in m04_diag:
+            md.append(
+                f"| `{mb['bucket']}` | `{mb['n_full']}` | `{mb['n_2026']}` | **`{mb['mean_net_bps_full']:+.1f}`** | "
+                f"`{mb['med_net_bps_full']:+.1f}` | `{mb['win_rate_pct']:.1f}%` | "
+                f"`{mb['net_bps_23_24']:+.1f}` | **`{mb['net_bps_2025']:+.1f}`** | **`{mb['net_bps_2026']:+.1f}`** |"
+            )
+    (output_dir / "frente_d_report.md").write_text("\n".join(md) + "\n")
+    print("FRENTE_D_COMPLETE!", flush=True)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
@@ -5908,6 +6925,7 @@ def build_parser() -> argparse.ArgumentParser:
             "execution-timing-router-lab",
             "frente-b-sniper-l2-waterfall",
             "frente-c-manga-p2-lab",
+            "frente-d-architecture-synthesis-lab",
         ],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
@@ -5942,7 +6960,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional rclone remote dir (e.g. gdrive:trading/.../m16_multimodal) for zero-residue shard streaming.",
     )
     parser.add_argument(
-        "--cache-dir", type=str, default="/tmp/crypto_alpha_backtest_cache", help="Market data cache path."
+        "--cache-dir",
+        type=str,
+        default="/tmp/crypto_alpha_backtest_cache",
+        help="Market data cache path.",
     )
     parser.add_argument(
         "--symbols",
@@ -5951,15 +6972,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated symbols for HRP benchmark.",
     )
     parser.add_argument("--lookback", type=int, default=4000, help="Total 1h bars to evaluate.")
-    parser.add_argument("--window", type=int, default=720, help="HRP estimation window in hours (default: 720).")
-    parser.add_argument("--rebalance", type=int, default=24, help="HRP rebalancing frequency in hours (default: 24).")
     parser.add_argument(
-        "--symbol", type=str, default="BTCUSDT", help="Symbol for info-bars benchmark (default: BTCUSDT)."
+        "--window",
+        type=int,
+        default=720,
+        help="HRP estimation window in hours (default: 720).",
     )
     parser.add_argument(
-        "--date", type=str, default="2024-03-01", help="Date for info-bars tick streaming (default: 2024-03-01)."
+        "--rebalance",
+        type=int,
+        default=24,
+        help="HRP rebalancing frequency in hours (default: 24).",
     )
-    parser.add_argument("--output-dir", type=str, default="reports", help="Output directory for reports.")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="BTCUSDT",
+        help="Symbol for info-bars benchmark (default: BTCUSDT).",
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        default="2024-03-01",
+        help="Date for info-bars tick streaming (default: 2024-03-01).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="reports",
+        help="Output directory for reports.",
+    )
     return parser
 
 
@@ -5979,7 +7021,11 @@ def main() -> None:
 
     pipe_stage_dir: Path | None = None
     m16_dir = Path(args.m16_data_dir)
-    if args.rclone_stream and args.suite in ("m16-gtx-matrix", "m16-discovery-synthesis", "m16-pipeline"):
+    if args.rclone_stream and args.suite in (
+        "m16-gtx-matrix",
+        "m16-discovery-synthesis",
+        "m16-pipeline",
+    ):
         import shutil
         import subprocess
 
@@ -5987,7 +7033,10 @@ def main() -> None:
         if pipe_stage_dir.exists():
             shutil.rmtree(pipe_stage_dir, ignore_errors=True)
         (pipe_stage_dir / "features_panel").mkdir(parents=True, exist_ok=True)
-        print(f"[*] Staging M16-2 causal panel via rclone into {pipe_stage_dir} (auto-cleaned on exit)...", flush=True)
+        print(
+            f"[*] Staging M16-2 causal panel via rclone into {pipe_stage_dir} (auto-cleaned on exit)...",
+            flush=True,
+        )
         subprocess.run(
             [
                 "rclone",
@@ -6035,7 +7084,7 @@ def main() -> None:
                     output_dir=out_dir,
                     max_shards=args.max_shards,
                     colab_session=args.colab_session,
-                    keep_colab=True if args.suite == "m16-pipeline" else args.keep_colab,
+                    keep_colab=(True if args.suite == "m16-pipeline" else args.keep_colab),
                     rclone_stream=args.rclone_stream,
                 )
             elif s_name == "m16-discovery-synthesis":
@@ -6148,12 +7197,23 @@ def main() -> None:
                     keep_colab=args.keep_colab,
                     rclone_stream=args.rclone_stream,
                 )
+            elif s_name == "frente-d-architecture-synthesis-lab":
+                run_frente_d_architecture_synthesis_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
     finally:
         if pipe_stage_dir is not None and pipe_stage_dir.exists():
             import shutil
 
             shutil.rmtree(pipe_stage_dir, ignore_errors=True)
-            print("[*] Cleaned temporary staging directory (/tmp/m16_pipe_stage -> 0 bytes).", flush=True)
+            print(
+                "[*] Cleaned temporary staging directory (/tmp/m16_pipe_stage -> 0 bytes).",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

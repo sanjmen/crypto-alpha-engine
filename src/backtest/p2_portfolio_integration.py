@@ -119,7 +119,12 @@ def compute_portfolio_era_metrics(
 
     def _stats(sub: pd.Series) -> dict[str, float]:
         if sub.empty or len(sub) < 5:
-            return {"sharpe": 0.0, "geom_daily_pct": 0.0, "cagr_pct": 0.0, "max_dd_pct": 0.0}
+            return {
+                "sharpe": 0.0,
+                "geom_daily_pct": 0.0,
+                "cagr_pct": 0.0,
+                "max_dd_pct": 0.0,
+            }
         arr = sub.to_numpy(dtype=np.float64)
         mu = float(np.mean(arr))
         sd = float(np.std(arr, ddof=1))
@@ -221,7 +226,11 @@ def identify_required_1m_symbols_for_portfolio(
         )
         if s_sym in funding_by_sym and not funding_by_sym[s_sym].empty:
             fd = funding_by_sym[s_sym].sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-            f_idx = pd.to_datetime(((fd["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600, unit="s", utc=True)
+            f_idx = pd.to_datetime(
+                ((fd["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600,
+                unit="s",
+                utc=True,
+            )
             f_ser = pd.Series(fd["funding_rate"].to_numpy(dtype=np.float64), index=f_idx)
             f_ser = f_ser[~f_ser.index.duplicated(keep="last")]
             fr_1h[:, j_s] = f_ser.reindex(eval_idx, method="ffill").fillna(0.0).to_numpy()
@@ -273,7 +282,11 @@ def build_core_1m_tensors_and_base_snipers(
         if s in funding_by_sym and not funding_by_sym[s].empty:
             f = funding_by_sym[s].sort_values("timestamp").drop_duplicates("timestamp", keep="last")
             f_idx = pd.DatetimeIndex(
-                pd.to_datetime(((f["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600, unit="s", utc=True)
+                pd.to_datetime(
+                    ((f["timestamp"].to_numpy(dtype=np.int64) + 30) // 3600) * 3600,
+                    unit="s",
+                    utc=True,
+                )
             )
             f_s = pd.Series(f["funding_rate"].to_numpy(dtype=np.float64), index=f_idx)
             fnd_core[s] = f_s[~f_s.index.duplicated(keep="last")]
@@ -431,9 +444,14 @@ def build_core_1m_tensors_and_base_snipers(
                     f_series_map[sym].reindex(idx_15m, method="ffill").fillna(0.0).to_numpy(dtype=np.float64)[:, None]
                 )
                 rk_15 = rk_df_1h[sym].reindex(idx_15m, method="ffill").fillna(999).to_numpy(dtype=np.int64)[:, None]
-                for en_ts, _j0, side, st_name, sc_v, rk_v in sn_eng.scan_historical_15m_events(
-                    ts_15m, c_15, h_15, qv_15, tb_15, fr_15, rk_15
-                ):
+                for (
+                    en_ts,
+                    _j0,
+                    side,
+                    st_name,
+                    sc_v,
+                    rk_v,
+                ) in sn_eng.scan_historical_15m_events(ts_15m, c_15, h_15, qv_15, tb_15, fr_15, rk_15):
                     sym_triggers.append((en_ts, side, st_name, sc_v, rk_v))
 
         if not sym_triggers:
@@ -445,6 +463,18 @@ def build_core_1m_tensors_and_base_snipers(
         l_a = df1["low"].to_numpy(dtype=np.float64)
         c_a = df1["close"].to_numpy(dtype=np.float64)
         fr_sym = f_maps.get(sym)
+
+        f_ser_sym = f_series_map.get(sym)
+        f_ts_ns = (
+            f_ser_sym.index.as_unit("s").astype(np.int64).to_numpy()
+            if f_ser_sym is not None and not f_ser_sym.empty
+            else np.empty(0, dtype=np.int64)
+        )
+        f_vals_sym = (
+            f_ser_sym.to_numpy(dtype=np.float64)
+            if f_ser_sym is not None and not f_ser_sym.empty
+            else np.empty(0, dtype=np.float64)
+        )
 
         resolved_out: list[dict[str, Any]] = []
         for en_ts, side, st_name, sc_v, rk_v in sym_triggers:
@@ -462,6 +492,8 @@ def build_core_1m_tensors_and_base_snipers(
             )
             if resolved is not None:
                 ex_ts, hr_ret, is_loss, _ = resolved
+                f_pos = int(np.searchsorted(f_ts_ns, int(en_ts), side="right")) - 1
+                en_fr = float(f_vals_sym[f_pos]) if f_pos >= 0 else 0.0
                 resolved_out.append(
                     {
                         "hr_ts": (en_ts // 3600) * 3600,
@@ -471,6 +503,7 @@ def build_core_1m_tensors_and_base_snipers(
                         "entry_ts": en_ts,
                         "exit_ts": ex_ts,
                         "score": sc_v,
+                        "entry_fr": en_fr,
                         "hourly_ret": hr_ret,
                         "was_loss": is_loss,
                     }
