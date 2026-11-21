@@ -6897,6 +6897,717 @@ def run_frente_d_architecture_synthesis_benchmark(
     return summary
 
 
+def run_frente_e1_carry_harvester_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente E1: Basis & Carry Harvester (`Manga P4`) + Definitive Resolution of
+    GitHub Issue `#64` (`M15-4 Extreme Funding Rate Harvester`) (`1m` + `premiumIndex 1h`, `2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.p2_portfolio_integration import PROD_TOP_15
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_e1 = Path("/tmp/frente_e1_bridge")
+        if stage_e1.exists():
+            shutil.rmtree(stage_e1, ignore_errors=True)
+        raw_e1 = stage_e1 / "raw"
+        raw_e1.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Frente E1 Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_e1 / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                ["rclone", "copy", f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet", str(raw_e1 / "p2_aggtrades")],
+                check=True,
+            )
+
+            keep_syms = set(PROD_TOP_15) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_e1 / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_e1 / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_e1 = stage_e1 / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_e1 / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_e1 / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_e1 / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(
+                raw_e1 / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_e1 / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+
+            tar_e1 = stage_e1 / "e1_bundle.tar"
+            with tarfile.open(tar_e1, "w") as tf:
+                for p_it in sorted(slim_e1.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_e1)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_e1, "/content/_e1_bundle.tar"), "Failed uploading Frente E1 bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/e1_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_e1_bundle.tar', 'r').extractall('/content/e1_data'); "
+                "os.remove('/content/_e1_bundle.tar'); "
+                "print('E1_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "E1_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Frente E1 bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/e1.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'frente-e1-carry-harvester-lab', '--m16-data-dir', '/content/e1_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/e1.pid', 'w').write(str(p.pid)); "
+                "print(f'E1_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Frente E1 Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/e1.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}/stat') and (' Z ' not in open(f'/proc/{pid}/stat').read()); "
+                    "lines = open('/content/e1.log').read().splitlines() if os.path.exists('/content/e1.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Frente E1 Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "FRENTE_E1_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Frente E1 Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "frente_e1_issue64_harvester_leaderboard.csv",
+                "frente_e1_carry_pods_leaderboard.csv",
+                "frente_e1_portfolio_leaderboard.csv",
+                "frente_e1_summary.json",
+                "frente_e1_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_e1.exists():
+                shutil.rmtree(stage_e1, ignore_errors=True)
+                print("[*] Wiped /tmp/frente_e1_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.backtest.core_rebalance_barrier_lab import (
+        CoreRebalanceBarrierSpec,
+        simulate_core_barrier_1m_portfolio,
+    )
+    from src.backtest.p2_portfolio_integration import (
+        build_core_1m_tensors_and_base_snipers,
+        identify_required_1m_symbols_for_portfolio,
+    )
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+    from src.models.basis_and_carry_harvester_lab import (
+        build_and_evaluate_continuous_carry_sleeves,
+        evaluate_portfolio_carry_integrations,
+        fetch_1h_premium_index_klines_universe,
+        identify_issue64_candidate_windows,
+        run_issue64_coupon_harvester_1m_study,
+    )
+    from src.models.manga_p2_tsmom_lab import (
+        MANGA_P2_SPECS,
+        build_p2_weight_matrix_for_spec,
+        compute_manga_p2_asset_hourly_signal,
+    )
+    from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+
+    sniper_present = [s for s in SNIPER_UNIVERSE_82 if s in bars_1h_by_sym]
+    print(
+        f"📡 Frente E1: Fetching 1h premiumIndexKlines (Spot-Perp Basis) for {len(sniper_present)} symbols...",
+        flush=True,
+    )
+    prem_1h_by_sym = fetch_1h_premium_index_klines_universe(
+        symbols=sniper_present, all_yms=all_yms, recent_days=recent_days, max_ts_sec=btc_max_ts, workers=14
+    )
+    cand_win_by_sym = identify_issue64_candidate_windows(
+        bars_1h_by_sym=bars_1h_by_sym, funding_by_sym=funding_by_sym, prem_1h_by_sym=prem_1h_by_sym
+    )
+    port_1m_syms = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym, funding_by_sym=funding_by_sym, eval_start="2023-03-01"
+    )
+    needed_1m_syms = sorted(set(port_1m_syms) | set(cand_win_by_sym.keys()))
+
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    sov3_cache: dict[str, pd.DataFrame] = {}
+    harv_1m_slices: dict[str, pd.DataFrame] = {}
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+            if sym_c in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
+                sov3_cache[sym_c] = df_c.copy()
+            if sym_c in cand_win_by_sym:
+                ts_v = df_c["timestamp"].to_numpy(dtype=np.int64)
+                keep_m = np.zeros(len(ts_v), dtype=bool)
+                for t_w in cand_win_by_sym[sym_c]:
+                    i_lo = int(np.searchsorted(ts_v, t_w - 4200, side="left"))
+                    i_hi = int(np.searchsorted(ts_v, t_w + 1200, side="right"))
+                    if i_hi > i_lo:
+                        keep_m[i_lo:i_hi] = True
+                if np.any(keep_m):
+                    harv_1m_slices[sym_c] = df_c.loc[keep_m, ["timestamp", "open", "high", "low", "close"]].reset_index(
+                        drop=True
+                    )
+        return df_c
+
+    print(
+        f"💰 Frente E1: Single-Pass Streaming {len(needed_1m_syms)} 1m symbols (Portfolio + Issue #64 Windows)...",
+        flush=True,
+    )
+    bundle = build_core_1m_tensors_and_base_snipers(
+        core_1m_by_sym=None,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        loader_workers=6,
+    )
+
+    print("🔍 Frente E1.1: Evaluating Issue #64 (M15-4) Extreme Funding Coupon Snipers (H1..H5)...", flush=True)
+    lb_h, tr_h = run_issue64_coupon_harvester_1m_study(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        prem_1h_by_sym=prem_1h_by_sym,
+        symbol_1m_loader=lambda s: harv_1m_slices.get(s),
+        eval_start="2023-03-01",
+    )
+
+    eval_idx = bundle["eval_idx"]
+    core_cols = list(bundle["mats"]["close"].columns)
+    sig_iv = {
+        (s_m, "dollar", False): compute_manga_p2_asset_hourly_signal(
+            sov3_cache.get(s_m, pd.DataFrame()), eval_idx=eval_idx, clock_mode="dollar", asym_crash_accel=False
+        )
+        for s_m in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+        if s_m in core_cols
+    }
+    p2_iv_mat = build_p2_weight_matrix_for_spec(sig_iv, core_cols, eval_idx, MANGA_P2_SPECS[2])
+
+    sim_p1_only = simulate_core_barrier_1m_portfolio(
+        mats=bundle["mats"],
+        o_1m_core=bundle["o_1m_core"],
+        h_1m_core=bundle["h_1m_core"],
+        l_1m_core=bundle["l_1m_core"],
+        eval_idx=eval_idx,
+        open_core=bundle["open_core"],
+        p2_w_mat=None,
+        spec=CoreRebalanceBarrierSpec("STRICT_8H", "Strict 8h", intracycle_mode="off"),
+        resolved_sniper_events_by_hour=None,
+        allowed_sniper_strats=set(),
+    )
+    c_arr_p2 = bundle["mats"]["close"].loc[eval_idx].to_numpy(dtype=np.float64)
+    r1h_p2 = np.zeros_like(c_arr_p2)
+    r1h_p2[1:] = np.where(c_arr_p2[:-1] > 0, (c_arr_p2[1:] - c_arr_p2[:-1]) / c_arr_p2[:-1], 0.0)
+    d_p2_stream = pd.Series(np.sum(p2_iv_mat * r1h_p2, axis=1), index=eval_idx).resample("1D").sum()
+
+    print("🏦 Frente E1.2: Evaluating Continuous Manga P4 Carry Sleeves (P4_C1..P4_C4)...", flush=True)
+    lb_c, sleeves = build_and_evaluate_continuous_carry_sleeves(
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        prem_1h_by_sym=prem_1h_by_sym,
+        eval_idx=eval_idx,
+        core_p1_daily=sim_p1_only["daily"],
+        manga_p2_daily=d_p2_stream,
+    )
+
+    print("🔗 Frente E1.3: Evaluating Unified 1m Portfolio Carry Integrations (E1_P0..E1_P6)...", flush=True)
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+    lb_port = evaluate_portfolio_carry_integrations(
+        bundle=bundle,
+        p2_inv_vol_mat=p2_iv_mat,
+        sleeves_out=sleeves,
+        m26_trades_df=m26_df,
+        coupon_trades_df=tr_h,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lb_h.to_csv(output_dir / "frente_e1_issue64_harvester_leaderboard.csv", index=False)
+    lb_c.to_csv(output_dir / "frente_e1_carry_pods_leaderboard.csv", index=False)
+    lb_port.to_csv(output_dir / "frente_e1_portfolio_leaderboard.csv", index=False)
+
+    summary = {
+        "benchmark": "frente_e1_basis_and_carry_harvester_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "issue64_coupon_harvesters": lb_h.to_dict(orient="records") if not lb_h.empty else [],
+        "continuous_carry_pods": lb_c.to_dict(orient="records"),
+        "portfolio_integrations": lb_port.to_dict(orient="records"),
+    }
+    (output_dir / "frente_e1_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente E1: Basis & Carry Harvester (`Manga P4`) + Resolución Forense del Issue `#64` (`M15-4`, `2023–2026`)",
+        "",
+        "## 1. Parte E1.1 — Resolución del Issue `#64` (`M15-4`): Cosechadores de Cupón Pre-Settlement (`1m` + `premiumIndex`, `0.000 ms` Lookahead)",
+        "",
+        "| Mech ID | `N` | Price (`bps`) | Coupon (`bps`) | Fee | **Net Full** | Med | Win`%` | `23-24` | **`2025`** | **`2026`** | **CPCV OOS (`Pos%`)** | Treasure |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, rh in lb_h.iterrows():
+        md.append(
+            f"| `{rh['mech_id']}` | `{int(rh['trades_full'])}` | `{rh['mean_gross_bps']:+.1f}` | `{rh['mean_fnd_bps']:+.1f}` | `{rh['mean_fee_bps']:.1f}` | "
+            f"**`{rh['mean_net_bps_full']:+.1f}`** | `{rh['med_net_bps_full']:+.1f}` | `{rh['win_rate_pct']:.1f}%` | "
+            f"`{rh['net_bps_23_24']:+.1f}` | **`{rh['net_bps_2025']:+.1f}`** | **`{rh['net_bps_2026']:+.1f}`** | "
+            f"`{rh['cpcv_infold_oos_bps']:+.1f}` (`{rh['cpcv_pos_splits_pct']:.0f}%`) | **`{'TREASURE 🏆' if rh['is_treasure'] else '—'}`** |"
+        )
+    md.extend(
+        [
+            "",
+            "## 2. Parte E1.2 — `Manga P4` Pods Continuos de Carry & Basis (`1x` Standalone, `2023–2026`)",
+            "",
+            "| Carry Pod ID | Activo`%` | **`4Y SR`** | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `Corr P1` | `Corr P2` | `FeeDrag%` |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for _, rc in lb_c.iterrows():
+        md.append(
+            f"| `{rc['carry_id']}` | `{rc['active_time_pct']:.1f}%` | **`{rc['sharpe_4y']:.2f}`** | `{rc['cagr_4y_pct']:+.1f}%` | "
+            f"`{rc['max_dd_4y_pct']:.2f}%` | `{rc['sharpe_23_24']:.2f} / {rc['sharpe_2025']:.2f} / {rc['sharpe_2026']:.2f}` | "
+            f"`{rc['cpcv_mean_sharpe']:.2f}` (`{rc['cpcv_pos_splits_pct']:.0f}%`) | `{rc['corr_vs_core_p1']:+.3f}` | "
+            f"`{rc['corr_vs_manga_p2']:+.3f}` | `{rc['fee_drag_pct']:.1f}%` |"
+        )
+    md.extend(
+        [
+            "",
+            "## 3. Parte E1.3 — Integración en Portafolio Unificado `1m` (`Stack M17 D11 + Carry`, `$2,700` en `2026` vs Piso `$2,500`)",
+            "",
+            "| Port ID | **`4Y SR`** | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for _, rp in lb_port.iterrows():
+        fl = "✅" if bool(rp["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{rp['port_id']}` | **`{rp['sharpe_4y']:.2f}`** | `{rp['cagr_4y_pct']:+.1f}%` | `{rp['max_dd_4y_pct']:.2f}%` | "
+            f"`{rp['sharpe_23_24']:.2f} / {rp['sharpe_2025']:.2f} / {rp['sharpe_2026']:.2f}` | "
+            f"`{rp['cpcv_mean_sharpe']:.2f}` (`{rp['cpcv_pos_splits_pct']:.0f}%`) | "
+            f"**`${rp['fresh_2026_final_eq']:,.2f}`** (`${rp['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    (output_dir / "frente_e1_report.md").write_text("\n".join(md) + "\n")
+    print("FRENTE_E1_COMPLETE!", flush=True)
+    return summary
+
+
+def run_frente_e2_seven_factor_benchmark(
+    m16_data_dir: Path,
+    output_dir: Path,
+    colab_session: str | None = None,
+    keep_colab: bool = False,
+    rclone_stream: str | None = None,
+) -> dict[str, object]:
+    """
+    Executes Frente E2: `SevenFactorOnlineEngine` `1-Minute` Leave-One-Factor-Out (`LOFO`),
+    Standalone `8h` Factor Anatomy, Multi-Modal `premiumIndex` Basis Overlay, and `8h`-Aligned
+    Online Meta-Allocator Audit (`2023–2026`).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+
+    if colab_session:
+        from src.backtest.p2_portfolio_integration import PROD_TOP_15
+        from src.cloud.colab_client import ColabClient
+        from src.strategies.event_snipers import SNIPER_UNIVERSE_82
+
+        stage_e2 = Path("/tmp/frente_e2_bridge")
+        if stage_e2.exists():
+            shutil.rmtree(stage_e2, ignore_errors=True)
+        raw_e2 = stage_e2 / "raw"
+        raw_e2.mkdir(parents=True, exist_ok=True)
+        client = ColabClient(session_name=colab_session)
+        try:
+            if not rclone_stream:
+                raise ValueError("--rclone-stream is required for zero-click Colab Frente E2 Lab.")
+            rb = rclone_stream.rstrip("/")
+            print("[*] Staging 1h + funding + M26 trades via rclone (auto-cleaned on exit)...", flush=True)
+            for sub_p in ("bars_1h", "funding"):
+                subprocess.run(
+                    ["rclone", "copy", "--multi-thread-streams=8", f"{rb}/{sub_p}", str(raw_e2 / sub_p)],
+                    check=True,
+                )
+            subprocess.run(
+                ["rclone", "copy", f"{rb}/p2_aggtrades/p2_all_variants_trades.parquet", str(raw_e2 / "p2_aggtrades")],
+                check=True,
+            )
+
+            keep_syms = set(PROD_TOP_15) | set(SNIPER_UNIVERSE_82)
+            b1h_cols = [
+                "timestamp",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "quote_volume",
+                "taker_buy_quote_volume",
+            ]
+            b1h_parts = [
+                pd.read_parquet(bf, columns=b1h_cols)[lambda d: d["symbol"].isin(keep_syms)]
+                for bf in sorted((raw_e2 / "bars_1h").glob("shard_*.parquet"))
+            ]
+            b1h_all = pd.concat([x for x in b1h_parts if not x.empty], ignore_index=True)
+            fnd_parts = [
+                pd.read_parquet(ff, columns=["timestamp", "symbol", "funding_rate"])[
+                    lambda d: d["symbol"].isin(keep_syms)
+                ]
+                for ff in sorted((raw_e2 / "funding").glob("shard_*.parquet"))
+            ]
+            fnd_all = pd.concat([x for x in fnd_parts if not x.empty], ignore_index=True)
+
+            slim_e2 = stage_e2 / "slim"
+            for sub_p in ("bars_1h", "funding", "p2_aggtrades"):
+                (slim_e2 / sub_p).mkdir(parents=True, exist_ok=True)
+            b1h_all.to_parquet(slim_e2 / "bars_1h" / "shard_00.parquet", index=False, compression="zstd")
+            fnd_all.to_parquet(slim_e2 / "funding" / "shard_00.parquet", index=False, compression="zstd")
+            shutil.copy2(
+                raw_e2 / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+                slim_e2 / "p2_aggtrades" / "p2_all_variants_trades.parquet",
+            )
+
+            tar_e2 = stage_e2 / "e2_bundle.tar"
+            with tarfile.open(tar_e2, "w") as tf:
+                for p_it in sorted(slim_e2.rglob("*")):
+                    if p_it.is_file():
+                        tf.add(p_it, arcname=str(p_it.relative_to(slim_e2)))
+
+            print(f"[*] Provisioning headless Colab CPU VM '{colab_session}' (0 OAuth prompts)...", flush=True)
+            if not client.ensure_session(gpu=None):
+                raise RuntimeError(f"Failed to provision Colab session '{colab_session}'")
+            assert client.sync_codebase(REPO_ROOT), "Failed syncing codebase to Colab"
+            assert client.upload(tar_e2, "/content/_e2_bundle.tar"), "Failed uploading Frente E2 bundle"
+            rc_u, out_u, err_u = client.exec_inline(
+                "import os, tarfile; "
+                "os.makedirs('/content/e2_data', exist_ok=True); "
+                "os.makedirs('/content/reports', exist_ok=True); "
+                "tarfile.open('/content/_e2_bundle.tar', 'r').extractall('/content/e2_data'); "
+                "os.remove('/content/_e2_bundle.tar'); "
+                "print('E2_BUNDLE_READY')",
+                timeout=120,
+            )
+            if rc_u != 0 or "E2_BUNDLE_READY" not in out_u:
+                raise RuntimeError(f"Failed unpacking Frente E2 bundle: {(err_u or out_u)[:160]}")
+
+            launch_py = (
+                "import subprocess, sys; "
+                "lf = open('/content/e2.log', 'w', buffering=1); "
+                "p = subprocess.Popen([sys.executable, '-u', '/content/scripts/run_benchmarks.py', "
+                "'--suite', 'frente-e2-seven-factor-lab', '--m16-data-dir', '/content/e2_data', "
+                "'--output-dir', '/content/reports'], "
+                "stdout=lf, stderr=subprocess.STDOUT, start_new_session=True); "
+                "open('/content/e2.pid', 'w').write(str(p.pid)); "
+                "print(f'E2_PID={p.pid}')"
+            )
+            rc_l, out_l, err_l = client.exec_inline(launch_py, timeout=90)
+            print(f"[+] Launched remote Frente E2 Lab ({rc_l}): {(out_l or err_l).strip()}", flush=True)
+
+            seen = 0
+            consec_err = 0
+            while True:
+                time.sleep(10.0)
+                poll_py = (
+                    "import os; "
+                    "pid = int(open('/content/e2.pid').read().strip()); "
+                    "alive = os.path.exists(f'/proc/{pid}/stat') and (' Z ' not in open(f'/proc/{pid}/stat').read()); "
+                    "lines = open('/content/e2.log').read().splitlines() if os.path.exists('/content/e2.log') else []; "
+                    f"print(f'ALIVE={{alive}} TOTAL={{len(lines)}}'); "
+                    f"[print('LOG|' + ln) for ln in lines[{seen}:]]"
+                )
+                rc_p, out_p, err_p = client.exec_inline(poll_py, timeout=90)
+                if rc_p != 0:
+                    consec_err += 1
+                    if consec_err >= 4:
+                        raise RuntimeError(f"Colab session lost during Frente E2 Lab: {(err_p or out_p)[:160]}")
+                    continue
+                consec_err = 0
+                alive, finished = True, False
+                for ln in out_p.splitlines():
+                    if ln.startswith("ALIVE="):
+                        parts = ln.split()
+                        alive = parts[0].split("=")[1] == "True"
+                        seen = int(parts[1].split("=")[1])
+                    elif ln.startswith("LOG|"):
+                        msg = ln[4:]
+                        print(msg, flush=True)
+                        if "FRENTE_E2_COMPLETE!" in msg:
+                            finished = True
+                if finished or not alive:
+                    break
+
+            if not finished:
+                raise RuntimeError("Remote Frente E2 Lab terminated early; inspect logs above.")
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for fname in (
+                "frente_e2_solo_factors_leaderboard.csv",
+                "frente_e2_lofo_allocator_leaderboard.csv",
+                "frente_e2_summary.json",
+                "frente_e2_report.md",
+            ):
+                client.download(f"/content/reports/{fname}", output_dir / fname)
+            return {}
+        finally:
+            if not keep_colab:
+                client.stop()
+                print(f"[*] Stopped Colab session '{colab_session}' cleanly.", flush=True)
+            if stage_e2.exists():
+                shutil.rmtree(stage_e2, ignore_errors=True)
+                print("[*] Wiped /tmp/frente_e2_bridge -> 0 bytes local residue.", flush=True)
+
+    from datetime import date, timedelta
+
+    from src.backtest.frente_e2_seven_factor_allocator_lab import evaluate_frente_e2_suite
+    from src.backtest.p2_portfolio_integration import (
+        PROD_TOP_15,
+        build_core_1m_tensors_and_base_snipers,
+        identify_required_1m_symbols_for_portfolio,
+    )
+    from src.data.multimodal_vision_ingestor import (
+        PERP_TICKER_ALIASES,
+        _make_pooled_session,
+        fetch_gap_free_1m_klines,
+    )
+    from src.models.basis_and_carry_harvester_lab import fetch_1h_premium_index_klines_universe
+    from src.models.manga_p2_tsmom_lab import (
+        MANGA_P2_SPECS,
+        build_p2_weight_matrix_for_spec,
+        compute_manga_p2_asset_hourly_signal,
+    )
+
+    t0 = time.time()
+    b1h_files = sorted((m16_data_dir / "bars_1h").glob("shard_*.parquet"))
+    fnd_files = sorted((m16_data_dir / "funding").glob("shard_*.parquet"))
+    p2_trades_path = m16_data_dir / "p2_aggtrades" / "p2_all_variants_trades.parquet"
+    bars_1h_by_sym: dict[str, pd.DataFrame] = {}
+    for bf in b1h_files:
+        bdf = pd.read_parquet(bf)
+        for s_k, g_df in bdf.groupby("symbol", sort=False):
+            bars_1h_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+    funding_by_sym: dict[str, pd.DataFrame] = {}
+    for ff in fnd_files:
+        fdf = pd.read_parquet(ff)
+        for s_k, g_df in fdf.groupby("symbol", sort=False):
+            funding_by_sym[str(s_k)] = g_df.reset_index(drop=True)
+
+    btc_max_ts = int(bars_1h_by_sym["BTCUSDT"]["timestamp"].max())
+    end_dt = pd.Timestamp(btc_max_ts, unit="s", tz="UTC") + timedelta(days=1)
+    all_yms = [
+        (y, m) for y in range(2023, end_dt.year + 1) for m in range(1, 13) if (y, m) < (end_dt.year, end_dt.month)
+    ]
+    recent_days = [date(end_dt.year, end_dt.month, d).isoformat() for d in range(1, end_dt.day + 1)]
+
+    core_present = [s for s in PROD_TOP_15 if s in bars_1h_by_sym]
+    print(f"📡 Frente E2: Fetching 1h premiumIndexKlines for Core {len(core_present)} symbols...", flush=True)
+    prem_1h_core = fetch_1h_premium_index_klines_universe(
+        symbols=core_present, all_yms=all_yms, recent_days=recent_days, max_ts_sec=btc_max_ts, workers=10
+    )
+    needed_1m_syms = identify_required_1m_symbols_for_portfolio(
+        bars_1h_by_sym=bars_1h_by_sym, funding_by_sym=funding_by_sym, eval_start="2023-03-01"
+    )
+    sess = _make_pooled_session(64)
+    req_cols_1m = ["timestamp", "open", "high", "low", "close", "quote_volume", "taker_buy_quote_volume"]
+    sov3_cache: dict[str, pd.DataFrame] = {}
+
+    def _stream_sym_1m(sym_c: str) -> pd.DataFrame | None:
+        tks = PERP_TICKER_ALIASES.get(sym_c, (sym_c,))
+        df_c = fetch_gap_free_1m_klines("futures/um", tks, sym_c, all_yms, recent_days, session=sess)
+        if df_c is not None and not df_c.empty:
+            df_c = df_c[df_c["timestamp"] <= btc_max_ts + 3600][req_cols_1m].reset_index(drop=True)
+            if sym_c in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
+                sov3_cache[sym_c] = df_c.copy()
+        return df_c
+
+    print(
+        f"🧬 Frente E2: Streaming {len(needed_1m_syms)} 1m symbols for 7-Factor LOFO & Meta-Allocator Lab...",
+        flush=True,
+    )
+    bundle = build_core_1m_tensors_and_base_snipers(
+        core_1m_by_sym=None,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        eval_start="2023-03-01",
+        symbol_1m_loader=_stream_sym_1m,
+        symbols_to_stream=needed_1m_syms,
+        loader_workers=6,
+    )
+    eval_idx = bundle["eval_idx"]
+    core_cols = list(bundle["mats"]["close"].columns)
+    sig_iv = {
+        (s_m, "dollar", False): compute_manga_p2_asset_hourly_signal(
+            sov3_cache.get(s_m, pd.DataFrame()), eval_idx=eval_idx, clock_mode="dollar", asym_crash_accel=False
+        )
+        for s_m in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+        if s_m in core_cols
+    }
+    p2_iv_mat = build_p2_weight_matrix_for_spec(sig_iv, core_cols, eval_idx, MANGA_P2_SPECS[2])
+    m26_df = pd.read_parquet(p2_trades_path) if p2_trades_path.exists() else None
+
+    solo_df, lofo_df = evaluate_frente_e2_suite(
+        bundle=bundle,
+        bars_1h_by_sym=bars_1h_by_sym,
+        funding_by_sym=funding_by_sym,
+        prem_1h_by_sym=prem_1h_core,
+        p2_inv_vol_mat=p2_iv_mat,
+        m26_trades_df=m26_df,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    solo_df.to_csv(output_dir / "frente_e2_solo_factors_leaderboard.csv", index=False)
+    lofo_df.to_csv(output_dir / "frente_e2_lofo_allocator_leaderboard.csv", index=False)
+    summary = {
+        "benchmark": "frente_e2_seven_factor_lofo_and_meta_allocator_1m_lab",
+        "elapsed_sec": round(time.time() - t0, 1),
+        "standalone_8h_factors": solo_df.to_dict(orient="records"),
+        "lofo_and_meta_allocator_results": lofo_df.to_dict(orient="records"),
+    }
+    (output_dir / "frente_e2_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    md = [
+        "# Frente E2: Anatomía Standalone `8h`, Ablación Leave-One-Factor-Out (`LOFO`) y Meta-Asignador Online de `SevenFactorOnlineEngine` (`2023–2026`)",
+        "",
+        "## 1. Parte E2.1 — Anatomía Standalone de los `7` Factores (`1x` Neutral `8h`, `2.55 bps` + Funding Real)",
+        "",
+        "| Factor | Prior | Share Vivo`%` | **`Solo 4Y SR`** | `Solo CAGR` | `Solo DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `Turn/Día` |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for _, rs in solo_df.iterrows():
+        md.append(
+            f"| `{rs['factor']}` | `{rs['default_prior']:.2f}` | `{rs['mean_prod_share_pct']:.1f}%` | "
+            f"**`{rs['solo_8h_sharpe_4y']:.2f}`** | `{rs['solo_8h_cagr_pct']:+.1f}%` | `{rs['solo_8h_max_dd_pct']:.2f}%` | "
+            f"`{rs['solo_23_24']:.2f} / {rs['solo_2025']:.2f} / {rs['solo_2026']:.2f}` | "
+            f"`{rs['cpcv_mean_sharpe']:.2f}` (`{rs['cpcv_pos_splits_pct']:.0f}%`) | `{rs['turnover_1x_per_day']:.2f}x` |"
+        )
+    md.extend(
+        [
+            "",
+            "## 2. Parte E2.2 — Ablación `LOFO` (`F1..F7`), Overlays (`Chop`, `Shields`, `Premium Basis`, `Lead-Lag`) y Meta-Asignador (`Stack M17 D11`, `$2,700` en `2026`)",
+            "",
+            "| Exp ID | **`4Y SR`** | `4Y CAGR` | `4Y DD` | `23-24 / 25 / 26 SR` | `CPCV SR (Pos%)` | `FeeDrag%` | **`2026` `$2,700 -> Final` (`MinEq`)** |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for _, rl in lofo_df.iterrows():
+        fl = "✅" if bool(rl["fresh_2026_floor_2500_ok"]) else "⚠️"
+        md.append(
+            f"| `{rl['exp_id']}` | **`{rl['sharpe_4y']:.2f}`** | `{rl['cagr_4y_pct']:+.1f}%` | `{rl['max_dd_4y_pct']:.2f}%` | "
+            f"`{rl['sharpe_23_24']:.2f} / {rl['sharpe_2025']:.2f} / {rl['sharpe_2026']:.2f}` | "
+            f"`{rl['cpcv_mean_sharpe']:.2f}` (`{rl['cpcv_pos_splits_pct']:.0f}%`) | `{rl['core_fee_drag_pct']:.1f}%` | "
+            f"**`${rl['fresh_2026_final_eq']:,.2f}`** (`${rl['fresh_2026_min_eq']:,.2f}` {fl}) |"
+        )
+    (output_dir / "frente_e2_report.md").write_text("\n".join(md) + "\n")
+    print("FRENTE_E2_COMPLETE!", flush=True)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Quantitative & Microstructure Benchmark Suite CLI")
     parser.add_argument(
@@ -6926,6 +7637,8 @@ def build_parser() -> argparse.ArgumentParser:
             "frente-b-sniper-l2-waterfall",
             "frente-c-manga-p2-lab",
             "frente-d-architecture-synthesis-lab",
+            "frente-e1-carry-harvester-lab",
+            "frente-e2-seven-factor-lab",
         ],
         default="hrp",
         help="Benchmark suite to execute (default: hrp).",
@@ -7199,6 +7912,22 @@ def main() -> None:
                 )
             elif s_name == "frente-d-architecture-synthesis-lab":
                 run_frente_d_architecture_synthesis_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "frente-e1-carry-harvester-lab":
+                run_frente_e1_carry_harvester_benchmark(
+                    m16_data_dir=Path(args.m16_data_dir),
+                    output_dir=out_dir,
+                    colab_session=args.colab_session,
+                    keep_colab=args.keep_colab,
+                    rclone_stream=args.rclone_stream,
+                )
+            elif s_name == "frente-e2-seven-factor-lab":
+                run_frente_e2_seven_factor_benchmark(
                     m16_data_dir=Path(args.m16_data_dir),
                     output_dir=out_dir,
                     colab_session=args.colab_session,
